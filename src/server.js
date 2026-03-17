@@ -62,8 +62,21 @@ app.get('*', (req, res) => {
 });
 
 initializeDatabase().then(() => {
-  app.listen(PORT, () => {
-    console.log(`\n🚀 Workshop Manager API on http://localhost:${PORT}`);
+  const os = require('os');
+  const interfaces = os.networkInterfaces();
+  let localIP = 'localhost';
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        localIP = iface.address;
+        break;
+      }
+    }
+  }
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n🚀 Workshop Manager API`);
+    console.log(`   Local:  http://localhost:${PORT}`);
+    console.log(`   Mobile: http://${localIP}:${PORT}`);
     console.log(`📋 Admin: admin / admin123\n`);
   });
 }).catch(err => {

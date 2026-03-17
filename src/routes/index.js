@@ -24,16 +24,38 @@ function adminOnly(req, res, next) {
 
 // ── Image Upload Setup ────────────────────────────────────────────────────────
 const imgDir = path.join(__dirname, '../../uploads/task-images');
+const deptGalleryDir = path.join(__dirname, '../../uploads/department-gallery');
 fs.mkdirSync(imgDir, { recursive: true });
+fs.mkdirSync(deptGalleryDir, { recursive: true });
 const imgStorage = multer.diskStorage({
   destination: imgDir,
   filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9.]/g,'_')}`)
 });
 const imgUpload = multer({ storage: imgStorage, limits: { fileSize: 10 * 1024 * 1024 } });
 
+// Department Gallery Upload - supports all file types
+const galleryStorage = multer.diskStorage({
+  destination: deptGalleryDir,
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9.]/g,'_')}`)
+});
+const galleryUpload = multer({ 
+  storage: galleryStorage, 
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = /\.(png|jpg|jpeg|gif|pdf|xlsx|xls|docx|doc)$/i;
+    if (allowed.test(file.originalname)) cb(null, true);
+    else cb(new Error('File type na chalega'), false);
+  }
+});
+
 // Serve images
 router.get('/uploads/:filename', (req, res) => {
   res.sendFile(path.join(imgDir, req.params.filename));
+});
+
+// Serve department gallery files
+router.get('/gallery/:filename', (req, res) => {
+  res.sendFile(path.join(deptGalleryDir, req.params.filename));
 });
 
 // ── AUTH ──────────────────────────────────────────────────────────────────────
@@ -306,6 +328,40 @@ router.get('/projects/:id', auth, async (req, res) => {
   res.json({ project, items, tasks, chains });
 });
 
+// Get images grouped by production chain steps for a project
+router.get('/projects/:id/images-by-stage', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [chains] = await db.query(`
+      SELECT pc.*, d.name as dept_name, d.color as dept_color
+      FROM production_chains pc
+      JOIN departments d ON d.id=pc.department_id
+      WHERE pc.project_id=? ORDER BY pc.stage_order`, [req.params.id]);
+    
+    const result = [];
+    for (const chain of chains) {
+      // Get all tasks for this stage and their images
+      const [images] = await db.query(`
+        SELECT ti.*, u.name as uploaded_by_name, ta.task_title
+        FROM task_images ti
+        JOIN task_assignments ta ON ta.id=ti.task_id
+        JOIN users u ON u.id=ti.uploaded_by
+        WHERE ta.project_id=? AND ta.department_id=? AND ta.stage_order=?
+        ORDER BY ti.created_at DESC`, [req.params.id, chain.department_id, chain.stage_order]);
+      
+      result.push({
+        stage_order: chain.stage_order,
+        dept_name: chain.dept_name,
+        dept_color: chain.dept_color,
+        images: images
+      });
+    }
+    res.json(result);
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ── CHANGE PASSWORD ─────────────────────────────────────────────────────────────
 router.put('/auth/change-password', auth, async (req, res) => {
   const db = await getPool();
@@ -417,7 +473,16 @@ async function _createChainTasks(db, project_id, item, stages, created_by) {
 // When a chain task completes → auto-advance to next stage
 async function autoAdvanceChain(db, task_id) {
   const [[task]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [task_id]);
-  if (!task || task.status !== 'completed' || !task.project_item_id) return;
+  if (!task || !task.project_item_id) return;
+
+  // If partially completed → transfer done qty to next stage
+  if (task.quantity_completed > 0 && task.quantity_completed < task.quantity_assigned) {
+    await transferPartialQuantityToNextStage(db, task);
+    return;
+  }
+
+  // If fully completed → advance to next stage
+  if (task.status !== 'completed') return;
 
   // Find next stage task for same item
   const [[nextTask]] = await db.query(`
@@ -437,6 +502,57 @@ async function autoAdvanceChain(db, task_id) {
   if (waiting.cnt === 0) {
     await db.query("UPDATE project_items SET status='completed' WHERE id=?", [task.project_item_id]);
   }
+}
+
+// Transfer completed quantity to next stage in production chain
+async function transferPartialQuantityToNextStage(db, currentTask) {
+  if (!currentTask.project_item_id || !currentTask.stage_order) return;
+
+  // Find next stage in production chain
+  const [[nextStage]] = await db.query(`
+    SELECT * FROM production_chains 
+    WHERE project_item_id=? AND stage_order>?
+    ORDER BY stage_order LIMIT 1`,
+    [currentTask.project_item_id, currentTask.stage_order]);
+
+  if (!nextStage) return; // No next stage
+
+  const completedQty = currentTask.quantity_completed;
+
+  // Check if next stage task already exists for this item
+  const [[existingNextTask]] = await db.query(`
+    SELECT * FROM task_assignments 
+    WHERE project_item_id=? AND department_id=? AND stage_order=?`,
+    [currentTask.project_item_id, nextStage.department_id, nextStage.stage_order]);
+
+  if (existingNextTask) {
+    // Add to existing next stage task
+    const newQty = parseInt(existingNextTask.quantity_assigned, 10) + completedQty;
+    await db.query(
+      'UPDATE task_assignments SET quantity_assigned=? WHERE id=?',
+      [newQty, existingNextTask.id]
+    );
+  } else {
+    // Create new task for next stage with completed quantity
+    const [[dept]] = await db.query('SELECT * FROM departments WHERE id=?', [nextStage.department_id]);
+    const taskTitle = `${currentTask.task_title.split('—')[0].trim()} — ${dept.name}`;
+    
+    await db.query(`
+      INSERT INTO task_assignments 
+      (project_id, project_item_id, assign_type, department_id, stage_order,
+       task_title, task_description, quantity_assigned, status, priority)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [currentTask.project_id, currentTask.project_item_id, 'department', nextStage.department_id,
+       nextStage.stage_order, taskTitle, currentTask.task_description,
+       completedQty, 'waiting', currentTask.priority]);
+  }
+
+  // Record the transfer
+  await db.query(`
+    INSERT INTO task_progress (task_id, updated_by, quantity_done, status, notes)
+    VALUES (?,?,?,?,?)`,
+    [currentTask.id, 1, completedQty, 'partial_transferred', 
+     `${completedQty} units transferred to next stage (${nextStage.stage_order})`]);
 }
 
 // ── TASKS ─────────────────────────────────────────────────────────────────────
@@ -568,6 +684,19 @@ router.delete('/tasks/:id', auth, adminOnly, async (req, res) => {
   }
 });
 
+// Helper: Get previous stage's completed quantity for stage dependency validation
+async function getPreviousStageQuantity(db, projectItemId, currentStageOrder) {
+  if (currentStageOrder <= 1) return null; // First stage has no dependency
+  
+  const [[prev]] = await db.query(`
+    SELECT ta.quantity_completed
+    FROM task_assignments ta
+    WHERE ta.project_item_id=? AND ta.stage_order=?
+    LIMIT 1`, [projectItemId, currentStageOrder - 1]);
+  
+  return prev ? prev.quantity_completed : null;
+}
+
 // Worker progress update
 router.patch('/tasks/:id/progress', auth, async (req, res) => {
   const db = await getPool();
@@ -577,6 +706,18 @@ router.patch('/tasks/:id/progress', auth, async (req, res) => {
   const newQty = quantity_completed !== undefined ? parseInt(quantity_completed, 10) : task.quantity_completed;
   const assignedQty = parseInt(task.quantity_assigned, 10);
   let newStatus = status || task.status;
+  
+  // Stage dependency validation: check previous stage's completed quantity
+  if (task.stage_order > 1 && newQty > task.quantity_completed) {
+    const prevStageQty = await getPreviousStageQuantity(db, task.project_item_id, task.stage_order);
+    if (prevStageQty !== null && newQty > prevStageQty) {
+      return res.status(400).json({ 
+        message: `Pehle stage mein sirf ${prevStageQty} quantity complete hue hain, isliye aap ${newQty} nahi kar sakte. Max ${prevStageQty} hi set kar sakte ho.`,
+        max_allowed: prevStageQty,
+        previous_stage_completed: prevStageQty
+      });
+    }
+  }
 
   // Revert case: admin sets qty=0 and status=pending
   if (newQty === 0 && status === 'pending') {
@@ -594,20 +735,20 @@ router.patch('/tasks/:id/progress', auth, async (req, res) => {
     [newQty, newStatus, worker_notes !== undefined ? worker_notes : task.worker_notes, completedDate, req.params.id]);
   await db.query('INSERT INTO task_progress (task_id,updated_by,quantity_done,status,notes) VALUES (?,?,?,?,?)',
     [req.params.id, req.user.id, newQty, newStatus, worker_notes || '']);
-  // Auto-advance chain
-  if (newStatus === 'completed') await autoAdvanceChain(db, req.params.id);
+  
+  // Auto-advance chain (handles both partial and full completion)
+  if (newQty > 0) await autoAdvanceChain(db, req.params.id);
+  
   const [[updated]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
   res.json({ message: 'Updated', task: updated });
 });
 
-// Task transfer
-router.post('/tasks/:id/transfer', auth, async (req, res) => {
+// Task transfer (ADMIN ONLY)
+router.post('/tasks/:id/transfer', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   const { to_worker_id, reason } = req.body;
   const [[task]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
   if (!task) return res.status(404).json({ message: 'Not found' });
-  if (req.user.role === 'worker' && task.worker_id !== req.user.id)
-    return res.status(403).json({ message: 'Sirf apna task transfer kar sakte ho' });
   if (task.status === 'completed')
     return res.status(400).json({ message: 'Completed task transfer nahi ho sakta' });
   await db.query('INSERT INTO task_transfers (task_id,from_worker_id,to_worker_id,transferred_by,reason) VALUES (?,?,?,?,?)',
@@ -643,6 +784,153 @@ router.delete('/tasks/:id/images/:imgId', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
+// Get all images for a project grouped by worker (for worker view)
+router.get('/projects/:projectId/images-for-worker', auth, async (req, res) => {
+  const db = await getPool();
+  const workerId = req.user.id;
+  try {
+    // Get all tasks for this project that worker can see (assigned to them or in their department)
+    const [myDepts] = await db.query(
+      'SELECT department_id FROM worker_departments WHERE worker_id=?', [workerId]
+    );
+    const deptIds = myDepts.map(d => d.department_id);
+    
+    // Build query to get tasks: either assigned to this worker OR in their departments
+    let taskQuery = `
+      SELECT ta.id FROM task_assignments ta
+      WHERE ta.project_id=? AND (ta.worker_id=?`;
+    const queryParams = [req.params.projectId, workerId];
+    
+    if (deptIds.length > 0) {
+      taskQuery += ` OR ta.department_id IN (${deptIds.map(() => '?').join(',')})`;
+      queryParams.push(...deptIds);
+    }
+    taskQuery += ')';
+    
+    const [tasks] = await db.query(taskQuery, queryParams);
+    const taskIds = tasks.map(t => t.id);
+    
+    if (taskIds.length === 0) {
+      return res.json([]);
+    }
+    
+    // Get all images for these tasks grouped by worker
+    const [images] = await db.query(`
+      SELECT ti.*, u.name as uploaded_by_name, ta.task_title
+      FROM task_images ti
+      JOIN task_assignments ta ON ta.id=ti.task_id
+      JOIN users u ON u.id=ti.uploaded_by
+      WHERE ti.task_id IN (${taskIds.map(() => '?').join(',')})
+      ORDER BY u.name, ti.created_at DESC
+    `, taskIds);
+    
+    // Group by worker
+    const grouped = {};
+    images.forEach(img => {
+      if (!grouped[img.uploaded_by_name]) {
+        grouped[img.uploaded_by_name] = [];
+      }
+      grouped[img.uploaded_by_name].push(img);
+    });
+    
+    // Convert to array format
+    const result = Object.entries(grouped).map(([workerName, imgs]) => ({
+      worker_name: workerName,
+      images: imgs
+    }));
+    
+    res.json(result);
+  } catch (err) {
+    console.error('Error fetching project images for worker:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── DEPARTMENT GALLERY ─────────────────────────────────────────────────────────
+// Upload files to department gallery (PNG, Excel, PDF, Docs)
+router.post('/departments/:id/gallery', auth, galleryUpload.array('files', 10), async (req, res) => {
+  const db = await getPool();
+  const files = req.files || [];
+  const { description } = req.body;
+  
+  // Check if user belongs to this department
+  const [[userDept]] = await db.query(`
+    SELECT * FROM worker_departments WHERE worker_id=? AND department_id=?`, 
+    [req.user.id, req.params.id]);
+  
+  if (!userDept && req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Aap is department mein nahi ho' });
+  }
+  
+  for (const f of files) {
+    const ext = path.extname(f.originalname);
+    await db.query(`INSERT INTO department_gallery 
+      (department_id, uploaded_by, file_path, file_name, file_type, description)
+      VALUES (?,?,?,?,?,?)`,
+      [req.params.id, req.user.id, f.filename, f.originalname, ext, description || '']);
+  }
+  res.json({ message: `${files.length} file(s) uploaded`, count: files.length });
+});
+
+// Get department gallery files
+router.get('/departments/:id/gallery', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [files] = await db.query(`
+      SELECT dg.*,u.name as uploaded_by_name, d.name as department_name
+      FROM department_gallery dg
+      JOIN users u ON u.id=dg.uploaded_by
+      JOIN departments d ON d.id=dg.department_id
+      WHERE dg.department_id=? 
+      ORDER BY dg.created_at DESC`, [req.params.id]);
+    res.json(files);
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Delete file from department gallery
+router.delete('/departments/:id/gallery/:fileId', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  const [[file]] = await db.query(`SELECT * FROM department_gallery WHERE id=? AND department_id=?`, 
+    [req.params.fileId, req.params.id]);
+  if (!file) return res.status(404).json({ message: 'File not found' });
+  try { 
+    fs.unlinkSync(path.join(deptGalleryDir, file.file_path)); 
+  } catch {}
+  await db.query('DELETE FROM department_gallery WHERE id=?', [req.params.fileId]);
+  res.json({ message: 'File deleted' });
+});
+
+// Get previous stage constraint for a task (for UI display)
+router.get('/tasks/:id/stage-constraint', auth, async (req, res) => {
+  const db = await getPool();
+  const [[task]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
+  if (!task) return res.status(404).json({ message: 'Task not found' });
+  
+  if (task.stage_order <= 1) {
+    return res.json({ has_constraint: false, constraint_qty: null });
+  }
+  
+  const [[prev]] = await db.query(`
+    SELECT ta.quantity_completed, d.name as dept_name
+    FROM task_assignments ta
+    LEFT JOIN departments d ON d.id=ta.department_id
+    WHERE ta.project_item_id=? AND ta.stage_order=?
+    LIMIT 1`, [task.project_item_id, task.stage_order - 1]);
+  
+  if (!prev) {
+    return res.json({ has_constraint: false, constraint_qty: null });
+  }
+  
+  res.json({ 
+    has_constraint: true, 
+    constraint_qty: prev.quantity_completed,
+    previous_dept: prev.dept_name,
+    message: `Previous department "${prev.dept_name}" has completed ${prev.quantity_completed} units. You can work on max ${prev.quantity_completed} units.`
+  });
+});
+
 // ── TIME TRACKING ─────────────────────────────────────────────────────────────
 router.post('/tasks/:id/clock-in', auth, async (req, res) => {
   const db = await getPool();
@@ -671,6 +959,34 @@ router.get('/tasks/:id/active-session', auth, async (req, res) => {
   const db = await getPool();
   const [[active]] = await db.query('SELECT * FROM worker_time_logs WHERE task_id=? AND worker_id=? AND clock_out IS NULL', [req.params.id, req.user.id]);
   res.json({ active: active || null });
+});
+
+// Manual time entry — for when worker didn't use clock-in/clock-out
+router.post('/tasks/:id/manual-time', auth, async (req, res) => {
+  const db = await getPool();
+  const { clock_in, clock_out, notes } = req.body;
+  if (!clock_in || !clock_out) return res.status(400).json({ message: 'Clock-in aur clock-out time dono zaroori hain' });
+  
+  const clockInDt = new Date(clock_in);
+  const clockOutDt = new Date(clock_out);
+  if (clockOutDt <= clockInDt) return res.status(400).json({ message: 'Clock-out, clock-in se pehle nahi ho sakta' });
+  
+  const durationMins = Math.round((clockOutDt - clockInDt) / 60000);
+  if (durationMins < 1) return res.status(400).json({ message: 'Duration kam se kam 1 minute hona chahiye' });
+  
+  // Admin can enter time for any worker, otherwise use req.user.id
+  const finalWorkerId = (req.user.role === 'admin' && req.body.worker_id) ? req.body.worker_id : req.user.id;
+  
+  try {
+    const [r] = await db.query(
+      'INSERT INTO worker_time_logs (task_id,worker_id,clock_in,clock_out,duration_minutes,notes) VALUES (?,?,?,?,?,?)',
+      [req.params.id, finalWorkerId, clock_in, clock_out, durationMins, notes || 'Manual entry']
+    );
+    const [[log]] = await db.query('SELECT * FROM worker_time_logs WHERE id=?', [r.insertId]);
+    res.json({ message: 'Manual time entry save ho gayi', log });
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 // ── REPORTS ───────────────────────────────────────────────────────────────────
@@ -772,16 +1088,22 @@ router.get('/reports/product-tracking', auth, async (req, res) => {
     ORDER BY p.created_at DESC,pi.id`, params);
   if (!items.length) return res.json({ items: [], stages: [] });
   const itemIds = items.map(i=>i.id);
-  const [chains] = await db.query(`
-    SELECT pc.*,d.name as dept_name,d.color as dept_color
-    FROM production_chains pc JOIN departments d ON d.id=pc.department_id
-    WHERE pc.project_item_id IN (${itemIds.join(',')}) ORDER BY pc.stage_order`);
-  const [tasks] = await db.query(`
-    SELECT ta.*,d.name as dept_name,d.color as dept_color,u.name as worker_name
-    FROM task_assignments ta
-    LEFT JOIN departments d ON d.id=ta.department_id
-    LEFT JOIN users u ON u.id=ta.worker_id
-    WHERE ta.project_item_id IN (${itemIds.join(',')}) ORDER BY ta.stage_order`);
+  let chains = [];
+  let tasks = [];
+  if (itemIds.length > 0) {
+    const [chainsData] = await db.query(`
+      SELECT pc.*,d.name as dept_name,d.color as dept_color
+      FROM production_chains pc JOIN departments d ON d.id=pc.department_id
+      WHERE pc.project_item_id IN (${itemIds.map(() => '?').join(',')}) ORDER BY pc.stage_order`, itemIds);
+    chains = chainsData;
+    const [tasksData] = await db.query(`
+      SELECT ta.*,d.name as dept_name,d.color as dept_color,u.name as worker_name
+      FROM task_assignments ta
+      LEFT JOIN departments d ON d.id=ta.department_id
+      LEFT JOIN users u ON u.id=ta.worker_id
+      WHERE ta.project_item_id IN (${itemIds.map(() => '?').join(',')}) ORDER BY ta.stage_order`, itemIds);
+    tasks = tasksData;
+  }
   const chainsByItem = {}, tasksByItem = {};
   for (const c of chains) { if (!chainsByItem[c.project_item_id]) chainsByItem[c.project_item_id] = []; chainsByItem[c.project_item_id].push(c); }
   for (const t of tasks) { if (!tasksByItem[t.project_item_id]) tasksByItem[t.project_item_id] = []; tasksByItem[t.project_item_id].push(t); }
@@ -876,7 +1198,7 @@ router.get('/reports/time', auth, adminOnly, async (req, res) => {
   const where = 'WHERE ' + conds.join(' AND ');
   const [logs] = await db.query(`
     SELECT tl.*,u.name as worker_name,u.hourly_rate,
-      ta.task_title,p.name as project_name,p.project_id as proj_code,
+      ta.task_title,p.name as project_name,p.client_name,p.project_id as proj_code,
       ROUND(tl.duration_minutes/60*u.hourly_rate,2) as earnings
     FROM worker_time_logs tl
     JOIN users u ON u.id=tl.worker_id
@@ -1336,6 +1658,32 @@ router.post('/workers/bulk-departments', auth, adminOnly, async (req, res) => {
       }
     }
     res.json({ message: `${worker_ids.length} workers updated` });
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── DELETE ALL DATA ───────────────────────────────────────────────────────────
+router.post('/admin/delete-all-data', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    // Delete all project-related data
+    await db.query('DELETE FROM task_transfers');
+    await db.query('DELETE FROM task_images');
+    await db.query('DELETE FROM worker_time_logs');
+    await db.query('DELETE FROM daily_progress');
+    await db.query('DELETE FROM task_progress');
+    await db.query('DELETE FROM task_assignments');
+    await db.query('DELETE FROM production_chains');
+    await db.query('DELETE FROM project_items');
+    await db.query('DELETE FROM projects');
+    await db.query('DELETE FROM worker_departments');
+    
+    // Keep workers/departments but clear their associations
+    // Keep users (admin + workers) but mark workers as inactive
+    await db.query("UPDATE users SET is_active=0 WHERE role='worker'");
+    
+    res.json({ message: 'All data deleted successfully' });
   } catch(err) {
     res.status(500).json({ message: err.message });
   }
