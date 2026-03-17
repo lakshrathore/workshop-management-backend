@@ -118,6 +118,13 @@ async function initializeDatabase() {
     FOREIGN KEY (uploaded_by) REFERENCES users(id)
   )`);
 
+  // Add customer_name to projects if not exists
+  await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255)`).catch(()=>{});
+  
+  // Add photo_id to task_assignments if not exists
+  await db.query(`ALTER TABLE task_assignments ADD COLUMN IF NOT EXISTS photo_id INT`).catch(()=>{});
+  await db.query(`ALTER TABLE task_assignments ADD CONSTRAINT IF NOT EXISTS fk_task_photo FOREIGN KEY (photo_id) REFERENCES task_images(id) ON DELETE SET NULL`).catch(()=>{});
+
   // Worker time tracking
   await db.query(`CREATE TABLE IF NOT EXISTS worker_time_logs (
     id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, worker_id INT NOT NULL,

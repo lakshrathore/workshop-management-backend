@@ -585,13 +585,15 @@ router.get('/tasks/all', auth, adminOnly, async (req, res) => {
   try {
     const [rows] = await db.query(`
       SELECT ta.*, u.name as worker_name, d.name as department_name, d.color as dept_color,
-        p.name as project_name, p.project_id as proj_code,
-        pi.item_name, COALESCE(pi.proto_code,'') as proto_code
+        p.name as project_name, p.project_id as proj_code, p.client_name as customer_name,
+        pi.item_name, COALESCE(pi.proto_code,'') as proto_code,
+        ti.id as photo_id, ti.image_path as photo_path
       FROM task_assignments ta
       LEFT JOIN users u ON u.id=ta.worker_id
       LEFT JOIN departments d ON d.id=ta.department_id
       LEFT JOIN projects p ON p.id=ta.project_id
       LEFT JOIN project_items pi ON pi.id=ta.project_item_id
+      LEFT JOIN task_images ti ON ti.id=ta.photo_id
       ${where} ORDER BY ta.created_at DESC LIMIT 200`, params);
     res.json(rows);
   } catch(err) {
