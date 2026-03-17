@@ -196,25 +196,37 @@ router.put('/workers/:id', auth, adminOnly, async (req, res) => {
 router.delete('/workers/:id', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   try {
-    // Check if worker has any tasks/data
-    const [tasks] = await db.query(
-      'SELECT COUNT(*) as cnt FROM task_assignments WHERE worker_id=?', [req.params.id]
-    );
-    const [timeLogs] = await db.query(
-      'SELECT COUNT(*) as cnt FROM worker_time_logs WHERE worker_id=?', [req.params.id]
-    );
-    const [queries] = await db.query(
-      'SELECT COUNT(*) as cnt FROM worker_queries WHERE raised_by=?', [req.params.id]
-    );
-    const totalData = tasks[0].cnt + timeLogs[0].cnt + queries[0].cnt;
-    if (totalData > 0) {
-      return res.status(400).json({
-        message: `Worker delete nahi ho sakta — ${tasks[0].cnt} tasks, ${timeLogs[0].cnt} time logs exist hain. Pehle worker ko deactivate karo.`
-      });
+    // First check if worker exists
+    const [workerCheck] = await db.query('SELECT id FROM users WHERE id=? AND role="worker"', [req.params.id]);
+    if (!workerCheck[0]) return res.status(404).json({ message: 'Worker not found' });
+
+    // Get all tasks assigned to this worker
+    const [tasks] = await db.query('SELECT id FROM task_assignments WHERE worker_id=?', [req.params.id]);
+    
+    // Delete all related data for each task
+    for (const task of tasks) {
+      await db.query('DELETE FROM task_images WHERE task_id=?', [task.id]);
+      await db.query('DELETE FROM worker_time_logs WHERE task_id=?', [task.id]);
+      await db.query('DELETE FROM task_progress WHERE task_id=?', [task.id]);
+      await db.query('DELETE FROM task_transfers WHERE task_id=?', [task.id]);
     }
+    
+    // Delete all queries raised by this worker
+    await db.query('DELETE FROM worker_queries WHERE raised_by=?', [req.params.id]);
+    
+    // Delete all tasks assigned to this worker
+    await db.query('DELETE FROM task_assignments WHERE worker_id=?', [req.params.id]);
+    
+    // Delete all time logs for this worker
+    await db.query('DELETE FROM worker_time_logs WHERE worker_id=?', [req.params.id]);
+    
+    // Delete worker from departments
     await db.query('DELETE FROM worker_departments WHERE worker_id=?', [req.params.id]);
+    
+    // Finally delete the worker
     await db.query('DELETE FROM users WHERE id=? AND role="worker"', [req.params.id]);
-    res.json({ message: 'Worker deleted' });
+    
+    res.json({ message: 'Worker and all related data deleted successfully' });
   } catch(err) {
     res.status(500).json({ message: err.message });
   }
@@ -698,6 +710,11 @@ router.delete('/tasks/:id', auth, adminOnly, async (req, res) => {
     if (task[0].status === 'in_progress') {
       return res.status(400).json({ message: 'In-progress task delete nahi ho sakti — pehle complete karo' });
     }
+    // Delete task and all related data
+    await db.query('DELETE FROM task_images WHERE task_id=?', [req.params.id]);
+    await db.query('DELETE FROM worker_time_logs WHERE task_id=?', [req.params.id]);
+    await db.query('DELETE FROM task_progress WHERE task_id=?', [req.params.id]);
+    await db.query('DELETE FROM task_transfers WHERE task_id=?', [req.params.id]);
     await db.query('DELETE FROM task_assignments WHERE id=?', [req.params.id]);
     res.json({ message: 'Task deleted' });
   } catch(err) {
