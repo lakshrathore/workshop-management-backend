@@ -262,14 +262,28 @@ router.post('/projects', auth, adminOnly, async (req, res) => {
   // Auto-generate project_id if not provided
   let finalProjectId = project_id;
   if (!finalProjectId || finalProjectId.trim() === '') {
-    const year = new Date().getFullYear().toString().slice(-2);
-    const [last] = await db.query("SELECT project_id FROM projects ORDER BY id DESC LIMIT 1");
-    let nextNum = 1001;
-    if (last.length > 0) {
-      const match = last[0].project_id?.match(/\d+$/);
-      if (match) nextNum = parseInt(match[0]) + 1;
+    try {
+      // Get custom prefix and starting number from settings
+      const [settings] = await db.query("SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('project_id_prefix', 'project_id_start_number')");
+      const settingsMap = {};
+      settings.forEach(s => settingsMap[s.setting_key] = s.setting_value);
+      const prefix = settingsMap.project_id_prefix || 'WM';
+      const startNum = parseInt(settingsMap.project_id_start_number || '1001');
+      
+      const year = new Date().getFullYear().toString().slice(-2);
+      const [last] = await db.query("SELECT project_id FROM projects ORDER BY id DESC LIMIT 1");
+      let nextNum = startNum;
+      if (last.length > 0) {
+        const match = last[0].project_id?.match(/\d+$/);
+        if (match) nextNum = parseInt(match[0]) + 1;
+      }
+      finalProjectId = `${prefix}-${year}-${nextNum}`;
+    } catch (err) {
+      console.error('Settings fetch error:', err.message);
+      // Fallback to default
+      const year = new Date().getFullYear().toString().slice(-2);
+      finalProjectId = `WM-${year}-1001`;
     }
-    finalProjectId = `WM-${year}-${nextNum}`;
   }
   try {
     const [r] = await db.query('INSERT INTO projects (project_id,name,client_name,client_phone,description,priority,order_date,deadline,total_amount,notes,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
