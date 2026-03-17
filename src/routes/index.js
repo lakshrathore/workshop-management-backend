@@ -424,30 +424,35 @@ router.delete('/projects/:projectId/items/:id', auth, adminOnly, async (req, res
 // ── PRODUCTION CHAIN ──────────────────────────────────────────────────────────
 // Set/replace chain for a project (or project item)
 router.post('/projects/:id/chain', auth, adminOnly, async (req, res) => {
-  const db = await getPool();
-  const { project_item_id, stages } = req.body;
-  // stages = [{department_id, stage_order}]
-  if (project_item_id) {
-    await db.query('DELETE FROM production_chains WHERE project_id=? AND project_item_id=?', [req.params.id, project_item_id]);
-  } else {
-    await db.query('DELETE FROM production_chains WHERE project_id=? AND project_item_id IS NULL', [req.params.id]);
-  }
-  for (const s of stages) {
-    await db.query('INSERT INTO production_chains (project_id,project_item_id,department_id,stage_order) VALUES (?,?,?,?)',
-      [req.params.id, project_item_id || null, s.department_id, s.stage_order]);
-  }
-  // Auto-create tasks for each stage, linked to each item
-  if (!project_item_id) {
-    // Project-level chain: apply to all items
-    const [items] = await db.query('SELECT * FROM project_items WHERE project_id=?', [req.params.id]);
-    for (const item of items) {
-      await _createChainTasks(db, req.params.id, item, stages, req.user.id);
+  try {
+    const db = await getPool();
+    const { project_item_id, stages } = req.body;
+    // stages = [{department_id, stage_order}]
+    if (project_item_id) {
+      await db.query('DELETE FROM production_chains WHERE project_id=? AND project_item_id=?', [req.params.id, project_item_id]);
+    } else {
+      await db.query('DELETE FROM production_chains WHERE project_id=? AND project_item_id IS NULL', [req.params.id]);
     }
-  } else {
-    const [[item]] = await db.query('SELECT * FROM project_items WHERE id=?', [project_item_id]);
-    if (item) await _createChainTasks(db, req.params.id, item, stages, req.user.id);
+    for (const s of stages) {
+      await db.query('INSERT INTO production_chains (project_id,project_item_id,department_id,stage_order) VALUES (?,?,?,?)',
+        [req.params.id, project_item_id || null, s.department_id, s.stage_order]);
+    }
+    // Auto-create tasks for each stage, linked to each item
+    if (!project_item_id) {
+      // Project-level chain: apply to all items
+      const [items] = await db.query('SELECT * FROM project_items WHERE project_id=?', [req.params.id]);
+      for (const item of items) {
+        await _createChainTasks(db, req.params.id, item, stages, req.user.id);
+      }
+    } else {
+      const [[item]] = await db.query('SELECT * FROM project_items WHERE id=?', [project_item_id]);
+      if (item) await _createChainTasks(db, req.params.id, item, stages, req.user.id);
+    }
+    res.json({ message: 'Chain set kiya' });
+  } catch (err) {
+    console.error('Chain save error:', err);
+    res.status(500).json({ message: err.message });
   }
-  res.json({ message: 'Chain set kiya' });
 });
 
 async function _createChainTasks(db, project_id, item, stages, created_by) {
@@ -1088,13 +1093,17 @@ router.get('/reports/product-tracking', auth, async (req, res) => {
     ORDER BY p.created_at DESC,pi.id`, params);
   if (!items.length) return res.json({ items: [], stages: [] });
   const itemIds = items.map(i=>i.id);
+  const projectIds = [...new Set(items.map(i => i.project_id))];
   let chains = [];
   let tasks = [];
   if (itemIds.length > 0) {
+    // Get both item-specific AND project-level chains
     const [chainsData] = await db.query(`
       SELECT pc.*,d.name as dept_name,d.color as dept_color
       FROM production_chains pc JOIN departments d ON d.id=pc.department_id
-      WHERE pc.project_item_id IN (${itemIds.map(() => '?').join(',')}) ORDER BY pc.stage_order`, itemIds);
+      WHERE (pc.project_item_id IN (${itemIds.map(() => '?').join(',')}) 
+             OR (pc.project_item_id IS NULL AND pc.project_id IN (${projectIds.map(() => '?').join(',')})))
+      ORDER BY pc.stage_order`, [...itemIds, ...projectIds]);
     chains = chainsData;
     const [tasksData] = await db.query(`
       SELECT ta.*,d.name as dept_name,d.color as dept_color,u.name as worker_name
@@ -1104,11 +1113,20 @@ router.get('/reports/product-tracking', auth, async (req, res) => {
       WHERE ta.project_item_id IN (${itemIds.map(() => '?').join(',')}) ORDER BY ta.stage_order`, itemIds);
     tasks = tasksData;
   }
-  const chainsByItem = {}, tasksByItem = {};
-  for (const c of chains) { if (!chainsByItem[c.project_item_id]) chainsByItem[c.project_item_id] = []; chainsByItem[c.project_item_id].push(c); }
+  const chainsByItem = {}, projectChains = {}, tasksByItem = {};
+  for (const c of chains) {
+    if (c.project_item_id) {
+      if (!chainsByItem[c.project_item_id]) chainsByItem[c.project_item_id] = [];
+      chainsByItem[c.project_item_id].push(c);
+    } else {
+      if (!projectChains[c.project_id]) projectChains[c.project_id] = [];
+      projectChains[c.project_id].push(c);
+    }
+  }
   for (const t of tasks) { if (!tasksByItem[t.project_item_id]) tasksByItem[t.project_item_id] = []; tasksByItem[t.project_item_id].push(t); }
   const result = items.map(item => {
-    const chain = chainsByItem[item.id] || [];
+    // Use item-specific chain if exists, otherwise use project-level chain
+    const chain = chainsByItem[item.id] || projectChains[item.project_id] || [];
     const itemTasks = tasksByItem[item.id] || [];
     const stages = chain.map(c => {
       const t = itemTasks.find(t => t.department_id === c.department_id);
