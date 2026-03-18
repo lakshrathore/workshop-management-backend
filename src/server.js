@@ -34,12 +34,17 @@ const { getPool } = require('./database');
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
   const db = await getPool();
-  const [rows] = await db.query('SELECT * FROM users WHERE username=? AND is_active=1', [username]);
-  if (!rows.length) return res.status(401).json({ message: 'Invalid credentials' });
-  if (!bcrypt.compareSync(password, rows[0].password)) return res.status(401).json({ message: 'Invalid credentials' });
-  const token = jwt.sign({ id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, process.env.JWT_SECRET, { expiresIn: '24h' });
-  const [depts] = await db.query(`SELECT d.* FROM departments d JOIN worker_departments wd ON wd.department_id=d.id WHERE wd.worker_id=?`, [rows[0].id]);
-  res.json({ token, user: { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role, departments: depts } });
+  try {
+    const [rows] = await db.query('SELECT * FROM users WHERE username=? AND is_active=1', [username]);
+    if (!rows.length) return res.status(401).json({ message: 'Invalid credentials' });
+    if (!bcrypt.compareSync(password, rows[0].password)) return res.status(401).json({ message: 'Invalid credentials' });
+    const token = jwt.sign({ id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, process.env.JWT_SECRET, { expiresIn: '24h' });
+    const [depts] = await db.query(`SELECT d.* FROM departments d LEFT JOIN worker_departments wd ON wd.department_id=d.id WHERE wd.worker_id=?`, [rows[0].id]).catch(() => [[]]);
+    res.json({ token, user: { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role, departments: depts[0] || [] } });
+  } catch(err) {
+    console.error('Login error:', err.message);
+    res.status(500).json({ message: 'Login failed' });
+  }
 });
 
 const apiRoutes = require('./routes');
