@@ -579,11 +579,12 @@ async function transferPartialQuantityToNextStage(db, currentTask) {
 // ── TASKS ─────────────────────────────────────────────────────────────────────
 router.get('/tasks/all', auth, adminOnly, async (req, res) => {
   const db = await getPool();
-  const { status, department_id } = req.query;
+  const { status, department_id, worker_id } = req.query;
   let where = 'WHERE 1=1';
   const params = [];
   if (status) { where += ' AND ta.status=?'; params.push(status); }
   if (department_id) { where += ' AND ta.department_id=?'; params.push(department_id); }
+  if (worker_id) { where += ' AND ta.worker_id=?'; params.push(worker_id); }
   try {
     const [rows] = await db.query(`
       SELECT ta.*, u.name as worker_name, d.name as department_name, d.color as dept_color,
