@@ -54,15 +54,9 @@ app.use('/api', backupRoutes);
 
 app.get('/health', (req, res) => res.json({ status: 'OK' }));
 
-// === SERVE REACT FRONTEND (for Electron / production) ===
-const frontendBuild = path.join(__dirname, '..', '..', 'frontend', 'build');
-app.use(express.static(frontendBuild));
+// Frontend is deployed on Vercel, not here
 app.get('*', (req, res) => {
-  res.sendFile(path.join(frontendBuild, 'index.html'), (err) => {
-    if (err) {
-      res.status(404).json({ message: 'Frontend not found', path: frontendBuild });
-    }
-  });
+  res.status(404).json({ message: 'API endpoint not found. Frontend is at https://workshop-management-frontend-885d.vercel.app' });
 });
 
 initializeDatabase().then(() => {
