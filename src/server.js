@@ -14,10 +14,9 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Temp upload
-const tmpDir = './tmp_uploads';
-if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
-const upload = multer({ dest: tmpDir, limits: { fileSize: 5 * 1024 * 1024 } });
+// Cloudinary upload (license screenshots)
+const { licenseUpload } = require('./services/cloudinaryStorage');
+const upload = licenseUpload;
 
 // === LICENSE ROUTES (no guard) ===
 app.get('/api/license/info', getLicenseInfo);

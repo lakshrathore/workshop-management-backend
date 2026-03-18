@@ -3,9 +3,7 @@ const router = express.Router();
 const { getPool } = require('../database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'workshop_secret_2024';
@@ -22,40 +20,18 @@ function adminOnly(req, res, next) {
   next();
 }
 
-// ── Image Upload Setup ────────────────────────────────────────────────────────
-const imgDir = path.join(__dirname, '../../uploads/task-images');
-const deptGalleryDir = path.join(__dirname, '../../uploads/department-gallery');
-fs.mkdirSync(imgDir, { recursive: true });
-fs.mkdirSync(deptGalleryDir, { recursive: true });
-const imgStorage = multer.diskStorage({
-  destination: imgDir,
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9.]/g,'_')}`)
-});
-const imgUpload = multer({ storage: imgStorage, limits: { fileSize: 10 * 1024 * 1024 } });
+// ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
+const { imgUpload, galleryUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 
-// Department Gallery Upload - supports all file types
-const galleryStorage = multer.diskStorage({
-  destination: deptGalleryDir,
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9.]/g,'_')}`)
-});
-const galleryUpload = multer({ 
-  storage: galleryStorage, 
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const allowed = /\.(png|jpg|jpeg|gif|pdf|xlsx|xls|docx|doc)$/i;
-    if (allowed.test(file.originalname)) cb(null, true);
-    else cb(new Error('File type na chalega'), false);
-  }
-});
-
-// Serve images
+// Serve images — redirect to B2 CDN
+// key format stored in DB: "task-images/filename.jpg"
 router.get('/uploads/:filename', (req, res) => {
-  res.sendFile(path.join(imgDir, req.params.filename));
+  res.redirect(getFileUrl(`task-images/${req.params.filename}`));
 });
 
-// Serve department gallery files
+// Serve department gallery files — redirect to B2 CDN
 router.get('/gallery/:filename', (req, res) => {
-  res.sendFile(path.join(deptGalleryDir, req.params.filename));
+  res.redirect(getFileUrl(`department-gallery/${req.params.filename}`));
 });
 
 // ── AUTH ──────────────────────────────────────────────────────────────────────
@@ -839,9 +815,12 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
   const db = await getPool();
   const { image_type, caption } = req.body;
   const files = req.files || [];
-  for (const f of files)
+  for (const f of files) {
+    // f.key = "task-images/1234-photo.jpg"  (set by multer-s3)
+    // f.location = full B2 https URL
     await db.query('INSERT INTO task_images (task_id,uploaded_by,image_path,image_type,caption) VALUES (?,?,?,?,?)',
-      [req.params.id, req.user.id, f.filename, image_type || 'progress', caption || '']);
+      [req.params.id, req.user.id, f.key, image_type || 'progress', caption || '']);
+  }
   res.json({ message: `${files.length} image(s) uploaded`, count: files.length });
 });
 router.get('/tasks/:id/images', auth, async (req, res) => {
@@ -855,7 +834,8 @@ router.delete('/tasks/:id/images/:imgId', auth, async (req, res) => {
   const db = await getPool();
   const [[img]] = await db.query('SELECT * FROM task_images WHERE id=? AND task_id=?', [req.params.imgId, req.params.id]);
   if (!img) return res.status(404).json({ message: 'Not found' });
-  try { fs.unlinkSync(path.join(imgDir, img.image_path)); } catch {}
+  // img.image_path is the B2 key e.g. "task-images/1234-photo.jpg"
+  await deleteFile(img.image_path);
   await db.query('DELETE FROM task_images WHERE id=?', [req.params.imgId]);
   res.json({ message: 'Deleted' });
 });
@@ -940,10 +920,11 @@ router.post('/departments/:id/gallery', auth, galleryUpload.array('files', 10), 
   
   for (const f of files) {
     const ext = path.extname(f.originalname);
+    // f.key = "department-gallery/1234-file.pdf"
     await db.query(`INSERT INTO department_gallery 
       (department_id, uploaded_by, file_path, file_name, file_type, description)
       VALUES (?,?,?,?,?,?)`,
-      [req.params.id, req.user.id, f.filename, f.originalname, ext, description || '']);
+      [req.params.id, req.user.id, f.key, f.originalname, ext, description || '']);
   }
   res.json({ message: `${files.length} file(s) uploaded`, count: files.length });
 });
@@ -971,9 +952,8 @@ router.delete('/departments/:id/gallery/:fileId', auth, adminOnly, async (req, r
   const [[file]] = await db.query(`SELECT * FROM department_gallery WHERE id=? AND department_id=?`, 
     [req.params.fileId, req.params.id]);
   if (!file) return res.status(404).json({ message: 'File not found' });
-  try { 
-    fs.unlinkSync(path.join(deptGalleryDir, file.file_path)); 
-  } catch {}
+  // file.file_path is the B2 key e.g. "department-gallery/1234-file.pdf"
+  await deleteFile(file.file_path);
   await db.query('DELETE FROM department_gallery WHERE id=?', [req.params.fileId]);
   res.json({ message: 'File deleted' });
 });
