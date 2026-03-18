@@ -255,14 +255,40 @@ router.get('/projects', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
       SELECT p.*,
-        COUNT(DISTINCT pi.id) as item_count,
-        COUNT(DISTINCT ta.id) as task_count,
-        SUM(ta.status='completed') as completed_tasks,
-        SUM(ta.status='in_progress') as active_tasks
+        (SELECT COUNT(id) FROM project_items WHERE project_id=p.id) as item_count,
+        (SELECT COALESCE(SUM(quantity), 0) FROM project_items WHERE project_id=p.id) as total_item_qty,
+        (SELECT COALESCE(SUM(quantity), 0) FROM project_items pi 
+         WHERE pi.project_id=p.id 
+         AND NOT EXISTS (
+           SELECT 1 FROM task_assignments ta 
+           WHERE ta.project_item_id=pi.id 
+           AND ta.status != 'completed'
+         )) as completed_item_qty,
+        (SELECT COUNT(id) FROM task_assignments WHERE project_id=p.id AND stage_order=1) as task_count,
+        (SELECT SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) FROM task_assignments WHERE project_id=p.id AND stage_order=1) as completed_tasks,
+        (SELECT SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) FROM task_assignments WHERE project_id=p.id AND stage_order=1) as active_tasks,
+        (SELECT COUNT(id) FROM task_assignments WHERE project_id=p.id AND status='delayed') as delayed_tasks
       FROM projects p
-      LEFT JOIN project_items pi ON pi.project_id=p.id
-      LEFT JOIN task_assignments ta ON ta.project_id=p.id
-      ${where} GROUP BY p.id ORDER BY p.created_at DESC`, params);
+      ${where} ORDER BY p.created_at DESC`, params);
+    
+    // For each project, fetch worker completion data
+    for (let project of rows) {
+      const [workers] = await db.query(`
+        SELECT 
+          u.id,
+          u.name,
+          d.name as department,
+          COALESCE(SUM(ta.quantity_assigned), 0) as assigned_qty,
+          COALESCE(SUM(ta.quantity_completed), 0) as completed_qty
+        FROM task_assignments ta
+        JOIN users u ON ta.worker_id = u.id
+        JOIN departments d ON ta.department_id = d.id
+        WHERE ta.project_id = ?
+        GROUP BY u.id, u.name, d.name
+        ORDER BY u.name`, [project.id]);
+      project.workers = workers;
+    }
+    
     res.json(rows);
   } catch(err) {
     res.status(500).json({ message: err.message });
@@ -509,30 +535,18 @@ async function autoAdvanceChain(db, task_id) {
   // If partially completed → transfer done qty to next stage
   if (task.quantity_completed > 0 && task.quantity_completed < task.quantity_assigned) {
     await transferPartialQuantityToNextStage(db, task);
+    // Check and activate next waiting stage if current stage is completed
+    if (task.status === 'completed' && task.quantity_completed === task.quantity_assigned) {
+      await checkAndActivateNextStage(db, task);
+    }
     return;
   }
 
   // If fully completed → advance to next stage
   if (task.status !== 'completed') return;
 
-  // Find next stage task for same item
-  const [[nextTask]] = await db.query(`
-    SELECT * FROM task_assignments 
-    WHERE project_item_id=? AND stage_order>? AND status='waiting'
-    ORDER BY stage_order LIMIT 1`,
-    [task.project_item_id, task.stage_order]);
-
-  if (nextTask) {
-    await db.query("UPDATE task_assignments SET status='pending' WHERE id=?", [nextTask.id]);
-  }
-
-  // Check if all stages done for this item → mark item complete
-  const [[waiting]] = await db.query(`
-    SELECT COUNT(*) as cnt FROM task_assignments 
-    WHERE project_item_id=? AND status != 'completed'`, [task.project_item_id]);
-  if (waiting.cnt === 0) {
-    await db.query("UPDATE project_items SET status='completed' WHERE id=?", [task.project_item_id]);
-  }
+  // Check and activate next waiting stage
+  await checkAndActivateNextStage(db, task);
 }
 
 // Transfer completed quantity to next stage in production chain
@@ -721,6 +735,30 @@ router.delete('/tasks/:id', auth, adminOnly, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+
+// Helper: Check and activate next waiting stage when current stage is fully completed
+async function checkAndActivateNextStage(db, task) {
+  // Find next waiting stage task for same item
+  const [[nextTask]] = await db.query(`
+    SELECT * FROM task_assignments 
+    WHERE project_item_id=? AND stage_order>? AND status='waiting'
+    ORDER BY stage_order LIMIT 1`,
+    [task.project_item_id, task.stage_order]);
+
+  if (nextTask) {
+    console.log(`Activating next stage task ${nextTask.id} - was waiting, now pending`);
+    await db.query("UPDATE task_assignments SET status='pending' WHERE id=?", [nextTask.id]);
+  }
+
+  // Check if all stages done for this item → mark item complete
+  const [[waiting]] = await db.query(`
+    SELECT COUNT(*) as cnt FROM task_assignments 
+    WHERE project_item_id=? AND status != 'completed'`, [task.project_item_id]);
+  if (waiting.cnt === 0) {
+    console.log(`All stages completed for item ${task.project_item_id}`);
+    await db.query("UPDATE project_items SET status='completed' WHERE id=?", [task.project_item_id]);
+  }
+}
 
 // Helper: Get previous stage's completed quantity for stage dependency validation
 async function getPreviousStageQuantity(db, projectItemId, currentStageOrder) {
