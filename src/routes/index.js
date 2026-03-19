@@ -24,15 +24,34 @@ function adminOnly(req, res, next) {
 const { imgUpload, galleryUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 
 // Serve images — redirect to Cloudinary CDN
-// Path format stored in DB: "workshop/task-images/filename.jpg" (full Cloudinary public_id)
+// Handles both formats:
+// 1. Full Cloudinary URL already stored: https://res.cloudinary.com/...
+// 2. Public ID only: workshop/task-images/abc123
 router.get('/uploads/*', (req, res) => {
-  const publicId = req.params[0]; // Captures everything after /uploads/
-  if (!publicId) {
+  let path = req.params[0]; // Captures everything after /uploads/
+  if (!path) {
     return res.status(400).json({ message: 'No image path provided' });
   }
-  console.log(`🔗 Redirecting image request: /uploads/${publicId}`);
-  const cloudinaryUrl = getFileUrl(publicId);
-  console.log(`➡️ Cloudinary URL: ${cloudinaryUrl}`);
+  
+  console.log(`🔗 Image request: /uploads/${path}`);
+  
+  // If it's already a full Cloudinary URL, use it directly
+  if (path.startsWith('https://')) {
+    console.log(`➡️ Already full URL, redirecting: ${path}`);
+    return res.redirect(path);
+  }
+  
+  // If it's a full URL without https (encoded), decode and use it
+  if (path.includes('res.cloudinary.com')) {
+    const fullUrl = decodeURIComponent(path);
+    console.log(`➡️ Decoded full URL, redirecting: ${fullUrl}`);
+    return res.redirect(fullUrl);
+  }
+  
+  // Otherwise treat as public_id and generate full Cloudinary URL
+  console.log(`📸 Public ID format: ${path}`);
+  const cloudinaryUrl = getFileUrl(path);
+  console.log(`➡️ Generated Cloudinary URL: ${cloudinaryUrl}`);
   return res.redirect(cloudinaryUrl);
 });
 
