@@ -935,6 +935,17 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
       // Clean up the public_id: remove common image extensions
       if (publicId) {
         publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
+        
+        // CRITICAL: Remove "https://" or "http://" if accidentally included
+        // This prevents storing full URLs instead of just public_id
+        if (publicId.startsWith('https://') || publicId.startsWith('http://')) {
+          console.warn('⚠️ WARNING: public_id looks like a full URL, extracting actual public_id');
+          const match = publicId.match(/workshop\/[a-z0-9\-_]+\/[a-z0-9\-_]+/i);
+          if (match) {
+            publicId = match[0];
+            console.log(`✅ Extracted real public_id from URL: ${publicId}`);
+          }
+        }
       }
       
       if (publicId) {
