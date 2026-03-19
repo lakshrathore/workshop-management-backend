@@ -897,41 +897,44 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
     
     for (const f of files) {
       // Log ALL properties on the file object to understand what Cloudinary is returning
-      console.log(`📸 Full file object keys:`, Object.keys(f));
-      console.log(`📸 File details:`, { 
-        fieldname: f.fieldname,
-        originalname: f.originalname,
-        encoding: f.encoding,
-        mimetype: f.mimetype,
-        public_id: f.public_id,
-        filename: f.filename,
-        secure_url: f.secure_url?.substring(0, 100),
-        url: f.url?.substring(0, 100),
-        path: f.path?.substring(0, 100)
-      });
+      console.log(`📸 === File ${files.indexOf(f) + 1} ===`);
+      console.log(`📸 All file properties:`, JSON.stringify(f, null, 2).substring(0, 500));
+      console.log(`📸 Key properties: key=${f.key}, public_id=${f.public_id}, location=${f.location}, path=${f.path}`);
       
       let publicId = '';
       
       // Try multiple ways to get the public_id
-      // Method 1: Direct public_id property (from Cloudinary storage)
-      if (f.public_id && typeof f.public_id === 'string') {
-        publicId = f.public_id;
-        console.log(`✅ Method 1 - Got public_id directly: ${publicId}`);
+      // multer-storage-cloudinary provides: key (public_id), location (secure_url), path (cloudinary URL)
+      
+      // Method 1: Direct key property (from Cloudinary storage)
+      if (f.key && typeof f.key === 'string') {
+        publicId = f.key;
+        console.log(`✅ Method 1 - Got key: ${publicId}`);
       } 
-      // Method 2: Extract from secure_url (most reliable)
-      else if (f.secure_url) {
-        const url = f.secure_url;
-        // Extract everything after /upload/vXXXXXX/ until the end (or query string or extension)
-        const match = url.match(/\/upload\/v[\d]+\/(.+?)(?:\?|\.webp|\.jpg|\.png|\.gif|$)/);
+      // Method 2: Direct public_id property
+      else if (f.public_id && typeof f.public_id === 'string') {
+        publicId = f.public_id;
+        console.log(`✅ Method 2 - Got public_id: ${publicId}`);
+      } 
+      // Method 3: Extract from location (might be secure_url)
+      else if (f.location || f.secure_url) {
+        const url = f.location || f.secure_url;
+        // Extract everything after /upload/vXXXXXX/ 
+        const match = url.match(/\/upload\/v[\d]+\/(.+?)(?:\?|$)/);
         if (match && match[1]) {
           publicId = match[1];
-          console.log(`✅ Method 2 - Extracted from secure_url: ${publicId}`);
+          console.log(`✅ Method 3 - Extracted from URL: ${publicId}`);
         }
       }
-      // Method 3: Extract from filename if it looks like a public_id
-      else if (f.filename && f.filename.includes('workshop')) {
-        publicId = f.filename;
-        console.log(`✅ Method 3 - Got from filename: ${publicId}`);
+      // Method 4: Extract from path if it contains workshop
+      else if (f.path && f.path.includes('workshop')) {
+        publicId = f.path;
+        console.log(`✅ Method 4 - Got from path: ${publicId}`);
+      }
+      
+      // Clean up the public_id: remove common image extensions
+      if (publicId) {
+        publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
       }
       
       if (publicId) {
