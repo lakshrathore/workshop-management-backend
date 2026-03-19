@@ -23,15 +23,29 @@ function adminOnly(req, res, next) {
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
 const { imgUpload, galleryUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 
-// Serve images — redirect to B2 CDN
-// key format stored in DB: "task-images/filename.jpg"
-router.get('/uploads/:filename', (req, res) => {
-  res.redirect(getFileUrl(`task-images/${req.params.filename}`));
+// Serve images — redirect to Cloudinary CDN
+// Path format stored in DB: "workshop/task-images/filename.jpg" (full Cloudinary public_id)
+router.get('/uploads/*', (req, res) => {
+  const publicId = req.params[0]; // Captures everything after /uploads/
+  if (!publicId) {
+    return res.status(400).json({ message: 'No image path provided' });
+  }
+  console.log(`🔗 Redirecting image request: /uploads/${publicId}`);
+  const cloudinaryUrl = getFileUrl(publicId);
+  console.log(`➡️ Cloudinary URL: ${cloudinaryUrl}`);
+  return res.redirect(cloudinaryUrl);
 });
 
-// Serve department gallery files — redirect to B2 CDN
-router.get('/gallery/:filename', (req, res) => {
-  res.redirect(getFileUrl(`department-gallery/${req.params.filename}`));
+// Serve department gallery files — redirect to Cloudinary CDN
+router.get('/gallery/*', (req, res) => {
+  const publicId = req.params[0]; // Captures everything after /gallery/
+  if (!publicId) {
+    return res.status(400).json({ message: 'No image path provided' });
+  }
+  console.log(`🔗 Redirecting gallery request: /gallery/${publicId}`);
+  const cloudinaryUrl = getFileUrl(publicId);
+  console.log(`➡️ Cloudinary URL: ${cloudinaryUrl}`);
+  return res.redirect(cloudinaryUrl);
 });
 
 // ── AUTH ──────────────────────────────────────────────────────────────────────
@@ -846,6 +860,8 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
     const { image_type, caption } = req.body;
     const files = req.files || [];
 
+    console.log(`📸 Image upload request for task ${req.params.id}, received ${files.length} files`);
+
     if (!files || files.length === 0) {
       return res.status(400).json({ message: 'Koi image select nahi kiya', success: false });
     }
@@ -858,10 +874,14 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
 
     // Insert all uploaded images
     for (const f of files) {
-      if (f.key) {
-        // f.key = "task-images/1234-photo.jpg"  (set by multer-s3/cloudinary)
+      console.log(`✅ Saving image: path=${f.path}, filename=${f.filename}`);
+      if (f.path) {
+        // With multer-storage-cloudinary: f.path = public_id (e.g., "workshop/task-images/abc123")
+        // We store this and use /api/uploads/:filename to redirect to Cloudinary
         await db.query('INSERT INTO task_images (task_id,uploaded_by,image_path,image_type,caption) VALUES (?,?,?,?,?)',
-          [req.params.id, req.user.id, f.key, image_type || 'progress', caption || '']);
+          [req.params.id, req.user.id, f.path, image_type || 'progress', caption || '']);
+      } else {
+        console.warn(`⚠️ File missing path: ${JSON.stringify(f.keys())}`);
       }
     }
 
@@ -884,6 +904,10 @@ router.get('/tasks/:id/images', auth, async (req, res) => {
   const [rows] = await db.query(`
     SELECT ti.*,u.name as uploaded_by_name FROM task_images ti
     JOIN users u ON u.id=ti.uploaded_by WHERE ti.task_id=? ORDER BY ti.created_at DESC`, [req.params.id]);
+  console.log(`📸 Getting images for task ${req.params.id}: found ${rows.length} images`);
+  if (rows.length > 0) {
+    console.log(`Image paths: ${rows.map(r => r.image_path).join(', ')}`);
+  }
   res.json(rows);
 });
 router.delete('/tasks/:id/images/:imgId', auth, async (req, res) => {
