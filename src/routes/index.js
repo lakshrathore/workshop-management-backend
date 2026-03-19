@@ -318,19 +318,55 @@ router.put('/projects/:id', auth, adminOnly, async (req, res) => {
 router.delete('/projects/:id', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   try {
+    const { force } = req.query; // force=true for hard delete
+
+    // Check for active tasks
     const [activeTasks] = await db.query(
       "SELECT COUNT(*) as cnt FROM task_assignments WHERE project_id=? AND status IN ('in_progress','on_hold')",
       [req.params.id]
     );
-    if (activeTasks[0].cnt > 0) {
-      return res.status(400).json({ message: `${activeTasks[0].cnt} tasks abhi kaam mein hain (in_progress/on_hold) — pehle complete karo phir delete hoga` });
+
+    if (activeTasks[0].cnt > 0 && !force) {
+      return res.status(400).json({ 
+        message: `${activeTasks[0].cnt} tasks abhi kaam mein hain (in_progress/on_hold) — pehle complete karo phir delete hoga`,
+        active_tasks: activeTasks[0].cnt
+      });
     }
-    // Soft delete - status = 'deleted' (recoverable)
-    await db.query("UPDATE projects SET status='deleted' WHERE id=?", [req.params.id]);
-    res.json({ message: 'Project delete ho gaya' });
+
+    if (force === 'true') {
+      // HARD DELETE - completely remove all related data
+      console.log(`🗑️ HARD DELETE initiated for project ${req.params.id}`);
+
+      // Delete all task images
+      const [tasks] = await db.query('SELECT id FROM task_assignments WHERE project_id=?', [req.params.id]);
+      for (const task of tasks) {
+        await db.query('DELETE FROM task_images WHERE task_id=?', [task.id]);
+        await db.query('DELETE FROM worker_time_logs WHERE task_id=?', [task.id]);
+        await db.query('DELETE FROM task_progress WHERE task_id=?', [task.id]);
+        await db.query('DELETE FROM task_transfers WHERE task_id=?', [task.id]);
+      }
+
+      // Delete all tasks
+      await db.query('DELETE FROM task_assignments WHERE project_id=?', [req.params.id]);
+
+      // Delete all production chains
+      await db.query('DELETE FROM production_chains WHERE project_id=?', [req.params.id]);
+
+      // Delete all project items
+      await db.query('DELETE FROM project_items WHERE project_id=?', [req.params.id]);
+
+      // Finally delete the project
+      await db.query('DELETE FROM projects WHERE id=?', [req.params.id]);
+
+      res.json({ message: '✅ Project completely delete ho gaya (hard delete)', type: 'success' });
+    } else {
+      // SOFT DELETE - just mark as deleted (recoverable)
+      await db.query("UPDATE projects SET status='deleted' WHERE id=?", [req.params.id]);
+      res.json({ message: 'Project delete ho gaya (recoverable)', type: 'soft_delete' });
+    }
   } catch(err) {
-    console.error('delete project error:', err.message);
-    res.status(500).json({ message: err.message });
+    console.error('Delete project error:', err.message);
+    res.status(500).json({ message: 'Delete fail: ' + err.message });
   }
 });
 
@@ -511,18 +547,12 @@ async function autoAdvanceChain(db, task_id) {
   // If partially completed → transfer done qty to next stage
   if (task.quantity_completed > 0 && task.quantity_completed < task.quantity_assigned) {
     await transferPartialQuantityToNextStage(db, task);
-    // Check and activate next waiting stage if current stage is completed
-    if (task.status === 'completed' && task.quantity_completed === task.quantity_assigned) {
-      await checkAndActivateNextStage(db, task);
-    }
-    return;
   }
 
-  // If fully completed → advance to next stage
-  if (task.status !== 'completed') return;
-
-  // Check and activate next waiting stage
-  await checkAndActivateNextStage(db, task);
+  // If task is marked as completed → check and activate next waiting stage
+  if (task.status === 'completed') {
+    await checkAndActivateNextStage(db, task);
+  }
 }
 
 // Transfer completed quantity to next stage in production chain
@@ -811,16 +841,43 @@ router.post('/tasks/:id/transfer', auth, adminOnly, async (req, res) => {
 
 // ── TASK IMAGES ───────────────────────────────────────────────────────────────
 router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req, res) => {
-  const db = await getPool();
-  const { image_type, caption } = req.body;
-  const files = req.files || [];
-  for (const f of files) {
-    // f.key = "task-images/1234-photo.jpg"  (set by multer-s3)
-    // f.location = full B2 https URL
-    await db.query('INSERT INTO task_images (task_id,uploaded_by,image_path,image_type,caption) VALUES (?,?,?,?,?)',
-      [req.params.id, req.user.id, f.key, image_type || 'progress', caption || '']);
+  try {
+    const db = await getPool();
+    const { image_type, caption } = req.body;
+    const files = req.files || [];
+
+    if (!files || files.length === 0) {
+      return res.status(400).json({ message: 'Koi image select nahi kiya', success: false });
+    }
+
+    // Verify task exists
+    const [[task]] = await db.query('SELECT id FROM task_assignments WHERE id=?', [req.params.id]);
+    if (!task) {
+      return res.status(404).json({ message: 'Task nahi mila', success: false });
+    }
+
+    // Insert all uploaded images
+    for (const f of files) {
+      if (f.key) {
+        // f.key = "task-images/1234-photo.jpg"  (set by multer-s3/cloudinary)
+        await db.query('INSERT INTO task_images (task_id,uploaded_by,image_path,image_type,caption) VALUES (?,?,?,?,?)',
+          [req.params.id, req.user.id, f.key, image_type || 'progress', caption || '']);
+      }
+    }
+
+    res.json({ 
+      message: `${files.length} image(s) upload ho gaye`, 
+      count: files.length,
+      success: true 
+    });
+  } catch (err) {
+    console.error('Image upload error:', err.message);
+    res.status(500).json({ 
+      message: 'Image upload fail ho gaya: ' + (err.message || 'Unknown error'),
+      success: false,
+      error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
-  res.json({ message: `${files.length} image(s) uploaded`, count: files.length });
 });
 router.get('/tasks/:id/images', auth, async (req, res) => {
   const db = await getPool();

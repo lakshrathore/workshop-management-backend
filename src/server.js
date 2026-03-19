@@ -48,9 +48,27 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 const apiRoutes = require('./routes');
-const backupRoutes = require('./routes/backupRoutes');
+// const backupRoutes = require('./routes/backupRoutes');  // BACKUP SYSTEM DISABLED
 app.use('/api', apiRoutes);
-app.use('/api', backupRoutes);
+// app.use('/api', backupRoutes);  // BACKUP SYSTEM DISABLED
+
+// Multer error handling middleware
+app.use((err, req, res, next) => {
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ message: 'File bahut bada hai! Max size check karo.' });
+  }
+  if (err.code === 'LIMIT_FILE_COUNT') {
+    return res.status(413).json({ message: 'Zyada saare files upload karne ki koshish ki' });
+  }
+  if (err.message && err.message.includes('File type')) {
+    return res.status(400).json({ message: 'Yeh file type supported nahi hai' });
+  }
+  if (err.message && err.message.includes('cloudinary')) {
+    console.error('Cloudinary error:', err);
+    return res.status(500).json({ message: 'Image service abhi kaam nahi kar raha, baad mein try karo' });
+  }
+  next(err);
+});
 
 app.get('/health', (req, res) => res.json({ status: 'OK' }));
 
