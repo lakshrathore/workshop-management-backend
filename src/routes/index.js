@@ -893,35 +893,48 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
 
     // Insert all uploaded images
     for (const f of files) {
-      console.log(`📸 File object from Cloudinary:`, { path: f.path, public_id: f.public_id, secure_url: f.secure_url });
+      console.log(`📸 Cloudinary file object:`, { filename: f.filename, public_id: f.public_id, path: f.path?.substring(0, 80) });
       
       let publicId = '';
       
-      // Try to get public_id directly from multer-storage-cloudinary response
-      if (f.public_id) {
+      // Cloudinary returns public_id directly from multer-storage-cloudinary
+      if (f.public_id && typeof f.public_id === 'string' && f.public_id.includes('workshop')) {
         publicId = f.public_id;
-        console.log(`✅ Using public_id from file object: ${publicId}`);
+        console.log(`✅ Got public_id directly: ${publicId}`);
       } 
-      // Fallback: extract from secure_url or path (e.g., "workshop/task-images/abc123")
       else if (f.path || f.secure_url) {
-        const url = f.path || f.secure_url;
-        // URL format: https://res.cloudinary.com/CLOUD/image/upload/vVERSION/public/id/with/slashes
-        // Extract everything after /upload/vXXXX/ and remove file extension
-        const match = url.match(/\/upload\/v\d+\/(.+?)(?:\.\w+)?$/);
-        if (match && match[1]) {
-          publicId = match[1].replace(/\.\w+$/, ''); // Remove extension if present
+        // Fallback: extract from full URL
+        // URL: https://res.cloudinary.com/CLOUD/image/upload/vVERSION/workshop/task-images/filename.jpg
+        // Need: workshop/task-images/filename (without extension)
+        const url = f.secure_url || f.path || '';
+        
+        // Find the position of '/upload/v' and skip to the public_id part
+        const uploadMatch = url.match(/\/upload\/v\d+\/(.+?)(?:\.\w+)?(?:\?|$)/);
+        if (uploadMatch && uploadMatch[1]) {
+          publicId = uploadMatch[1];
           console.log(`✅ Extracted public_id from URL: ${publicId}`);
+        } else {
+          // Ultimate fallback: just get everything after 'workshop/'
+          const workshopMatch = url.match(/(workshop\/[^\?\.]+)/);
+          if (workshopMatch) {
+            publicId = workshopMatch[1];
+            console.log(`✅ Extracted from workshop/ pattern: ${publicId}`);
+          }
         }
       }
       
-      if (publicId) {
-        // Store only the public_id (e.g., "workshop/task-images/abc123")
-        // Redirect route will use this to generate full Cloudinary URL
-        console.log(`💾 Storing image with public_id: ${publicId}`);
+      if (publicId && publicId.includes('workshop')) {
+        // Store ONLY the public_id - NEVER store full URL
+        console.log(`💾 Saving to DB with public_id: ${publicId}`);
         await db.query('INSERT INTO task_images (task_id,uploaded_by,image_path,image_type,caption) VALUES (?,?,?,?,?)',
           [req.params.id, req.user.id, publicId, image_type || 'progress', caption || '']);
       } else {
-        console.warn(`⚠️ Could not extract public_id from:`, { path: f.path, public_id: f.public_id, secure_url: f.secure_url });
+        console.warn(`⚠️ FAILED to extract valid public_id from:`, { 
+          public_id: f.public_id, 
+          path: f.path?.substring(0, 100),
+          secure_url: f.secure_url?.substring(0, 100),
+          extracted: publicId
+        });
       }
     }
 
