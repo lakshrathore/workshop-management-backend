@@ -893,19 +893,35 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
 
     // Insert all uploaded images
     for (const f of files) {
-      console.log(`✅ Saving image: path=${f.path}, publicId=${f.public_id}, filename=${f.filename}`);
-      // Extract just the public_id from Cloudinary response
-      // f.path might be full URL, f.public_id is the clean public_id
-      const publicId = f.public_id || (f.path ? f.path.replace(/^https?:\/\/[^\/]+\/v\d+\//, '') : '');
+      console.log(`📸 File object from Cloudinary:`, { path: f.path, public_id: f.public_id, secure_url: f.secure_url });
+      
+      let publicId = '';
+      
+      // Try to get public_id directly from multer-storage-cloudinary response
+      if (f.public_id) {
+        publicId = f.public_id;
+        console.log(`✅ Using public_id from file object: ${publicId}`);
+      } 
+      // Fallback: extract from secure_url or path (e.g., "workshop/task-images/abc123")
+      else if (f.path || f.secure_url) {
+        const url = f.path || f.secure_url;
+        // URL format: https://res.cloudinary.com/CLOUD/image/upload/vVERSION/public/id/with/slashes
+        // Extract everything after /upload/vXXXX/ and remove file extension
+        const match = url.match(/\/upload\/v\d+\/(.+?)(?:\.\w+)?$/);
+        if (match && match[1]) {
+          publicId = match[1].replace(/\.\w+$/, ''); // Remove extension if present
+          console.log(`✅ Extracted public_id from URL: ${publicId}`);
+        }
+      }
       
       if (publicId) {
         // Store only the public_id (e.g., "workshop/task-images/abc123")
         // Redirect route will use this to generate full Cloudinary URL
-        console.log(`💾 Storing public_id: ${publicId}`);
+        console.log(`💾 Storing image with public_id: ${publicId}`);
         await db.query('INSERT INTO task_images (task_id,uploaded_by,image_path,image_type,caption) VALUES (?,?,?,?,?)',
           [req.params.id, req.user.id, publicId, image_type || 'progress', caption || '']);
       } else {
-        console.warn(`⚠️ Could not extract public_id from:`, { path: f.path, public_id: f.public_id, filename: f.filename });
+        console.warn(`⚠️ Could not extract public_id from:`, { path: f.path, public_id: f.public_id, secure_url: f.secure_url });
       }
     }
 
