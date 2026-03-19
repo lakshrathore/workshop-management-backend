@@ -892,56 +892,80 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
     }
 
     // Insert all uploaded images
+    let savedCount = 0;
+    let failedCount = 0;
+    
     for (const f of files) {
-      console.log(`📸 Cloudinary file object:`, { filename: f.filename, public_id: f.public_id, path: f.path?.substring(0, 80) });
+      // Log ALL properties on the file object to understand what Cloudinary is returning
+      console.log(`📸 Full file object keys:`, Object.keys(f));
+      console.log(`📸 File details:`, { 
+        fieldname: f.fieldname,
+        originalname: f.originalname,
+        encoding: f.encoding,
+        mimetype: f.mimetype,
+        public_id: f.public_id,
+        filename: f.filename,
+        secure_url: f.secure_url?.substring(0, 100),
+        url: f.url?.substring(0, 100),
+        path: f.path?.substring(0, 100)
+      });
       
       let publicId = '';
       
-      // Cloudinary returns public_id directly from multer-storage-cloudinary
-      if (f.public_id && typeof f.public_id === 'string' && f.public_id.includes('workshop')) {
+      // Try multiple ways to get the public_id
+      // Method 1: Direct public_id property (from Cloudinary storage)
+      if (f.public_id && typeof f.public_id === 'string') {
         publicId = f.public_id;
-        console.log(`✅ Got public_id directly: ${publicId}`);
+        console.log(`✅ Method 1 - Got public_id directly: ${publicId}`);
       } 
-      else if (f.path || f.secure_url) {
-        // Fallback: extract from full URL
-        // URL: https://res.cloudinary.com/CLOUD/image/upload/vVERSION/workshop/task-images/filename.jpg
-        // Need: workshop/task-images/filename (without extension)
-        const url = f.secure_url || f.path || '';
-        
-        // Find the position of '/upload/v' and skip to the public_id part
-        const uploadMatch = url.match(/\/upload\/v\d+\/(.+?)(?:\.\w+)?(?:\?|$)/);
-        if (uploadMatch && uploadMatch[1]) {
-          publicId = uploadMatch[1];
-          console.log(`✅ Extracted public_id from URL: ${publicId}`);
-        } else {
-          // Ultimate fallback: just get everything after 'workshop/'
-          const workshopMatch = url.match(/(workshop\/[^\?\.]+)/);
-          if (workshopMatch) {
-            publicId = workshopMatch[1];
-            console.log(`✅ Extracted from workshop/ pattern: ${publicId}`);
-          }
+      // Method 2: Extract from secure_url (most reliable)
+      else if (f.secure_url) {
+        const url = f.secure_url;
+        // Extract everything after /upload/vXXXXXX/ until the end (or query string or extension)
+        const match = url.match(/\/upload\/v[\d]+\/(.+?)(?:\?|\.webp|\.jpg|\.png|\.gif|$)/);
+        if (match && match[1]) {
+          publicId = match[1];
+          console.log(`✅ Method 2 - Extracted from secure_url: ${publicId}`);
         }
       }
+      // Method 3: Extract from filename if it looks like a public_id
+      else if (f.filename && f.filename.includes('workshop')) {
+        publicId = f.filename;
+        console.log(`✅ Method 3 - Got from filename: ${publicId}`);
+      }
       
-      if (publicId && publicId.includes('workshop')) {
+      if (publicId) {
         // Store ONLY the public_id - NEVER store full URL
-        console.log(`💾 Saving to DB with public_id: ${publicId}`);
-        await db.query('INSERT INTO task_images (task_id,uploaded_by,image_path,image_type,caption) VALUES (?,?,?,?,?)',
-          [req.params.id, req.user.id, publicId, image_type || 'progress', caption || '']);
+        try {
+          console.log(`💾 Saving to DB with public_id: ${publicId}`);
+          await db.query('INSERT INTO task_images (task_id,uploaded_by,image_path,image_type,caption) VALUES (?,?,?,?,?)',
+            [req.params.id, req.user.id, publicId, image_type || 'progress', caption || '']);
+          savedCount++;
+          console.log(`✅ Saved to DB: ${publicId}`);
+        } catch (dbErr) {
+          failedCount++;
+          console.error(`❌ DB insert failed for ${publicId}:`, dbErr.message);
+        }
       } else {
-        console.warn(`⚠️ FAILED to extract valid public_id from:`, { 
-          public_id: f.public_id, 
-          path: f.path?.substring(0, 100),
-          secure_url: f.secure_url?.substring(0, 100),
-          extracted: publicId
-        });
+        failedCount++;
+        console.warn(`⚠️ FAILED to extract public_id. File object:`, f);
       }
     }
 
+    if (savedCount === 0 && failedCount > 0) {
+      return res.status(400).json({ 
+        message: `${failedCount} image upload fail - public_id extract nahi hua`, 
+        saved: 0,
+        failed: failedCount,
+        success: false 
+      });
+    }
+
     res.json({ 
-      message: `${files.length} image(s) upload ho gaye`, 
-      count: files.length,
-      success: true 
+      message: `${savedCount} image save hua${failedCount > 0 ? `, ${failedCount} fail` : ''}`, 
+      saved: savedCount,
+      failed: failedCount,
+      success: savedCount > 0 
     });
   } catch (err) {
     console.error('Image upload error:', err.message);
