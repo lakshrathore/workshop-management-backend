@@ -1368,17 +1368,22 @@ router.get('/reports/product-tracking', auth, async (req, res) => {
   }
   for (const t of tasks) { if (!tasksByItem[t.project_item_id]) tasksByItem[t.project_item_id] = []; tasksByItem[t.project_item_id].push(t); }
   const result = items.map(item => {
-    // Use item-specific chain if exists, otherwise use project-level chain
-    const chain = chainsByItem[item.id] || projectChains[item.project_id] || [];
+    // Use item-specific chain if exists, otherwise use project-level chain (not both)
+    const chain = (chainsByItem[item.id] && chainsByItem[item.id].length > 0)
+      ? chainsByItem[item.id]
+      : (projectChains[item.project_id] || []);
     const itemTasks = tasksByItem[item.id] || [];
     const stages = chain.map(c => {
-      const t = itemTasks.find(t => t.department_id === c.department_id);
-      const pct = t ? Math.round((t.quantity_completed / t.quantity_assigned) * 100) : 0;
+      const t = itemTasks.find(t => t.department_id === c.department_id && t.stage_order === c.stage_order);
+      const pct = t && t.quantity_assigned > 0 ? Math.round((t.quantity_completed / t.quantity_assigned) * 100) : 0;
       return { ...c, task: t || null, pct, status: t ? t.status : 'not_assigned' };
     });
     const totalStages = stages.length;
     const doneStages = stages.filter(s => s.status === 'completed').length;
-    const overallPct = totalStages > 0 ? Math.round((doneStages / totalStages) * 100) : 0;
+    // Overall % = average of all stage percentages (shows actual work done, not just completed stages)
+    const overallPct = totalStages > 0
+      ? Math.round(stages.reduce((sum, s) => sum + s.pct, 0) / totalStages)
+      : 0;
     return { ...item, stages, overallPct, doneStages, totalStages };
   });
   res.json({ items: result });
