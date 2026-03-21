@@ -858,8 +858,9 @@ router.patch('/tasks/:id/progress', auth, async (req, res) => {
     [req.params.id, req.user.id, newQty, newStatus, worker_notes || '']
   );
 
-  // Auto-advance chain only when completed
-  if (newStatus === 'completed') await autoAdvanceChain(db, req.params.id);
+  // Auto-advance chain — call on any progress (qty > 0)
+  // autoAdvanceChain internally handles both partial and full completion
+  if (newQty > 0) await autoAdvanceChain(db, req.params.id);
 
   const [[updated]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
   res.json({ message: 'Updated', task: updated });
