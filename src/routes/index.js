@@ -1534,8 +1534,12 @@ router.post('/tasks/:id/daily-progress', auth, async (req, res) => {
     await db.query('UPDATE task_assignments SET quantity_completed=?, status=?, updated_at=NOW() WHERE id=?',
       [totalDone, newStatus, req.params.id]);
 
+    // Auto-advance chain — pass task ID (not project_item_id!)
     if (newStatus === 'completed' && t.status !== 'completed') {
-      await autoAdvanceChain(db, t.project_item_id, t.stage_order || 0);
+      await autoAdvanceChain(db, req.params.id);
+    } else if (newStatus === 'in_progress' && totalDone > 0) {
+      // Also trigger partial transfer if in progress
+      await autoAdvanceChain(db, req.params.id);
     }
 
     res.json({ message: 'Daily progress saved', total_done: totalDone, status: newStatus });
@@ -1937,6 +1941,43 @@ router.post('/workers/bulk-departments', auth, adminOnly, async (req, res) => {
     }
     res.json({ message: `${worker_ids.length} workers updated` });
   } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── FIX STUCK WAITING TASKS ───────────────────────────────────────────────────
+// One-time fix: activate next waiting stage for all completed tasks
+router.post('/admin/fix-waiting-tasks', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    // Find all completed tasks that have a next waiting stage
+    const [completedTasks] = await db.query(`
+      SELECT ta.* FROM task_assignments ta
+      WHERE ta.status = 'completed' AND ta.project_item_id IS NOT NULL
+      ORDER BY ta.project_item_id, ta.stage_order
+    `);
+
+    let fixed = 0;
+    for (const task of completedTasks) {
+      // Check if there's a waiting task for the next stage of same item+project
+      const [[nextTask]] = await db.query(`
+        SELECT * FROM task_assignments
+        WHERE project_id=? AND project_item_id=? AND stage_order>? AND status='waiting'
+        ORDER BY stage_order LIMIT 1`,
+        [task.project_id, task.project_item_id, task.stage_order]);
+
+      if (nextTask) {
+        // Only activate if NO other task at same stage_order is still incomplete
+        // i.e. this completed task is truly the blocker
+        await db.query("UPDATE task_assignments SET status='pending' WHERE id=?", [nextTask.id]);
+        fixed++;
+        console.log(`✅ Fixed: task ${nextTask.id} (${nextTask.task_title}) → pending`);
+      }
+    }
+
+    res.json({ message: `Fix complete! ${fixed} waiting tasks activated.`, fixed });
+  } catch (err) {
+    console.error('Fix waiting tasks error:', err.message);
     res.status(500).json({ message: err.message });
   }
 });
