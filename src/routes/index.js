@@ -796,40 +796,71 @@ router.patch('/tasks/:id/progress', auth, async (req, res) => {
   if (!task) return res.status(404).json({ message: 'Not found' });
   const newQty = quantity_completed !== undefined ? parseInt(quantity_completed, 10) : task.quantity_completed;
   const assignedQty = parseInt(task.quantity_assigned, 10);
-  let newStatus = status || task.status;
-  
-  // Stage dependency validation: check previous stage's completed quantity
+
+  // Stage dependency validation
   if (task.stage_order > 1 && newQty > task.quantity_completed) {
     const prevStageQty = await getPreviousStageQuantity(db, task.project_item_id, task.stage_order);
     if (prevStageQty !== null && newQty > prevStageQty) {
-      return res.status(400).json({ 
-        message: `Pehle stage mein sirf ${prevStageQty} quantity complete hue hain, isliye aap ${newQty} nahi kar sakte. Max ${prevStageQty} hi set kar sakte ho.`,
+      return res.status(400).json({
+        message: `Pehle stage mein sirf ${prevStageQty} quantity complete hue hain. Max ${prevStageQty} hi set kar sakte ho.`,
         max_allowed: prevStageQty,
         previous_stage_completed: prevStageQty
       });
     }
   }
 
-  // Revert case: admin sets qty=0 and status=pending
-  if (newQty === 0 && status === 'pending') {
-    newStatus = 'pending';
-  } else if (newQty >= assignedQty) {
-    newStatus = 'completed';
-  } else if (newQty > 0 && newStatus === 'pending') {
-    newStatus = 'in_progress';
-  } else if (newQty < assignedQty && newStatus === 'completed') {
-    newStatus = 'in_progress';
+  // Status logic:
+  // 1. If qty == assigned → always completed (auto)
+  // 2. If qty == 0 → pending (reset)
+  // 3. Otherwise → respect worker's chosen status exactly
+  let newStatus;
+  if (newQty >= assignedQty) {
+    newStatus = 'completed'; // auto complete when all qty done
+  } else if (newQty === 0) {
+    newStatus = 'pending'; // reset
+  } else {
+    // Respect whatever worker selected — don't override
+    newStatus = status || task.status;
+    // Only prevent 'completed' if qty not fully done
+    if (newStatus === 'completed' && newQty < assignedQty) {
+      newStatus = 'in_progress';
+    }
   }
 
   const completedDate = newStatus === 'completed' ? new Date().toISOString().split('T')[0] : null;
-  await db.query('UPDATE task_assignments SET quantity_completed=?,status=?,worker_notes=?,completed_date=? WHERE id=?',
-    [newQty, newStatus, worker_notes !== undefined ? worker_notes : task.worker_notes, completedDate, req.params.id]);
-  await db.query('INSERT INTO task_progress (task_id,updated_by,quantity_done,status,notes) VALUES (?,?,?,?,?)',
-    [req.params.id, req.user.id, newQty, newStatus, worker_notes || '']);
-  
-  // Auto-advance chain (handles both partial and full completion)
-  if (newQty > 0) await autoAdvanceChain(db, req.params.id);
-  
+
+  await db.query(
+    'UPDATE task_assignments SET quantity_completed=?,status=?,worker_notes=?,completed_date=? WHERE id=?',
+    [newQty, newStatus, worker_notes !== undefined ? worker_notes : task.worker_notes, completedDate, req.params.id]
+  );
+
+  // Also save as daily progress entry automatically
+  const workDate = new Date().toISOString().slice(0, 10);
+  const dailyQty = newQty - (task.quantity_completed || 0);
+  if (dailyQty > 0) {
+    const [existing] = await db.query(
+      'SELECT id FROM daily_progress WHERE task_id=? AND work_date=? AND (worker_id=? OR created_by=?)',
+      [req.params.id, workDate, req.user.id, req.user.id]
+    );
+    if (existing.length > 0) {
+      await db.query('UPDATE daily_progress SET qty_done=qty_done+?, notes=? WHERE id=?',
+        [dailyQty, worker_notes || '', existing[0].id]);
+    } else {
+      await db.query(
+        'INSERT INTO daily_progress (task_id,project_item_id,department_id,worker_id,work_date,qty_done,notes,created_by) VALUES (?,?,?,?,?,?,?,?)',
+        [req.params.id, task.project_item_id, task.department_id || null, req.user.id, workDate, dailyQty, worker_notes || '', req.user.id]
+      );
+    }
+  }
+
+  await db.query(
+    'INSERT INTO task_progress (task_id,updated_by,quantity_done,status,notes) VALUES (?,?,?,?,?)',
+    [req.params.id, req.user.id, newQty, newStatus, worker_notes || '']
+  );
+
+  // Auto-advance chain only when completed
+  if (newStatus === 'completed') await autoAdvanceChain(db, req.params.id);
+
   const [[updated]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
   res.json({ message: 'Updated', task: updated });
 });
