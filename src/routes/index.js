@@ -594,67 +594,15 @@ async function autoAdvanceChain(db, task_id) {
   const [[task]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [task_id]);
   if (!task || !task.project_item_id) return;
 
-  // If partially completed → transfer done qty to next stage
-  if (task.quantity_completed > 0 && task.quantity_completed < task.quantity_assigned) {
-    await transferPartialQuantityToNextStage(db, task);
-  }
-
-  // If task is marked as completed → check and activate next waiting stage
+  // If task is completed → activate next waiting stage
   if (task.status === 'completed') {
     await checkAndActivateNextStage(db, task);
   }
 }
 
-// Transfer completed quantity to next stage in production chain
-async function transferPartialQuantityToNextStage(db, currentTask) {
-  if (!currentTask.project_item_id || !currentTask.stage_order) return;
-
-  // Find next stage in production chain (filter by project_id too)
-  const [[nextStage]] = await db.query(`
-    SELECT * FROM production_chains 
-    WHERE project_id=? AND project_item_id=? AND stage_order>?
-    ORDER BY stage_order LIMIT 1`,
-    [currentTask.project_id, currentTask.project_item_id, currentTask.stage_order]);
-
-  if (!nextStage) return; // No next stage
-
-  const completedQty = currentTask.quantity_completed;
-
-  // Check if next stage task already exists for this item (filter by project_id too)
-  const [[existingNextTask]] = await db.query(`
-    SELECT * FROM task_assignments 
-    WHERE project_id=? AND project_item_id=? AND department_id=? AND stage_order=?`,
-    [currentTask.project_id, currentTask.project_item_id, nextStage.department_id, nextStage.stage_order]);
-
-  if (existingNextTask) {
-    // Add to existing next stage task
-    const newQty = parseInt(existingNextTask.quantity_assigned, 10) + completedQty;
-    await db.query(
-      'UPDATE task_assignments SET quantity_assigned=? WHERE id=?',
-      [newQty, existingNextTask.id]
-    );
-  } else {
-    // Create new task for next stage with completed quantity
-    const [[dept]] = await db.query('SELECT * FROM departments WHERE id=?', [nextStage.department_id]);
-    const taskTitle = `${currentTask.task_title.split('—')[0].trim()} — ${dept.name}`;
-    
-    await db.query(`
-      INSERT INTO task_assignments 
-      (project_id, project_item_id, assign_type, department_id, stage_order,
-       task_title, task_description, quantity_assigned, status, priority)
-      VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [currentTask.project_id, currentTask.project_item_id, 'department', nextStage.department_id,
-       nextStage.stage_order, taskTitle, currentTask.task_description,
-       completedQty, 'waiting', currentTask.priority]);
-  }
-
-  // Record the transfer
-  await db.query(`
-    INSERT INTO task_progress (task_id, updated_by, quantity_done, status, notes)
-    VALUES (?,?,?,?,?)`,
-    [currentTask.id, 1, completedQty, 'partial_transferred', 
-     `${completedQty} units transferred to next stage (${nextStage.stage_order})`]);
-}
+// Transfer function removed - caused quantity inflation
+// Chain tasks are already created with correct qty in _createChainTasks
+// Only status activation is needed via checkAndActivateNextStage
 
 // ── TASKS ─────────────────────────────────────────────────────────────────────
 router.get('/tasks/all', auth, adminOnly, async (req, res) => {
@@ -826,14 +774,18 @@ async function checkAndActivateNextStage(db, task) {
 // Helper: Get previous stage's completed quantity for stage dependency validation
 async function getPreviousStageQuantity(db, projectItemId, currentStageOrder) {
   if (currentStageOrder <= 1) return null; // First stage has no dependency
-  
+
   const [[prev]] = await db.query(`
-    SELECT ta.quantity_completed
+    SELECT ta.quantity_assigned, ta.quantity_completed, ta.status
     FROM task_assignments ta
     WHERE ta.project_item_id=? AND ta.stage_order=?
     LIMIT 1`, [projectItemId, currentStageOrder - 1]);
-  
-  return prev ? prev.quantity_completed : null;
+
+  if (!prev) return null;
+  // If previous stage is fully completed — no restriction on current stage
+  if (prev.status === 'completed') return null;
+  // Otherwise restrict to what previous stage has completed so far
+  return prev.quantity_completed;
 }
 
 // Worker progress update
