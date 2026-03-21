@@ -123,7 +123,8 @@ router.get('/departments', auth, async (req, res) => {
     SELECT d.*, COUNT(DISTINCT wd.worker_id) as worker_count,
       COUNT(DISTINCT ta.id) as total_tasks,
       SUM(ta.status='completed') as completed_tasks,
-      SUM(ta.status='in_progress') as active_tasks
+      SUM(ta.status='in_progress') as active_tasks,
+      CASE WHEN COUNT(DISTINCT wd.worker_id) > 0 THEN 1 ELSE 0 END as has_workers
     FROM departments d
     LEFT JOIN worker_departments wd ON wd.department_id=d.id
     LEFT JOIN task_assignments ta ON ta.department_id=d.id
@@ -409,12 +410,20 @@ router.get('/projects/:id', auth, async (req, res) => {
   if (!project) return res.status(404).json({ message: 'Not found' });
   const [items] = await db.query('SELECT * FROM project_items WHERE project_id=? ORDER BY id', [req.params.id]);
   const [tasks] = await db.query(`
-    SELECT ta.*, u.name as worker_name, d.name as department_name, d.color as dept_color,
+    SELECT ta.*, 
+      COALESCE(u.name, dept_workers.worker_names) as worker_name,
+      d.name as department_name, d.color as dept_color,
       pi.item_name, COALESCE(pi.proto_code,'') as proto_code
     FROM task_assignments ta
     LEFT JOIN users u ON u.id=ta.worker_id
     LEFT JOIN departments d ON d.id=ta.department_id
     LEFT JOIN project_items pi ON pi.id=ta.project_item_id
+    LEFT JOIN (
+      SELECT wd.department_id, GROUP_CONCAT(u2.name ORDER BY u2.name SEPARATOR ', ') as worker_names
+      FROM worker_departments wd
+      JOIN users u2 ON u2.id=wd.worker_id AND u2.is_active=1
+      GROUP BY wd.department_id
+    ) dept_workers ON dept_workers.department_id=ta.department_id AND ta.worker_id IS NULL
     WHERE ta.project_id=? ORDER BY ta.created_at DESC`, [req.params.id]);
   // Production chain per item
   const [chains] = await db.query(`
@@ -446,11 +455,19 @@ router.get('/projects/:id/images-by-stage', auth, async (req, res) => {
         WHERE ta.project_id=? AND ta.department_id=? AND ta.stage_order=?
         ORDER BY ti.created_at DESC`, [req.params.id, chain.department_id, chain.stage_order]);
       
+      // Add full Cloudinary URL to each image object
+      const imagesWithUrl = images.map(img => ({
+        ...img,
+        image_url: img.image_path
+          ? (img.image_path.startsWith('https://') ? img.image_path : getFileUrl(img.image_path))
+          : null
+      }));
+
       result.push({
         stage_order: chain.stage_order,
         dept_name: chain.dept_name,
         dept_color: chain.dept_color,
-        images: images
+        images: imagesWithUrl
       });
     }
     res.json(result);
@@ -592,22 +609,22 @@ async function autoAdvanceChain(db, task_id) {
 async function transferPartialQuantityToNextStage(db, currentTask) {
   if (!currentTask.project_item_id || !currentTask.stage_order) return;
 
-  // Find next stage in production chain
+  // Find next stage in production chain (filter by project_id too)
   const [[nextStage]] = await db.query(`
     SELECT * FROM production_chains 
-    WHERE project_item_id=? AND stage_order>?
+    WHERE project_id=? AND project_item_id=? AND stage_order>?
     ORDER BY stage_order LIMIT 1`,
-    [currentTask.project_item_id, currentTask.stage_order]);
+    [currentTask.project_id, currentTask.project_item_id, currentTask.stage_order]);
 
   if (!nextStage) return; // No next stage
 
   const completedQty = currentTask.quantity_completed;
 
-  // Check if next stage task already exists for this item
+  // Check if next stage task already exists for this item (filter by project_id too)
   const [[existingNextTask]] = await db.query(`
     SELECT * FROM task_assignments 
-    WHERE project_item_id=? AND department_id=? AND stage_order=?`,
-    [currentTask.project_item_id, nextStage.department_id, nextStage.stage_order]);
+    WHERE project_id=? AND project_item_id=? AND department_id=? AND stage_order=?`,
+    [currentTask.project_id, currentTask.project_item_id, nextStage.department_id, nextStage.stage_order]);
 
   if (existingNextTask) {
     // Add to existing next stage task
@@ -647,10 +664,12 @@ router.get('/tasks/all', auth, adminOnly, async (req, res) => {
   const params = [];
   if (status) { where += ' AND ta.status=?'; params.push(status); }
   if (department_id) { where += ' AND ta.department_id=?'; params.push(department_id); }
-  if (worker_id) { where += ' AND ta.worker_id=?'; params.push(worker_id); }
+  if (worker_id) { where += ' AND (ta.worker_id=? OR (ta.worker_id IS NULL AND ta.department_id IN (SELECT department_id FROM worker_departments WHERE worker_id=?)))'; params.push(worker_id, worker_id); }
   try {
     const [rows] = await db.query(`
-      SELECT ta.*, u.name as worker_name, d.name as department_name, d.color as dept_color,
+      SELECT ta.*, 
+        COALESCE(u.name, dept_workers.worker_names) as worker_name,
+        d.name as department_name, d.color as dept_color,
         p.name as project_name, p.project_id as proj_code, p.client_name as customer_name,
         pi.item_name, COALESCE(pi.proto_code,'') as proto_code
       FROM task_assignments ta
@@ -658,6 +677,12 @@ router.get('/tasks/all', auth, adminOnly, async (req, res) => {
       LEFT JOIN departments d ON d.id=ta.department_id
       LEFT JOIN projects p ON p.id=ta.project_id
       LEFT JOIN project_items pi ON pi.id=ta.project_item_id
+      LEFT JOIN (
+        SELECT wd.department_id, GROUP_CONCAT(u2.name ORDER BY u2.name SEPARATOR ', ') as worker_names
+        FROM worker_departments wd
+        JOIN users u2 ON u2.id=wd.worker_id AND u2.is_active=1
+        GROUP BY wd.department_id
+      ) dept_workers ON dept_workers.department_id=ta.department_id AND ta.worker_id IS NULL
       ${where} ORDER BY ta.created_at DESC LIMIT 200`, params);
     res.json(rows);
   } catch(err) {
@@ -776,12 +801,12 @@ router.delete('/tasks/:id', auth, adminOnly, async (req, res) => {
 
 // Helper: Check and activate next waiting stage when current stage is fully completed
 async function checkAndActivateNextStage(db, task) {
-  // Find next waiting stage task for same item
+  // Find next waiting stage task for SAME item AND same project (prevent cross-item interference)
   const [[nextTask]] = await db.query(`
     SELECT * FROM task_assignments 
-    WHERE project_item_id=? AND stage_order>? AND status='waiting'
+    WHERE project_id=? AND project_item_id=? AND stage_order>? AND status='waiting'
     ORDER BY stage_order LIMIT 1`,
-    [task.project_item_id, task.stage_order]);
+    [task.project_id, task.project_item_id, task.stage_order]);
 
   if (nextTask) {
     console.log(`Activating next stage task ${nextTask.id} - was waiting, now pending`);
@@ -791,7 +816,7 @@ async function checkAndActivateNextStage(db, task) {
   // Check if all stages done for this item → mark item complete
   const [[waiting]] = await db.query(`
     SELECT COUNT(*) as cnt FROM task_assignments 
-    WHERE project_item_id=? AND status != 'completed'`, [task.project_item_id]);
+    WHERE project_id=? AND project_item_id=? AND status != 'completed'`, [task.project_id, task.project_item_id]);
   if (waiting.cnt === 0) {
     console.log(`All stages completed for item ${task.project_item_id}`);
     await db.query("UPDATE project_items SET status='completed' WHERE id=?", [task.project_item_id]);
@@ -999,7 +1024,14 @@ router.get('/tasks/:id/images', auth, async (req, res) => {
   if (rows.length > 0) {
     console.log(`Image paths: ${rows.map(r => r.image_path).join(', ')}`);
   }
-  res.json(rows);
+  // Add full Cloudinary URL to each image object
+  const rowsWithUrl = rows.map(r => ({
+    ...r,
+    image_url: r.image_path
+      ? (r.image_path.startsWith('https://') ? r.image_path : getFileUrl(r.image_path))
+      : null
+  }));
+  res.json(rowsWithUrl);
 });
 router.delete('/tasks/:id/images/:imgId', auth, async (req, res) => {
   const db = await getPool();
@@ -1057,7 +1089,13 @@ router.get('/projects/:projectId/images-for-worker', auth, async (req, res) => {
       if (!grouped[img.uploaded_by_name]) {
         grouped[img.uploaded_by_name] = [];
       }
-      grouped[img.uploaded_by_name].push(img);
+      // Add full Cloudinary URL to each image object
+      grouped[img.uploaded_by_name].push({
+        ...img,
+        image_url: img.image_path
+          ? (img.image_path.startsWith('https://') ? img.image_path : getFileUrl(img.image_path))
+          : null
+      });
     });
     
     // Convert to array format
