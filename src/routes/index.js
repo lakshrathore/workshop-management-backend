@@ -589,13 +589,13 @@ async function _createChainTasks(db, project_id, item, stages, created_by) {
   }
 }
 
-// When a chain task completes → auto-advance to next stage
+// When a chain task has progress → auto-advance to next stage
 async function autoAdvanceChain(db, task_id) {
   const [[task]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [task_id]);
   if (!task || !task.project_item_id) return;
 
-  // If task is completed → activate next waiting stage
-  if (task.status === 'completed') {
+  // Activate next stage on ANY progress (partial or full)
+  if (task.quantity_completed > 0 || task.status === 'completed') {
     await checkAndActivateNextStage(db, task);
   }
 }
@@ -747,9 +747,9 @@ router.delete('/tasks/:id', auth, adminOnly, async (req, res) => {
   }
 });
 
-// Helper: Check and activate next waiting stage when current stage is fully completed
+// Helper: Check and activate next waiting stage — triggers on ANY progress (partial or full)
 async function checkAndActivateNextStage(db, task) {
-  // Find next waiting stage task for SAME item AND same project (prevent cross-item interference)
+  // Activate next waiting stage as soon as current stage has any progress
   const [[nextTask]] = await db.query(`
     SELECT * FROM task_assignments 
     WHERE project_id=? AND project_item_id=? AND stage_order>? AND status='waiting'
