@@ -2021,13 +2021,11 @@ router.get('/packing-parts/:project_item_id', auth, async (req, res) => {
   try {
     const [parts] = await db.query(`
       SELECT pp.*,
-        COALESCE(SUM(pl.packed_qty), 0) as packed_qty,
-        u.name as last_packed_by_name
+        COALESCE((SELECT SUM(pl.packed_qty) FROM packing_logs pl WHERE pl.packing_part_id = pp.id), 0) as packed_qty,
+        (SELECT u.name FROM packing_logs pl JOIN users u ON u.id = pl.packed_by 
+         WHERE pl.packing_part_id = pp.id ORDER BY pl.packed_at DESC LIMIT 1) as last_packed_by_name
       FROM packing_parts pp
-      LEFT JOIN packing_logs pl ON pl.packing_part_id = pp.id
-      LEFT JOIN users u ON u.id = pl.packed_by
       WHERE pp.project_item_id = ?
-      GROUP BY pp.id
       ORDER BY pp.sort_order, pp.id`, [req.params.project_item_id]);
     res.json(parts);
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -2119,11 +2117,9 @@ router.get('/packing-label/:project_item_id', auth, async (req, res) => {
 
     const [parts] = await db.query(`
       SELECT pp.*,
-        COALESCE(SUM(pl.packed_qty), 0) as packed_qty
+        COALESCE((SELECT SUM(pl.packed_qty) FROM packing_logs pl WHERE pl.packing_part_id = pp.id), 0) as packed_qty
       FROM packing_parts pp
-      LEFT JOIN packing_logs pl ON pl.packing_part_id = pp.id
       WHERE pp.project_item_id = ?
-      GROUP BY pp.id
       ORDER BY pp.sort_order, pp.id`, [req.params.project_item_id]);
 
     res.json({ item, parts });
