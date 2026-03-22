@@ -8,6 +8,18 @@ require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'workshop_secret_2024';
 
+// ── Web Push Setup ────────────────────────────────────────────────────────────
+let webpush = null;
+try {
+  webpush = require('web-push');
+  const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || 'BDT3sQDeaJhvQHe_CrbmKifgygdtlppVCbDe7OAY7oobL5D5pnWIOYLy-bVPr30xJLqkHDRZcGVXVIwXLQloeGQ';
+  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '5mJhC6k1qkVZnsFPUhmT5B-3-Komog0pn2xJtEPz66I';
+  webpush.setVapidDetails('mailto:admin@workshop.com', VAPID_PUBLIC, VAPID_PRIVATE);
+  console.log('✅ Web Push initialized');
+} catch (e) {
+  console.log('⚠️ web-push not installed — push notifications disabled');
+}
+
 // ── Auth Middleware ───────────────────────────────────────────────────────────
 function auth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
@@ -39,6 +51,40 @@ function toHttpsImageUrl(imagePath) {
   }
   // Plain public_id (e.g. workshop/task-images/abc123)
   return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload/${p}`;
+}
+
+// Helper: Send push notification to a user
+async function sendPushToUser(db, userId, payload) {
+  if (!webpush) return;
+  try {
+    const [subs] = await db.query('SELECT * FROM push_subscriptions WHERE user_id=?', [userId]);
+    for (const sub of subs) {
+      try {
+        await webpush.sendNotification(
+          JSON.parse(sub.subscription),
+          JSON.stringify(payload)
+        );
+      } catch (err) {
+        // Remove invalid subscriptions
+        if (err.statusCode === 410 || err.statusCode === 404) {
+          await db.query('DELETE FROM push_subscriptions WHERE id=?', [sub.id]);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Push send error:', err.message);
+  }
+}
+
+// Helper: Send push to all admins
+async function sendPushToAdmins(db, payload) {
+  if (!webpush) return;
+  try {
+    const [admins] = await db.query("SELECT id FROM users WHERE role='admin' AND is_active=1");
+    for (const admin of admins) {
+      await sendPushToUser(db, admin.id, payload);
+    }
+  } catch (err) { console.error('Push admins error:', err.message); }
 }
 
 // Serve images — redirect to Cloudinary CDN
@@ -764,8 +810,29 @@ router.delete('/tasks/:id', auth, adminOnly, async (req, res) => {
 });
 
 // Helper: Check and activate next waiting stage — triggers on ANY progress (partial or full)
+// Helper: Create notification + send push
+async function createNotification(db, { user_id, type, title, message, task_id, project_id }) {
+  try {
+    await db.query(
+      'INSERT INTO notifications (user_id, type, title, message, task_id, project_id) VALUES (?,?,?,?,?,?)',
+      [user_id, type, title, message, task_id || null, project_id || null]
+    );
+    // Also send push notification
+    await sendPushToUser(db, user_id, { title, body: message, tag: type, task_id, project_id });
+  } catch (err) { console.error('Notification error:', err.message); }
+}
+
+// Helper: Notify all admins
+async function notifyAdmins(db, { type, title, message, task_id, project_id }) {
+  try {
+    const [admins] = await db.query("SELECT id FROM users WHERE role='admin' AND is_active=1");
+    for (const admin of admins) {
+      await createNotification(db, { user_id: admin.id, type, title, message, task_id, project_id });
+    }
+  } catch (err) { console.error('Notify admins error:', err.message); }
+}
+
 async function checkAndActivateNextStage(db, task) {
-  // Activate next waiting stage as soon as current stage has any progress
   const [[nextTask]] = await db.query(`
     SELECT * FROM task_assignments 
     WHERE project_id=? AND project_item_id=? AND stage_order>? AND status='waiting'
@@ -773,17 +840,47 @@ async function checkAndActivateNextStage(db, task) {
     [task.project_id, task.project_item_id, task.stage_order]);
 
   if (nextTask) {
-    console.log(`Activating next stage task ${nextTask.id} - was waiting, now pending`);
     await db.query("UPDATE task_assignments SET status='pending' WHERE id=?", [nextTask.id]);
+
+    // Notify workers in next stage department
+    const [deptWorkers] = await db.query(
+      'SELECT worker_id FROM worker_departments WHERE department_id=?',
+      [nextTask.department_id]
+    );
+    for (const w of deptWorkers) {
+      await createNotification(db, {
+        user_id: w.worker_id,
+        type: 'stage_activated',
+        title: '🔔 Naya Kaam Ready!',
+        message: `"${nextTask.task_title}" — Stage ${nextTask.stage_order} ab pending hai. Kaam shuru karo!`,
+        task_id: nextTask.id,
+        project_id: nextTask.project_id
+      });
+    }
+    if (nextTask.worker_id) {
+      await createNotification(db, {
+        user_id: nextTask.worker_id,
+        type: 'stage_activated',
+        title: '🔔 Naya Kaam Ready!',
+        message: `"${nextTask.task_title}" — Stage ${nextTask.stage_order} ab pending hai. Kaam shuru karo!`,
+        task_id: nextTask.id,
+        project_id: nextTask.project_id
+      });
+    }
   }
 
-  // Check if all stages done for this item → mark item complete
+  // Check if all stages done for this item
   const [[waiting]] = await db.query(`
     SELECT COUNT(*) as cnt FROM task_assignments 
     WHERE project_id=? AND project_item_id=? AND status != 'completed'`, [task.project_id, task.project_item_id]);
   if (waiting.cnt === 0) {
-    console.log(`All stages completed for item ${task.project_item_id}`);
     await db.query("UPDATE project_items SET status='completed' WHERE id=?", [task.project_item_id]);
+    await notifyAdmins(db, {
+      type: 'item_completed',
+      title: '✅ Item Complete!',
+      message: `Project item ke saare stages complete ho gaye!`,
+      project_id: task.project_id
+    });
   }
 }
 
@@ -874,8 +971,16 @@ router.patch('/tasks/:id/progress', auth, async (req, res) => {
     [req.params.id, req.user.id, newQty, newStatus, worker_notes || '']
   );
 
+  // Notify admins about progress update
+  await notifyAdmins(db, {
+    type: 'progress_update',
+    title: `📊 Progress Update`,
+    message: `${req.user.name} ne "${task.task_title}" mein ${newQty}/${task.quantity_assigned} complete kiya (${newStatus})`,
+    task_id: req.params.id,
+    project_id: task.project_id
+  });
+
   // Auto-advance chain — call on any progress (qty > 0)
-  // autoAdvanceChain internally handles both partial and full completion
   if (newQty > 0) await autoAdvanceChain(db, req.params.id);
 
   const [[updated]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
@@ -2021,6 +2126,88 @@ router.post('/admin/fix-waiting-tasks', auth, adminOnly, async (req, res) => {
     console.error('Fix waiting tasks error:', err.message);
     res.status(500).json({ message: err.message });
   }
+});
+
+// ── NOTIFICATIONS ──────────────────────────────────────────────────────────────
+
+// ── PUSH SUBSCRIPTIONS ────────────────────────────────────────────────────────
+
+// Get VAPID public key
+router.get('/push/vapid-key', auth, (req, res) => {
+  const key = process.env.VAPID_PUBLIC_KEY || 'BDT3sQDeaJhvQHe_CrbmKifgygdtlppVCbDe7OAY7oobL5D5pnWIOYLy-bVPr30xJLqkHDRZcGVXVIwXLQloeGQ';
+  res.json({ publicKey: key });
+});
+
+// Save push subscription
+router.post('/push/subscribe', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { subscription } = req.body;
+    if (!subscription) return res.status(400).json({ message: 'Subscription required' });
+    const subStr = JSON.stringify(subscription);
+    const endpoint = subscription.endpoint;
+    // Upsert — same endpoint update karo
+    const [existing] = await db.query(
+      'SELECT id FROM push_subscriptions WHERE user_id=? AND endpoint=?',
+      [req.user.id, endpoint]
+    );
+    if (existing.length > 0) {
+      await db.query('UPDATE push_subscriptions SET subscription=? WHERE id=?', [subStr, existing[0].id]);
+    } else {
+      await db.query(
+        'INSERT INTO push_subscriptions (user_id, endpoint, subscription) VALUES (?,?,?)',
+        [req.user.id, endpoint, subStr]
+      );
+    }
+    res.json({ message: 'Subscribed!' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Remove push subscription
+router.post('/push/unsubscribe', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { endpoint } = req.body;
+    await db.query('DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?', [req.user.id, endpoint]);
+    res.json({ message: 'Unsubscribed' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Get notifications for current user
+router.get('/notifications', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [rows] = await db.query(
+      `SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    const unreadCount = rows.filter(r => !r.is_read).length;
+    res.json({ notifications: rows, unread_count: unreadCount });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Mark notification(s) as read
+router.patch('/notifications/read', auth, async (req, res) => {
+  const db = await getPool();
+  const { ids } = req.body; // array of ids, or empty = mark all
+  try {
+    if (ids && ids.length > 0) {
+      await db.query(
+        `UPDATE notifications SET is_read=1 WHERE user_id=? AND id IN (${ids.map(() => '?').join(',')})`,
+        [req.user.id, ...ids]
+      );
+    } else {
+      await db.query('UPDATE notifications SET is_read=1 WHERE user_id=?', [req.user.id]);
+    }
+    res.json({ message: 'Read mark ho gaya' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Delete a notification
+router.delete('/notifications/:id', auth, async (req, res) => {
+  const db = await getPool();
+  await db.query('DELETE FROM notifications WHERE id=? AND user_id=?', [req.params.id, req.user.id]);
+  res.json({ message: 'Deleted' });
 });
 
 // ── PACKING BOXES ─────────────────────────────────────────────────────────────

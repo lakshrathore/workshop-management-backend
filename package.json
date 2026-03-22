@@ -23,7 +23,8 @@
     "node-cron": "^3.0.2",
     "archiver": "^6.0.0",
     "unzipper": "^0.10.14",
-    "moment": "^2.29.4"
+    "moment": "^2.29.4",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "nodemon": "^3.0.3"

@@ -319,6 +319,29 @@ async function initializeDatabase() {
   await safeAlter('ALTER TABLE project_items ADD COLUMN proto_code VARCHAR(100)');
   await safeAlter('ALTER TABLE project_items ADD COLUMN current_stage_id INT DEFAULT NULL');
   await safeAlter('ALTER TABLE users ADD COLUMN hourly_rate DECIMAL(10,2) DEFAULT 0');
+  // Notifications table
+  await db.query(`CREATE TABLE IF NOT EXISTS notifications (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
+    is_read TINYINT DEFAULT 0,
+    task_id INT DEFAULT NULL,
+    project_id INT DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )`);
+
+  // Push Subscriptions table
+  await db.query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    endpoint TEXT NOT NULL,
+    subscription TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )`);
   await safeAlter('ALTER TABLE packing_boxes ADD COLUMN photo_code VARCHAR(100) DEFAULT NULL');
   await safeAlter('ALTER TABLE departments ADD COLUMN stage_order INT DEFAULT 999');
 
