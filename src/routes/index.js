@@ -642,12 +642,30 @@ async function _createChainTasks(db, project_id, item, stages, created_by) {
       await db.query('UPDATE task_assignments SET stage_order=? WHERE id=?', [s.stage_order, existing.id]);
       continue;
     }
-    const status = i === 0 ? 'pending' : 'waiting'; // First stage active, rest waiting
-    await db.query(`INSERT INTO task_assignments 
+    const status = i === 0 ? 'pending' : 'waiting';
+    const [r] = await db.query(`INSERT INTO task_assignments 
       (project_id, project_item_id, assign_type, department_id, stage_order, task_title, quantity_assigned, status)
       VALUES (?,?,?,?,?,?,?,?)`,
       [project_id, item.id, 'department', s.department_id, s.stage_order,
         `${item.item_name} — ${dept.name}`, item.quantity, status]);
+
+    // Notify workers of Stage 1 (pending) — they can start work now
+    if (i === 0) {
+      const taskId = r.insertId;
+      const [deptWorkers] = await db.query(
+        'SELECT worker_id FROM worker_departments WHERE department_id=?', [s.department_id]
+      );
+      for (const w of deptWorkers) {
+        await createNotification(db, {
+          user_id: w.worker_id,
+          type: 'stage_activated',
+          title: '🔔 Naya Kaam Assign Hua!',
+          message: `"${item.item_name} — ${dept.name}" — Stage 1 ka kaam shuru karo! Qty: ${item.quantity}`,
+          task_id: taskId,
+          project_id
+        });
+      }
+    }
   }
 }
 
