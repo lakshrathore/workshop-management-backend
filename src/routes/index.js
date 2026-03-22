@@ -2049,8 +2049,9 @@ router.get('/packing/boxes', auth, async (req, res) => {
     const params = project_id ? [project_id] : [];
     const [boxes] = await db.query(`
       SELECT pb.*, u.name as created_by_name,
-        p.name as project_name, p.project_id as proj_code,
-        pi.item_name
+        p.name as project_name, p.project_id as proj_code, p.client_name,
+        pi.item_name,
+        (SELECT COUNT(*) FROM packing_box_photos pbp WHERE pbp.box_id = pb.id) as photo_count
       FROM packing_boxes pb
       LEFT JOIN users u ON u.id = pb.created_by
       LEFT JOIN projects p ON p.id = pb.project_id
