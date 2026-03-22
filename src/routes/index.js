@@ -597,6 +597,64 @@ router.delete('/projects/:projectId/items/:id', auth, adminOnly, async (req, res
   }
 });
 
+// ── PROJECT ITEM REFERENCE IMAGES ─────────────────────────────────────────────
+
+// Upload reference images for a project item
+router.post('/projects/:projectId/items/:itemId/images', auth, adminOnly, imgUpload.array('images', 10), async (req, res) => {
+  const db = await getPool();
+  try {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ message: 'Koi image nahi' });
+
+    let savedCount = 0;
+    for (const f of files) {
+      let publicId = f.key || f.public_id || '';
+      if (!publicId && (f.location || f.secure_url)) {
+        const url = f.location || f.secure_url;
+        const match = url.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match && match[1]) publicId = match[1];
+      }
+      publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
+      if (publicId) {
+        await db.query(
+          'INSERT INTO project_item_images (project_item_id, project_id, image_path, uploaded_by) VALUES (?,?,?,?)',
+          [req.params.itemId, req.params.projectId, publicId, req.user.id]
+        );
+        savedCount++;
+      }
+    }
+    const [images] = await db.query(
+      'SELECT * FROM project_item_images WHERE project_item_id=? ORDER BY created_at DESC',
+      [req.params.itemId]
+    );
+    res.json({ message: `${savedCount} images upload ho gayi`, images: images.map(img => ({ ...img, image_url: toHttpsImageUrl(img.image_path) })) });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Get reference images for a project item
+router.get('/projects/:projectId/items/:itemId/images', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [images] = await db.query(
+      'SELECT * FROM project_item_images WHERE project_item_id=? ORDER BY created_at ASC',
+      [req.params.itemId]
+    );
+    res.json(images.map(img => ({ ...img, image_url: toHttpsImageUrl(img.image_path) })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Delete a reference image
+router.delete('/projects/:projectId/items/:itemId/images/:imageId', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[img]] = await db.query('SELECT * FROM project_item_images WHERE id=? AND project_item_id=?', [req.params.imageId, req.params.itemId]);
+    if (!img) return res.status(404).json({ message: 'Image nahi mili' });
+    await deleteFile(img.image_path);
+    await db.query('DELETE FROM project_item_images WHERE id=?', [req.params.imageId]);
+    res.json({ message: 'Deleted' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ── PRODUCTION CHAIN ──────────────────────────────────────────────────────────
 // Set/replace chain for a project (or project item)
 router.post('/projects/:id/chain', auth, adminOnly, async (req, res) => {
