@@ -160,6 +160,7 @@ async function initializeDatabase() {
   )`);
 
 
+
   // ── APP SETTINGS ────────────────────────────────────────────────────────────
   await db.query(`CREATE TABLE IF NOT EXISTS app_settings (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -309,6 +310,8 @@ async function initializeDatabase() {
     }
   }
 
+  // Safely add columns that might be missing in existing installations
+  const safeAlter = async (sql) => { try { await db.query(sql); } catch(e) { /* column exists */ } };
   await safeAlter('ALTER TABLE daily_progress MODIFY COLUMN department_id INT NULL');
     await safeAlter("ALTER TABLE projects MODIFY COLUMN status ENUM('active','completed','on_hold','cancelled','deleted') DEFAULT 'active'");
   await safeAlter('ALTER TABLE task_assignments ADD COLUMN stage_order INT DEFAULT 0');
