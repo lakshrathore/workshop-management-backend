@@ -1197,7 +1197,12 @@ router.post('/tasks/:id/clock-in', auth, async (req, res) => {
   const db = await getPool();
   const [[active]] = await db.query('SELECT * FROM worker_time_logs WHERE task_id=? AND worker_id=? AND clock_out IS NULL', [req.params.id, req.user.id]);
   if (active) return res.status(400).json({ message: 'Pehle se clock-in hai', log: active });
-  const [r] = await db.query('INSERT INTO worker_time_logs (task_id,worker_id,clock_in) VALUES (?,?,NOW())', [req.params.id, req.user.id]);
+  // Allow custom clock_in datetime (for manual entry), default to NOW()
+  const clockInTime = req.body.clock_in ? new Date(req.body.clock_in).toISOString().slice(0,19).replace('T',' ') : null;
+  const [r] = await db.query(
+    'INSERT INTO worker_time_logs (task_id,worker_id,clock_in) VALUES (?,?,?)',
+    [req.params.id, req.user.id, clockInTime || new Date()]
+  );
   res.json({ message: 'Clock-in ho gaya', log_id: r.insertId });
 });
 router.post('/tasks/:id/clock-out', auth, async (req, res) => {
@@ -1477,11 +1482,16 @@ router.get('/reports/time', auth, adminOnly, async (req, res) => {
   const where = 'WHERE ' + conds.join(' AND ');
   const [logs] = await db.query(`
     SELECT tl.*,u.name as worker_name,u.hourly_rate,
-      ta.task_title,p.name as project_name,p.client_name,p.project_id as proj_code,
+      ta.task_title, ta.stage_order, ta.department_id,
+      d.name as department_name,
+      p.name as project_name,p.client_name,p.project_id as proj_code,
+      pi.item_name, COALESCE(pi.proto_code,'') as proto_code,
       ROUND(tl.duration_minutes/60*u.hourly_rate,2) as earnings
     FROM worker_time_logs tl
     JOIN users u ON u.id=tl.worker_id
     JOIN task_assignments ta ON ta.id=tl.task_id
+    LEFT JOIN departments d ON d.id=ta.department_id
+    LEFT JOIN project_items pi ON pi.id=ta.project_item_id
     JOIN projects p ON p.id=ta.project_id
     ${where} ORDER BY tl.clock_in DESC LIMIT 500`, params);
   const [summary] = await db.query(`
