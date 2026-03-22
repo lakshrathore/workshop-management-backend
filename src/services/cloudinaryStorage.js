@@ -66,7 +66,7 @@ async function deleteFile(publicId) {
 
 // Get full URL from public_id
 function getFileUrl(publicId) {
-  return cloudinary.url(publicId);
+  return cloudinary.url(publicId, { secure: true });
 }
 
 module.exports = { imgUpload, galleryUpload, licenseUpload, getFileUrl, deleteFile };
