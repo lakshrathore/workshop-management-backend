@@ -1946,7 +1946,37 @@ router.post('/workers/bulk-departments', auth, adminOnly, async (req, res) => {
   }
 });
 
-// ── FIX STUCK WAITING TASKS ───────────────────────────────────────────────────
+// ── FIX IMAGE PATHS IN DB ────────────────────────────────────────────────────
+// One-time fix: convert localhost/server URLs stored in image_path to clean public_ids
+router.post('/admin/fix-image-paths', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [images] = await db.query('SELECT id, image_path FROM task_images');
+    let fixed = 0;
+    for (const img of images) {
+      const p = String(img.image_path || '').trim();
+      if (!p) continue;
+      let newPath = p;
+      // Extract public_id from localhost or any URL with /uploads/
+      if (p.includes('/uploads/')) {
+        newPath = p.split('/uploads/').pop(); // e.g. workshop/task-images/abc123
+      } else if (p.startsWith('http://res.cloudinary.com') || p.startsWith('https://res.cloudinary.com')) {
+        // Extract public_id from full Cloudinary URL
+        const match = p.match(/\/upload\/(?:v\d+\/)?(.+)$/);
+        if (match) newPath = match[1];
+      }
+      if (newPath !== p) {
+        await db.query('UPDATE task_images SET image_path=? WHERE id=?', [newPath, img.id]);
+        fixed++;
+      }
+    }
+    res.json({ message: `Fix complete! ${fixed} image paths updated.`, fixed });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+
 // One-time fix: activate next waiting stage for all completed tasks
 router.post('/admin/fix-waiting-tasks', auth, adminOnly, async (req, res) => {
   const db = await getPool();
