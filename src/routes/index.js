@@ -608,13 +608,29 @@ router.post('/projects/:projectId/items/:itemId/images', auth, adminOnly, imgUpl
 
     let savedCount = 0;
     for (const f of files) {
-      let publicId = f.key || f.public_id || '';
-      if (!publicId && (f.location || f.secure_url)) {
-        const url = f.location || f.secure_url;
-        const match = url.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+      // multer-storage-cloudinary stores public_id in f.filename or f.public_id
+      // and full URL in f.path
+      let publicId = '';
+
+      if (f.filename) {
+        // multer-storage-cloudinary v4 uses f.filename as public_id
+        publicId = f.filename;
+      } else if (f.public_id) {
+        publicId = f.public_id;
+      } else if (f.key) {
+        publicId = f.key;
+      } else if (f.path && (f.path.startsWith('http') || f.path.includes('cloudinary'))) {
+        // Extract public_id from URL
+        const match = f.path.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match && match[1]) publicId = match[1];
+      } else if (f.location) {
+        const match = f.location.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
         if (match && match[1]) publicId = match[1];
       }
+
+      // Remove extension
       publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
+
       if (publicId) {
         await db.query(
           'INSERT INTO project_item_images (project_item_id, project_id, image_path, uploaded_by) VALUES (?,?,?,?)',
@@ -623,6 +639,11 @@ router.post('/projects/:projectId/items/:itemId/images', auth, adminOnly, imgUpl
         savedCount++;
       }
     }
+
+    if (savedCount === 0) {
+      return res.status(400).json({ message: 'Images save nahi hui — retry karo' });
+    }
+
     const [images] = await db.query(
       'SELECT * FROM project_item_images WHERE project_item_id=? ORDER BY created_at DESC',
       [req.params.itemId]
@@ -1109,33 +1130,28 @@ router.post('/tasks/:id/images', auth, imgUpload.array('images', 5), async (req,
       
       let publicId = '';
       
-      // Try multiple ways to get the public_id
-      // multer-storage-cloudinary provides: key (public_id), location (secure_url), path (cloudinary URL)
-      
-      // Method 1: Direct key property (from Cloudinary storage)
-      if (f.key && typeof f.key === 'string') {
+      // Method 1: filename (multer-storage-cloudinary v4 primary field)
+      if (f.filename && typeof f.filename === 'string') {
+        publicId = f.filename;
+      }
+      // Method 2: Direct key property (from Cloudinary storage)
+      else if (f.key && typeof f.key === 'string') {
         publicId = f.key;
-        console.log(`✅ Method 1 - Got key: ${publicId}`);
       } 
-      // Method 2: Direct public_id property
+      // Method 3: Direct public_id property
       else if (f.public_id && typeof f.public_id === 'string') {
         publicId = f.public_id;
-        console.log(`✅ Method 2 - Got public_id: ${publicId}`);
       } 
-      // Method 3: Extract from location (might be secure_url)
+      // Method 4: Extract from path URL
+      else if (f.path && (f.path.startsWith('http') || f.path.includes('cloudinary'))) {
+        const match = f.path.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match && match[1]) publicId = match[1];
+      }
+      // Method 5: Extract from location (might be secure_url)
       else if (f.location || f.secure_url) {
         const url = f.location || f.secure_url;
-        // Extract everything after /upload/vXXXXXX/ 
         const match = url.match(/\/upload\/v[\d]+\/(.+?)(?:\?|$)/);
-        if (match && match[1]) {
-          publicId = match[1];
-          console.log(`✅ Method 3 - Extracted from URL: ${publicId}`);
-        }
-      }
-      // Method 4: Extract from path if it contains workshop
-      else if (f.path && f.path.includes('workshop')) {
-        publicId = f.path;
-        console.log(`✅ Method 4 - Got from path: ${publicId}`);
+        if (match && match[1]) publicId = match[1];
       }
       
       // Clean up the public_id: remove common image extensions
@@ -2426,23 +2442,28 @@ router.post('/packing/boxes/:id/photos', auth, imgUpload.array('photos', 10), as
     for (const f of files) {
       let publicId = '';
 
-      // Method 1: key (from multer-storage-cloudinary)
-      if (f.key && typeof f.key === 'string') {
+      // Method 1: filename (multer-storage-cloudinary v4 primary field)
+      if (f.filename && typeof f.filename === 'string') {
+        publicId = f.filename;
+      }
+      // Method 2: key (from multer-storage-cloudinary)
+      else if (f.key && typeof f.key === 'string') {
         publicId = f.key;
       }
-      // Method 2: public_id
+      // Method 3: public_id
       else if (f.public_id && typeof f.public_id === 'string') {
         publicId = f.public_id;
       }
-      // Method 3: extract from location/secure_url
+      // Method 4: extract from path URL
+      else if (f.path && (f.path.startsWith('http') || f.path.includes('cloudinary'))) {
+        const match = f.path.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match && match[1]) publicId = match[1];
+      }
+      // Method 5: extract from location/secure_url
       else if (f.location || f.secure_url) {
         const url = f.location || f.secure_url;
         const match = url.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
         if (match && match[1]) publicId = match[1];
-      }
-      // Method 4: path with workshop
-      else if (f.path && f.path.includes('workshop')) {
-        publicId = f.path;
       }
 
       // Clean extension
