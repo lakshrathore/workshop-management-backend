@@ -160,7 +160,6 @@ async function initializeDatabase() {
   )`);
 
 
-
   // ── APP SETTINGS ────────────────────────────────────────────────────────────
   await db.query(`CREATE TABLE IF NOT EXISTS app_settings (
     id INT AUTO_INCREMENT PRIMARY KEY,
