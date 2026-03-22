@@ -344,6 +344,18 @@ async function initializeDatabase() {
     notes TEXT,
     FOREIGN KEY (box_id) REFERENCES packing_boxes(id) ON DELETE CASCADE
   )`);
+
+  // Packing Box Photos
+  await db.query(`CREATE TABLE IF NOT EXISTS packing_box_photos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    box_id INT NOT NULL,
+    image_path VARCHAR(500) NOT NULL,
+    uploaded_by INT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (box_id) REFERENCES packing_boxes(id) ON DELETE CASCADE,
+    FOREIGN KEY (uploaded_by) REFERENCES users(id)
+  )`);
+
   await db.query(`CREATE TABLE IF NOT EXISTS packing_parts (
     id INT AUTO_INCREMENT PRIMARY KEY,
     project_item_id INT NOT NULL,

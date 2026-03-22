@@ -2127,7 +2127,56 @@ router.get('/packing/next-box-number', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── PACKING BOXES ─────────────────────────────────────────────────────────────
+// Upload photos for a box
+router.post('/packing/boxes/:id/photos', auth, imgUpload.array('photos', 10), async (req, res) => {
+  const db = await getPool();
+  try {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ message: 'Koi photo nahi' });
+    for (const f of files) {
+      let publicId = f.key || f.public_id || '';
+      if (!publicId && (f.location || f.secure_url)) {
+        const url = f.location || f.secure_url;
+        const match = url.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match) publicId = match[1];
+      }
+      publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
+      if (publicId) {
+        await db.query(
+          'INSERT INTO packing_box_photos (box_id, image_path, uploaded_by) VALUES (?,?,?)',
+          [req.params.id, publicId, req.user.id]
+        );
+      }
+    }
+    res.json({ message: 'Photos upload ho gaye' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Get photos for a box
+router.get('/packing/boxes/:id/photos', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [photos] = await db.query(
+      'SELECT * FROM packing_box_photos WHERE box_id=? ORDER BY created_at DESC',
+      [req.params.id]
+    );
+    res.json(photos.map(p => ({ ...p, image_url: toHttpsImageUrl(p.image_path) })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Delete a box photo
+router.delete('/packing/boxes/:boxId/photos/:photoId', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[photo]] = await db.query('SELECT * FROM packing_box_photos WHERE id=? AND box_id=?', [req.params.photoId, req.params.boxId]);
+    if (!photo) return res.status(404).json({ message: 'Photo nahi mili' });
+    await deleteFile(photo.image_path);
+    await db.query('DELETE FROM packing_box_photos WHERE id=?', [req.params.photoId]);
+    res.json({ message: 'Deleted' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PACKING PARTS ─────────────────────────────────────────────────────────────
 
 // Get packing parts for a project item
 router.get('/packing-parts/:project_item_id', auth, async (req, res) => {
