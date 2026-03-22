@@ -23,6 +23,24 @@ function adminOnly(req, res, next) {
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
 const { imgUpload, galleryUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 
+// Helper: always return https Cloudinary URL from any image_path format
+function toHttpsImageUrl(imagePath) {
+  if (!imagePath) return null;
+  const p = String(imagePath).trim();
+  if (!p) return null;
+  // Already https Cloudinary URL
+  if (p.startsWith('https://res.cloudinary.com')) return p;
+  // http Cloudinary URL → force https
+  if (p.startsWith('http://res.cloudinary.com')) return p.replace('http://', 'https://');
+  // Any URL with /uploads/ → extract public_id
+  if (p.includes('/uploads/')) {
+    const publicId = p.split('/uploads/').pop();
+    return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload/${publicId}`;
+  }
+  // Plain public_id (e.g. workshop/task-images/abc123)
+  return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload/${p}`;
+}
+
 // Serve images — redirect to Cloudinary CDN
 // Handles both formats:
 // 1. Full Cloudinary URL already stored: https://res.cloudinary.com/...
@@ -458,9 +476,7 @@ router.get('/projects/:id/images-by-stage', auth, async (req, res) => {
       // Add full Cloudinary URL to each image object
       const imagesWithUrl = images.map(img => ({
         ...img,
-        image_url: img.image_path
-          ? (img.image_path.startsWith('https://') ? img.image_path : getFileUrl(img.image_path))
-          : null
+        image_url: toHttpsImageUrl(img.image_path)
       }));
 
       result.push({
@@ -1011,9 +1027,7 @@ router.get('/tasks/:id/images', auth, async (req, res) => {
   // Add full Cloudinary URL to each image object
   const rowsWithUrl = rows.map(r => ({
     ...r,
-    image_url: r.image_path
-      ? (r.image_path.startsWith('https://') ? r.image_path : getFileUrl(r.image_path))
-      : null
+    image_url: toHttpsImageUrl(r.image_path)
   }));
   res.json(rowsWithUrl);
 });
@@ -1076,9 +1090,7 @@ router.get('/projects/:projectId/images-for-worker', auth, async (req, res) => {
       // Add full Cloudinary URL to each image object
       grouped[img.uploaded_by_name].push({
         ...img,
-        image_url: img.image_path
-          ? (img.image_path.startsWith('https://') ? img.image_path : getFileUrl(img.image_path))
-          : null
+        image_url: toHttpsImageUrl(img.image_path)
       });
     });
     
