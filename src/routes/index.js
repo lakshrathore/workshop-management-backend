@@ -2158,23 +2158,63 @@ router.post('/packing/boxes/:id/photos', auth, imgUpload.array('photos', 10), as
   try {
     const files = req.files || [];
     if (!files.length) return res.status(400).json({ message: 'Koi photo nahi' });
+
+    let savedCount = 0;
     for (const f of files) {
-      let publicId = f.key || f.public_id || '';
-      if (!publicId && (f.location || f.secure_url)) {
+      let publicId = '';
+
+      // Method 1: key (from multer-storage-cloudinary)
+      if (f.key && typeof f.key === 'string') {
+        publicId = f.key;
+      }
+      // Method 2: public_id
+      else if (f.public_id && typeof f.public_id === 'string') {
+        publicId = f.public_id;
+      }
+      // Method 3: extract from location/secure_url
+      else if (f.location || f.secure_url) {
         const url = f.location || f.secure_url;
         const match = url.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
-        if (match) publicId = match[1];
+        if (match && match[1]) publicId = match[1];
       }
+      // Method 4: path with workshop
+      else if (f.path && f.path.includes('workshop')) {
+        publicId = f.path;
+      }
+
+      // Clean extension
       publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
+
+      // Remove full URL prefix if accidentally included
+      if (publicId.startsWith('https://') || publicId.startsWith('http://')) {
+        const match = publicId.match(/workshop\/[a-z0-9\-_]+\/[a-z0-9\-_]+/i);
+        if (match) publicId = match[0];
+      }
+
       if (publicId) {
         await db.query(
           'INSERT INTO packing_box_photos (box_id, image_path, uploaded_by) VALUES (?,?,?)',
           [req.params.id, publicId, req.user.id]
         );
+        savedCount++;
       }
     }
-    res.json({ message: 'Photos upload ho gaye' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+
+    if (savedCount === 0) {
+      return res.status(400).json({ message: 'Photos save nahi ho sake — retry karo' });
+    }
+
+    // Return updated photos list
+    const [photos] = await db.query(
+      'SELECT * FROM packing_box_photos WHERE box_id=? ORDER BY created_at DESC',
+      [req.params.id]
+    );
+    const photosWithUrl = photos.map(p => ({ ...p, image_url: toHttpsImageUrl(p.image_path) }));
+    res.json({ message: `${savedCount} photos upload ho gaye`, photos: photosWithUrl });
+  } catch (err) {
+    console.error('Packing photo upload error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
 });
 
 // Get photos for a box
