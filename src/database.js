@@ -321,7 +321,29 @@ async function initializeDatabase() {
   await safeAlter('ALTER TABLE users ADD COLUMN hourly_rate DECIMAL(10,2) DEFAULT 0');
   await safeAlter('ALTER TABLE departments ADD COLUMN stage_order INT DEFAULT 999');
 
-  // Packing Parts table
+  // Packing Boxes table — manual + auto box management
+  await db.query(`CREATE TABLE IF NOT EXISTS packing_boxes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    box_number VARCHAR(100) NOT NULL,
+    project_id INT,
+    project_item_id INT,
+    mode ENUM('auto','manual') DEFAULT 'manual',
+    created_by INT NOT NULL,
+    notes TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (created_by) REFERENCES users(id)
+  )`);
+
+  // Packing Box Items table — items inside each box
+  await db.query(`CREATE TABLE IF NOT EXISTS packing_box_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    box_id INT NOT NULL,
+    item_name VARCHAR(255) NOT NULL,
+    quantity INT DEFAULT 1,
+    unit VARCHAR(50) DEFAULT 'pcs',
+    notes TEXT,
+    FOREIGN KEY (box_id) REFERENCES packing_boxes(id) ON DELETE CASCADE
+  )`);
   await db.query(`CREATE TABLE IF NOT EXISTS packing_parts (
     id INT AUTO_INCREMENT PRIMARY KEY,
     project_item_id INT NOT NULL,

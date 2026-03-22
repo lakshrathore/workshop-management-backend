@@ -2013,7 +2013,121 @@ router.post('/admin/fix-waiting-tasks', auth, adminOnly, async (req, res) => {
   }
 });
 
-// ── PACKING PARTS ─────────────────────────────────────────────────────────────
+// ── PACKING BOXES ─────────────────────────────────────────────────────────────
+
+// Generate next box number
+async function generateBoxNumber(db) {
+  const [setting] = await db.query(
+    "SELECT setting_value FROM app_settings WHERE setting_key='packing_box_prefix'"
+  );
+  const prefix = setting[0]?.setting_value || 'BOX';
+  const [last] = await db.query(
+    "SELECT box_number FROM packing_boxes WHERE box_number LIKE ? ORDER BY id DESC LIMIT 1",
+    [`${prefix}-%`]
+  );
+  if (!last[0]) return `${prefix}-01`;
+  const lastNum = parseInt(last[0].box_number.split('-').pop()) || 0;
+  return `${prefix}-${String(lastNum + 1).padStart(2, '0')}`;
+}
+
+// Get all boxes (with items) — filter by project or all
+router.get('/packing/boxes', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { project_id } = req.query;
+    const where = project_id ? 'WHERE pb.project_id=?' : 'WHERE 1=1';
+    const params = project_id ? [project_id] : [];
+    const [boxes] = await db.query(`
+      SELECT pb.*, u.name as created_by_name,
+        p.name as project_name, p.project_id as proj_code,
+        pi.item_name
+      FROM packing_boxes pb
+      LEFT JOIN users u ON u.id = pb.created_by
+      LEFT JOIN projects p ON p.id = pb.project_id
+      LEFT JOIN project_items pi ON pi.id = pb.project_item_id
+      ${where} ORDER BY pb.created_at DESC`, params);
+
+    // Get items for each box
+    for (const box of boxes) {
+      const [items] = await db.query(
+        'SELECT * FROM packing_box_items WHERE box_id=? ORDER BY id',
+        [box.id]
+      );
+      box.items = items;
+    }
+    res.json(boxes);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Create new box (manual or auto)
+router.post('/packing/boxes', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { project_id, project_item_id, mode, items, notes, box_number } = req.body;
+    // Use provided box_number or generate
+    const finalBoxNum = box_number || await generateBoxNumber(db);
+
+    const [r] = await db.query(
+      'INSERT INTO packing_boxes (box_number, project_id, project_item_id, mode, created_by, notes) VALUES (?,?,?,?,?,?)',
+      [finalBoxNum, project_id || null, project_item_id || null, mode || 'manual', req.user.id, notes || '']
+    );
+    const boxId = r.insertId;
+
+    // Add items to box
+    if (items && items.length > 0) {
+      for (const item of items) {
+        await db.query(
+          'INSERT INTO packing_box_items (box_id, item_name, quantity, unit, notes) VALUES (?,?,?,?,?)',
+          [boxId, item.item_name, item.quantity || 1, item.unit || 'pcs', item.notes || '']
+        );
+      }
+    }
+
+    const [[box]] = await db.query(
+      'SELECT pb.*, u.name as created_by_name FROM packing_boxes pb JOIN users u ON u.id=pb.created_by WHERE pb.id=?',
+      [boxId]
+    );
+    const [boxItems] = await db.query('SELECT * FROM packing_box_items WHERE box_id=?', [boxId]);
+    res.json({ ...box, items: boxItems });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Update box
+router.put('/packing/boxes/:id', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { notes, items } = req.body;
+    await db.query('UPDATE packing_boxes SET notes=? WHERE id=?', [notes || '', req.params.id]);
+    if (items) {
+      await db.query('DELETE FROM packing_box_items WHERE box_id=?', [req.params.id]);
+      for (const item of items) {
+        await db.query(
+          'INSERT INTO packing_box_items (box_id, item_name, quantity, unit, notes) VALUES (?,?,?,?,?)',
+          [req.params.id, item.item_name, item.quantity || 1, item.unit || 'pcs', item.notes || '']
+        );
+      }
+    }
+    res.json({ message: 'Updated' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Delete box
+router.delete('/packing/boxes/:id', auth, async (req, res) => {
+  const db = await getPool();
+  await db.query('DELETE FROM packing_boxes WHERE id=?', [req.params.id]);
+  res.json({ message: 'Deleted' });
+});
+
+// Get next box number (for UI preview)
+router.get('/packing/next-box-number', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const nextNum = await generateBoxNumber(db);
+    res.json({ box_number: nextNum });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PACKING BOXES ─────────────────────────────────────────────────────────────
 
 // Get packing parts for a project item
 router.get('/packing-parts/:project_item_id', auth, async (req, res) => {
