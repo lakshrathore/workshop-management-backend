@@ -319,7 +319,7 @@ async function initializeDatabase() {
   await safeAlter('ALTER TABLE project_items ADD COLUMN proto_code VARCHAR(100)');
   await safeAlter('ALTER TABLE project_items ADD COLUMN current_stage_id INT DEFAULT NULL');
   await safeAlter('ALTER TABLE users ADD COLUMN hourly_rate DECIMAL(10,2) DEFAULT 0');
-  await safeAlter('ALTER TABLE packing_boxes ADD COLUMN IF NOT EXISTS photo_code VARCHAR(100) DEFAULT NULL');
+  await safeAlter('ALTER TABLE packing_boxes ADD COLUMN photo_code VARCHAR(100) DEFAULT NULL');
   await safeAlter('ALTER TABLE departments ADD COLUMN stage_order INT DEFAULT 999');
 
   // Packing Boxes table — manual + auto box management
