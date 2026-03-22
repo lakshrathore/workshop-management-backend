@@ -327,6 +327,7 @@ async function initializeDatabase() {
     box_number VARCHAR(100) NOT NULL,
     project_id INT,
     project_item_id INT,
+    photo_code VARCHAR(100) DEFAULT NULL,
     mode ENUM('auto','manual') DEFAULT 'manual',
     created_by INT NOT NULL,
     notes TEXT,
