@@ -2013,6 +2013,123 @@ router.post('/admin/fix-waiting-tasks', auth, adminOnly, async (req, res) => {
   }
 });
 
+// ── PACKING PARTS ─────────────────────────────────────────────────────────────
+
+// Get packing parts for a project item
+router.get('/packing-parts/:project_item_id', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [parts] = await db.query(`
+      SELECT pp.*,
+        COALESCE(SUM(pl.packed_qty), 0) as packed_qty,
+        u.name as last_packed_by_name
+      FROM packing_parts pp
+      LEFT JOIN packing_logs pl ON pl.packing_part_id = pp.id
+      LEFT JOIN users u ON u.id = pl.packed_by
+      WHERE pp.project_item_id = ?
+      GROUP BY pp.id
+      ORDER BY pp.sort_order, pp.id`, [req.params.project_item_id]);
+    res.json(parts);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Create packing parts for a project item (admin)
+router.post('/packing-parts', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { project_item_id, project_id, parts } = req.body;
+    // parts = [{part_name, quantity, unit, sort_order}]
+    if (!parts || !parts.length) return res.status(400).json({ message: 'Parts list empty hai' });
+    // Delete existing parts first
+    await db.query('DELETE FROM packing_parts WHERE project_item_id=?', [project_item_id]);
+    for (const p of parts) {
+      await db.query(
+        'INSERT INTO packing_parts (project_item_id, project_id, part_name, quantity, unit, sort_order) VALUES (?,?,?,?,?,?)',
+        [project_item_id, project_id, p.part_name, p.quantity || 1, p.unit || 'pcs', p.sort_order || 0]
+      );
+    }
+    res.json({ message: 'Packing parts save ho gaye' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Delete a single packing part (admin)
+router.delete('/packing-parts/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  await db.query('DELETE FROM packing_parts WHERE id=?', [req.params.id]);
+  res.json({ message: 'Deleted' });
+});
+
+// Log packing progress for a part (worker)
+router.post('/packing-parts/:id/log', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { packed_qty, notes } = req.body;
+    const [[part]] = await db.query('SELECT * FROM packing_parts WHERE id=?', [req.params.id]);
+    if (!part) return res.status(404).json({ message: 'Part nahi mila' });
+
+    // Get already packed qty
+    const [[existing]] = await db.query(
+      'SELECT COALESCE(SUM(packed_qty),0) as total FROM packing_logs WHERE packing_part_id=?',
+      [req.params.id]
+    );
+    const alreadyPacked = parseInt(existing.total || 0);
+    const newTotal = alreadyPacked + parseInt(packed_qty || 0);
+
+    if (newTotal > part.quantity) {
+      return res.status(400).json({
+        message: `Sirf ${part.quantity - alreadyPacked} units baki hain pack karne ke liye`,
+        remaining: part.quantity - alreadyPacked
+      });
+    }
+
+    await db.query(
+      'INSERT INTO packing_logs (packing_part_id, project_item_id, packed_qty, packed_by, notes) VALUES (?,?,?,?,?)',
+      [req.params.id, part.project_item_id, parseInt(packed_qty), req.user.id, notes || '']
+    );
+
+    res.json({ message: 'Packing log save ho gaya', total_packed: newTotal, remaining: part.quantity - newTotal });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Get packing logs for a part
+router.get('/packing-parts/:id/logs', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [logs] = await db.query(`
+      SELECT pl.*, u.name as packed_by_name
+      FROM packing_logs pl
+      JOIN users u ON u.id = pl.packed_by
+      WHERE pl.packing_part_id = ?
+      ORDER BY pl.packed_at DESC`, [req.params.id]);
+    res.json(logs);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Get full packing summary for label printing
+router.get('/packing-label/:project_item_id', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[item]] = await db.query(`
+      SELECT pi.*, p.name as project_name, p.project_id as proj_code,
+        p.client_name, p.deadline
+      FROM project_items pi
+      JOIN projects p ON p.id = pi.project_id
+      WHERE pi.id = ?`, [req.params.project_item_id]);
+    if (!item) return res.status(404).json({ message: 'Item nahi mila' });
+
+    const [parts] = await db.query(`
+      SELECT pp.*,
+        COALESCE(SUM(pl.packed_qty), 0) as packed_qty
+      FROM packing_parts pp
+      LEFT JOIN packing_logs pl ON pl.packing_part_id = pp.id
+      WHERE pp.project_item_id = ?
+      GROUP BY pp.id
+      ORDER BY pp.sort_order, pp.id`, [req.params.project_item_id]);
+
+    res.json({ item, parts });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ── DELETE ALL DATA ───────────────────────────────────────────────────────────
 router.post('/admin/delete-all-data', auth, adminOnly, async (req, res) => {
   const db = await getPool();

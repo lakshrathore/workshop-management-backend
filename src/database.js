@@ -310,8 +310,6 @@ async function initializeDatabase() {
     }
   }
 
-  // Safely add columns that might be missing in existing installations
-  const safeAlter = async (sql) => { try { await db.query(sql); } catch(e) { /* column exists */ } };
   await safeAlter('ALTER TABLE daily_progress MODIFY COLUMN department_id INT NULL');
     await safeAlter("ALTER TABLE projects MODIFY COLUMN status ENUM('active','completed','on_hold','cancelled','deleted') DEFAULT 'active'");
   await safeAlter('ALTER TABLE task_assignments ADD COLUMN stage_order INT DEFAULT 0');
@@ -320,6 +318,32 @@ async function initializeDatabase() {
   await safeAlter('ALTER TABLE project_items ADD COLUMN current_stage_id INT DEFAULT NULL');
   await safeAlter('ALTER TABLE users ADD COLUMN hourly_rate DECIMAL(10,2) DEFAULT 0');
   await safeAlter('ALTER TABLE departments ADD COLUMN stage_order INT DEFAULT 999');
+
+  // Packing Parts table
+  await db.query(`CREATE TABLE IF NOT EXISTS packing_parts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    project_item_id INT NOT NULL,
+    project_id INT NOT NULL,
+    part_name VARCHAR(255) NOT NULL,
+    quantity INT DEFAULT 1,
+    unit VARCHAR(50) DEFAULT 'pcs',
+    sort_order INT DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_item_id) REFERENCES project_items(id) ON DELETE CASCADE
+  )`);
+
+  // Packing Logs table
+  await db.query(`CREATE TABLE IF NOT EXISTS packing_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    packing_part_id INT NOT NULL,
+    project_item_id INT NOT NULL,
+    packed_qty INT DEFAULT 0,
+    packed_by INT NOT NULL,
+    notes TEXT,
+    packed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (packing_part_id) REFERENCES packing_parts(id) ON DELETE CASCADE,
+    FOREIGN KEY (packed_by) REFERENCES users(id)
+  )`);
 
   console.log('✅ Workshop App Database initialized');
   return db;
