@@ -132,6 +132,21 @@ router.get('/gallery/*', (req, res) => {
 });
 
 // ── AUTH ──────────────────────────────────────────────────────────────────────
+// Emergency admin password reset — only works with secret key from .env
+router.post('/auth/emergency-reset', async (req, res) => {
+  const { secret, new_password } = req.body;
+  const RESET_SECRET = process.env.RESET_SECRET || 'moji-reset-2024';
+  if (secret !== RESET_SECRET) return res.status(403).json({ message: 'Wrong secret key' });
+  if (!new_password || new_password.length < 4) return res.status(400).json({ message: 'Password kam se kam 4 characters ka hona chahiye' });
+  try {
+    const db = await getPool();
+    const hashed = await bcrypt.hash(new_password, 10);
+    await db.query("UPDATE users SET password=? WHERE role='admin' LIMIT 1", [hashed]);
+    const [[admin]] = await db.query("SELECT username FROM users WHERE role='admin' LIMIT 1");
+    res.json({ message: `Admin password reset ho gaya! Username: ${admin.username}` });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 router.post('/auth/login', async (req, res) => {
   const db = await getPool();
   const { username, password } = req.body;
@@ -2353,25 +2368,14 @@ router.get('/packing/boxes', auth, async (req, res) => {
 router.post('/packing/boxes', auth, async (req, res) => {
   const db = await getPool();
   try {
-    const { project_id, project_item_id, mode, items, notes, box_number, photo_code } = req.body;
+    const { project_id, project_item_id, mode, items, notes, box_number, photo_code, main_item } = req.body;
     const finalBoxNum = box_number || await generateBoxNumber(db);
 
-    // First try with photo_code, fallback without if column doesn't exist yet
-    let boxId;
-    try {
-      const [r] = await db.query(
-        'INSERT INTO packing_boxes (box_number, project_id, project_item_id, photo_code, mode, created_by, notes) VALUES (?,?,?,?,?,?,?)',
-        [finalBoxNum, project_id || null, project_item_id || null, photo_code || null, mode || 'manual', req.user.id, notes || '']
-      );
-      boxId = r.insertId;
-    } catch (colErr) {
-      // photo_code column might not exist yet — insert without it
-      const [r] = await db.query(
-        'INSERT INTO packing_boxes (box_number, project_id, project_item_id, mode, created_by, notes) VALUES (?,?,?,?,?,?)',
-        [finalBoxNum, project_id || null, project_item_id || null, mode || 'manual', req.user.id, notes || '']
-      );
-      boxId = r.insertId;
-    }
+    const [r] = await db.query(
+      'INSERT INTO packing_boxes (box_number, project_id, project_item_id, photo_code, main_item, mode, created_by, notes) VALUES (?,?,?,?,?,?,?,?)',
+      [finalBoxNum, project_id || null, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '']
+    );
+    const boxId = r.insertId;
 
     // Add items to box
     if (items && items.length > 0) {
@@ -2396,12 +2400,11 @@ router.post('/packing/boxes', auth, async (req, res) => {
 router.put('/packing/boxes/:id', auth, async (req, res) => {
   const db = await getPool();
   try {
-    const { notes, items, photo_code } = req.body;
-    try {
-      await db.query('UPDATE packing_boxes SET notes=?, photo_code=? WHERE id=?', [notes || '', photo_code || null, req.params.id]);
-    } catch {
-      await db.query('UPDATE packing_boxes SET notes=? WHERE id=?', [notes || '', req.params.id]);
-    }
+    const { notes, items, photo_code, main_item } = req.body;
+    await db.query(
+      'UPDATE packing_boxes SET notes=?, photo_code=?, main_item=? WHERE id=?',
+      [notes || '', photo_code || null, main_item || null, req.params.id]
+    );
     if (items) {
       await db.query('DELETE FROM packing_box_items WHERE box_id=?', [req.params.id]);
       for (const item of items) {

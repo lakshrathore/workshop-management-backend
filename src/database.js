@@ -356,6 +356,7 @@ async function initializeDatabase() {
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
   await safeAlter('ALTER TABLE packing_boxes ADD COLUMN photo_code VARCHAR(100) DEFAULT NULL');
+  await safeAlter('ALTER TABLE packing_boxes ADD COLUMN main_item VARCHAR(255) DEFAULT NULL');
   await safeAlter('ALTER TABLE departments ADD COLUMN stage_order INT DEFAULT 999');
 
   // Packing Boxes table — manual + auto box management
