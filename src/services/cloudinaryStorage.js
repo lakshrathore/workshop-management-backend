@@ -54,6 +54,27 @@ const licenseUpload = multer({
   limits: { fileSize: 5 * 1024 * 1024 },
 });
 
+// MO Reference images + PDFs uploader (max 20MB)
+const moReferenceUpload = multer({
+  storage: new CloudinaryStorage({
+    cloudinary,
+    params: async (req, file) => {
+      const isImage = /\.(png|jpg|jpeg|gif|webp)$/i.test(file.originalname);
+      return {
+        folder: 'workshop/mo-references',
+        resource_type: isImage ? 'image' : 'raw',
+        allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf'],
+      };
+    },
+  }),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = /\.(jpg|jpeg|png|gif|webp|pdf)$/i;
+    if (allowed.test(file.originalname)) cb(null, true);
+    else cb(new Error('Only images and PDFs allowed'), false);
+  },
+});
+
 // Delete file from Cloudinary by public_id
 async function deleteFile(publicId) {
   try {
@@ -69,4 +90,4 @@ function getFileUrl(publicId) {
   return cloudinary.url(publicId, { secure: true });
 }
 
-module.exports = { imgUpload, galleryUpload, licenseUpload, getFileUrl, deleteFile };
+module.exports = { imgUpload, galleryUpload, licenseUpload, moReferenceUpload, getFileUrl, deleteFile };

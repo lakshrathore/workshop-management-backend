@@ -33,7 +33,7 @@ function adminOnly(req, res, next) {
 }
 
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
-const { imgUpload, galleryUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
+const { imgUpload, galleryUpload, moReferenceUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 
 // Helper: always return https Cloudinary URL from any image_path format
 function toHttpsImageUrl(imagePath) {
@@ -429,7 +429,7 @@ router.put('/projects/:id', auth, adminOnly, async (req, res) => {
   res.json({ message: 'Updated' });
 });
 
-router.post('/projects/:id/mo-references', auth, adminOnly, imgUpload.array('images', 10), async (req, res) => {
+router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.array('images', 10), async (req, res) => {
   const db = await getPool();
   const projectId = req.params.id;
   try {
