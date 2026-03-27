@@ -251,6 +251,18 @@ async function initializeDatabase() {
     FOREIGN KEY (responded_by) REFERENCES users(id) ON DELETE SET NULL
   )`);
 
+  await db.query(`CREATE TABLE IF NOT EXISTS worker_query_images (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    query_id INT NOT NULL,
+    project_id INT NOT NULL,
+    uploaded_by INT NOT NULL,
+    image_path VARCHAR(500) NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (query_id) REFERENCES worker_queries(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
+  )`);
+
 
   // ── MATERIAL PRODUCTION OUTPUT (Excel: Cutting sheet - production side) ──────
   await db.query(`CREATE TABLE IF NOT EXISTS material_production (

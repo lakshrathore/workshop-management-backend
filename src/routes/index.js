@@ -1683,6 +1683,29 @@ router.get('/reports/transfers', auth, adminOnly, async (req, res) => {
   res.json(rows);
 });
 
+router.get('/reports/material-requests', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [summary] = await db.query(`
+      SELECT p.id AS project_id, p.project_id AS proj_code, p.name AS project_name,
+        COUNT(DISTINCT wq.id) AS mr_requests,
+        COUNT(wqi.id) AS mr_images,
+        MAX(wq.created_at) AS latest_request,
+        MAX(wqi.created_at) AS latest_image
+      FROM worker_queries wq
+      JOIN projects p ON p.id=wq.project_id
+      LEFT JOIN worker_query_images wqi ON wqi.query_id=wq.id
+      WHERE wq.query_type='material_request'
+      GROUP BY p.id
+      ORDER BY mr_images DESC, mr_requests DESC
+      LIMIT 200`);
+    res.json(summary);
+  } catch(err) {
+    console.error('reports/material-requests error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // Time report
 router.get('/reports/time', auth, adminOnly, async (req, res) => {
   const db = await getPool();
@@ -2032,9 +2055,75 @@ router.get('/queries', auth, async (req, res) => {
         FIELD(wq.priority,'urgent','high','medium','low'),
         FIELD(wq.status,'open','in_review','resolved','closed'),
         wq.created_at DESC`, params);
-    res.json(rows);
+
+    const queryIds = rows.map(r => r.id);
+    let queryImagesByQueryId = {};
+    if (queryIds.length > 0) {
+      const [images] = await db.query(
+        'SELECT * FROM worker_query_images WHERE query_id IN (?) ORDER BY created_at DESC',
+        [queryIds]
+      );
+      queryImagesByQueryId = images.reduce((acc, image) => {
+        const qid = image.query_id;
+        if (!acc[qid]) acc[qid] = [];
+        acc[qid].push({ ...image, image_url: toHttpsImageUrl(image.image_path) });
+        return acc;
+      }, {});
+    }
+
+    const rowsWithImages = rows.map(row => ({ ...row, images: queryImagesByQueryId[row.id] || [] }));
+    res.json(rowsWithImages);
   } catch(err) {
     console.error('queries error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.post('/queries/:id/images', auth, imgUpload.array('images', 10), async (req, res) => {
+  const db = await getPool();
+  const queryId = req.params.id;
+  try {
+    const [[query]] = await db.query('SELECT * FROM worker_queries WHERE id=?', [queryId]);
+    if (!query) return res.status(404).json({ message: 'Query not found' });
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ message: 'No files uploaded' });
+
+    let saved = 0;
+    for (const f of files) {
+      let publicId = '';
+      if (f.filename) publicId = f.filename;
+      else if (f.public_id) publicId = f.public_id;
+      else if (f.key) publicId = f.key;
+      else if (f.path && (f.path.startsWith('http') || f.path.includes('cloudinary'))) {
+        const match = f.path.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match && match[1]) publicId = match[1];
+      } else if (f.location) {
+        const match = f.location.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match && match[1]) publicId = match[1];
+      }
+      publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
+      if (!publicId) continue;
+      await db.query('INSERT INTO worker_query_images (query_id, project_id, uploaded_by, image_path) VALUES (?,?,?,?)', [queryId, query.project_id, req.user.id, publicId]);
+      saved++;
+    }
+    if (saved === 0) return res.status(400).json({ message: 'No valid images were saved' });
+
+    const [images] = await db.query('SELECT * FROM worker_query_images WHERE query_id=? ORDER BY created_at DESC', [queryId]);
+    res.json({ message: `${saved} images uploaded`, images: images.map(img => ({ ...img, image_url: toHttpsImageUrl(img.image_path) })) });
+  } catch(err) {
+    console.error('query images upload error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.get('/queries/:id/images', auth, async (req, res) => {
+  const db = await getPool();
+  const queryId = req.params.id;
+  try {
+    const [images] = await db.query('SELECT * FROM worker_query_images WHERE query_id=? ORDER BY created_at DESC', [queryId]);
+    res.json(images.map(img => ({ ...img, image_url: toHttpsImageUrl(img.image_path) })));
+  } catch(err) {
+    console.error('query images load error:', err.message);
     res.status(500).json({ message: err.message });
   }
 });
