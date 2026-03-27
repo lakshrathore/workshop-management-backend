@@ -62,14 +62,17 @@ const moReferenceUpload = multer({
       try {
         const isImage = /\.(png|jpg|jpeg|gif|webp)$/i.test(file.originalname);
         const rt = isImage ? 'image' : 'raw';
-        console.log(`📤 Cloudinary MO upload: ${file.originalname} -> type: ${rt}`);
+        console.log(`\n📤 CLOUDINARY UPLOAD CONFIG`);
+        console.log(`   File: ${file.originalname}`);
+        console.log(`   Type detected: ${rt}`);
+        console.log(`   Folder: workshop/mo-references`);
         return {
           folder: 'workshop/mo-references',
           resource_type: rt,
           allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf'],
         };
       } catch(e) {
-        console.error('Cloudinary params error:', e.message);
+        console.error('❌ Cloudinary params error:', e.message);
         throw new Error(`Cloudinary config error: ${e.message}`);
       }
     },
@@ -78,11 +81,11 @@ const moReferenceUpload = multer({
   fileFilter: (req, file, cb) => {
     const allowed = /\.(jpg|jpeg|png|gif|webp|pdf)$/i;
     if (allowed.test(file.originalname)) {
-      console.log(`✅ File allowed: ${file.originalname}`);
+      console.log(`✅ File filter ALLOWED: ${file.originalname}`);
       cb(null, true);
     } else {
       const err = new Error(`Only images and PDFs allowed. Got: ${file.originalname}`);
-      console.warn(`❌ File rejected: ${file.originalname}`);
+      console.warn(`❌ File filter REJECTED: ${file.originalname}`);
       cb(err, false);
     }
   },

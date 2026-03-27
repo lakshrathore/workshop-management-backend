@@ -441,74 +441,118 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
   const db = await getPool();
   const projectId = parseInt(req.params.id, 10);
   try {
-    console.log(`📤 MO Reference upload: project ${projectId}`);
-    console.log(`   req.files exists: ${!!req.files}, count: ${req.files?.length || 0}`);
-    console.log(`   req.body keys: ${Object.keys(req.body).join(', ')}`);
+    console.log(`\n📤 MO REFERENCE UPLOAD REQUEST`);
+    console.log(`   Project ID: ${projectId}`);
+    console.log(`   Files received: ${req.files?.length || 0}`);
+    
+    if (req.files && req.files.length > 0) {
+      console.log(`   File details:`);
+      req.files.forEach((f, idx) => {
+        console.log(`     [${idx}] filename: ${f.filename}`);
+        console.log(`         public_id: ${f.public_id}`);
+        console.log(`         resource_type: ${f.resource_type}`);
+        console.log(`         originalname: ${f.originalname}`);
+        console.log(`         path: ${f.path?.substring(0, 100)}`);
+        console.log(`         location: ${f.location?.substring(0, 100)}`);
+        console.log(`         All keys: ${Object.keys(f).join(', ')}`);
+      });
+    }
 
     if (!req.files || req.files.length === 0) {
-      console.warn(`⚠️ No files in request. This usually means multer didn't parse multipart correctly.`);
-      console.warn(`   Middleware: moReferenceUpload.array('images', 10)`);
+      console.error(`❌ NO FILES IN REQUEST`);
       return res.status(400).json({ 
-        message: 'No files uploaded. Check file selection and multipart encoding.',
-        debug: { filesReceived: req.files?.length || 0 }
+        message: 'No files uploaded. Multer did not receive files.',
+        debug: { filesReceived: 0, middleware: 'moReferenceUpload.array(images, 10)' }
       });
     }
 
     const [[project]] = await db.query('SELECT id FROM projects WHERE id=?', [projectId]);
-    if (!project) return res.status(404).json({ message: 'Project not found' });
+    if (!project) {
+      console.error(`❌ PROJECT NOT FOUND: ${projectId}`);
+      return res.status(404).json({ message: 'Project not found' });
+    }
 
     const files = req.files;
     let saved = 0;
-    const insertedRows = [];
+    const errors = [];
 
     for (const f of files) {
       try {
         let publicId = '';
 
-        // Try multiple ways to extract public_id from file object
-        if (f.filename) publicId = f.filename;
-        else if (f.public_id) publicId = f.public_id;
-        else if (f.key) publicId = f.key;
-        else if (f.path && (f.path.startsWith('http') || f.path.includes('cloudinary'))) {
+        // PRIORITY: Try filename first (most reliable from Cloudinary)
+        if (f.filename) {
+          publicId = f.filename;
+          console.log(`✅ Got publicId from f.filename: ${publicId}`);
+        }
+        // Otherwise try public_id
+        else if (f.public_id) {
+          publicId = f.public_id;
+          console.log(`✅ Got publicId from f.public_id: ${publicId}`);
+        }
+        // Try key
+        else if (f.key) {
+          publicId = f.key;
+          console.log(`✅ Got publicId from f.key: ${publicId}`);
+        }
+        // Try extracting from path/location
+        else if (f.path) {
           const match = f.path.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
-          if (match && match[1]) publicId = match[1];
-        } else if (f.location) {
+          if (match && match[1]) {
+            publicId = match[1];
+            console.log(`✅ Got publicId from f.path: ${publicId}`);
+          }
+        }
+        else if (f.location) {
           const match = f.location.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
-          if (match && match[1]) publicId = match[1];
+          if (match && match[1]) {
+            publicId = match[1];
+            console.log(`✅ Got publicId from f.location: ${publicId}`);
+          }
         }
 
         if (!publicId) {
-          console.warn(`⚠️ Skipping file - no public_id found. File object keys:`, Object.keys(f));
-          console.warn(`   Available:`, { filename: f.filename, public_id: f.public_id, key: f.key, location: f.location });
+          const err = `No public_id found. File props: ${JSON.stringify({filename: f.filename, public_id: f.public_id, key: f.key, originalname: f.originalname})}`;
+          console.error(`❌ ${err}`);
+          errors.push({ file: f.originalname, error: err });
           continue;
         }
 
-        // Strip extension from public_id
-        publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp|pdf)$/i, '');
+        // Clean up public_id
+        publicId = String(publicId).replace(/\.(jpg|jpeg|png|gif|webp|pdf)$/i, '').trim();
 
-        if (!publicId) {
-          console.warn(`⚠️ Skipping file - public_id empty after extension strip`);
+        if (!publicId || publicId.length === 0) {
+          const err = `publicId empty after cleanup`;
+          console.error(`❌ ${err}`);
+          errors.push({ file: f.originalname, error: err });
           continue;
         }
 
         // Determine resource type
         const resourceType = f.resource_type || (/(jpg|jpeg|png|gif|webp)$/i.test(f.originalname) ? 'image' : 'raw');
 
-        console.log(`✅ Inserting: publicId='${publicId}', resourceType='${resourceType}', originalName='${f.originalname}'`);
+        console.log(`   INSERT: publicId='${publicId}', resourceType='${resourceType}', file='${f.originalname}'`);
 
         await db.query(
           'INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)',
           [projectId, req.user.id, publicId, resourceType]
         );
-        insertedRows.push({ publicId, resourceType });
+
+        console.log(`   ✅ SAVED to DB`);
         saved++;
       } catch (fileErr) {
-        console.error(`❌ Error processing file ${f.originalname}:`, fileErr.message);
+        const err = `Error processing ${f.originalname}: ${fileErr.message}`;
+        console.error(`❌ ${err}`);
+        errors.push({ file: f.originalname, error: fileErr.message });
       }
     }
 
     if (saved === 0) {
-      return res.status(400).json({ message: 'No files were successfully uploaded. Check Cloudinary credentials and file formats.' });
+      console.error(`❌ NO FILES SAVED. Errors:`, errors);
+      return res.status(400).json({ 
+        message: `Failed to save any files. ${errors.length} error(s) occurred.`,
+        details: errors
+      });
     }
 
     const [images] = await db.query(
@@ -516,16 +560,20 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
       [projectId]
     );
 
+    console.log(`✅ SUCCESS: ${saved} file(s) uploaded and saved\n`);
     res.json({
       message: `${saved} file(s) uploaded successfully`,
+      saved_count: saved,
+      error_count: errors.length,
       images: images.map(img => ({
         ...img,
         image_url: toHttpsImageUrl(img.image_path, img.resource_type),
       })),
     });
   } catch(err) {
-    console.error('❌ MO Reference upload error:', err.message, err.stack);
-    res.status(500).json({ message: `Upload failed: ${err.message}` });
+    console.error(`\n❌ FATAL ERROR:`, err.message);
+    console.error(err.stack);
+    res.status(500).json({ message: `Upload error: ${err.message}` });
   }
 });
 
