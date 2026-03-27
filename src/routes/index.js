@@ -428,6 +428,83 @@ router.put('/projects/:id', auth, adminOnly, async (req, res) => {
     [name, client_name, client_phone, description, status, priority, order_date, deadline, total_amount, notes, req.params.id]);
   res.json({ message: 'Updated' });
 });
+
+router.post('/projects/:id/mo-references', auth, adminOnly, imgUpload.array('images', 10), async (req, res) => {
+  const db = await getPool();
+  const projectId = req.params.id;
+  try {
+    const [[project]] = await db.query('SELECT id FROM projects WHERE id=?', [projectId]);
+    if (!project) return res.status(404).json({ message: 'Project not found' });
+
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ message: 'No files uploaded' });
+
+    let saved = 0;
+    for (const f of files) {
+      let publicId = '';
+      if (f.filename) publicId = f.filename;
+      else if (f.public_id) publicId = f.public_id;
+      else if (f.key) publicId = f.key;
+      else if (f.path && (f.path.startsWith('http') || f.path.includes('cloudinary'))) {
+        const match = f.path.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match && match[1]) publicId = match[1];
+      } else if (f.location) {
+        const match = f.location.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+        if (match && match[1]) publicId = match[1];
+      }
+      publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
+      if (!publicId) continue;
+
+      await db.query('INSERT INTO project_mo_references (project_id, uploaded_by, image_path) VALUES (?,?,?)', [projectId, req.user.id, publicId]);
+      saved++;
+    }
+    if (saved === 0) return res.status(400).json({ message: 'No valid images saved' });
+
+    const [images] = await db.query('SELECT * FROM project_mo_references WHERE project_id=? ORDER BY created_at DESC', [projectId]);
+    res.json({ message: `${saved} images uploaded`, images: images.map(img => ({ ...img, image_url: toHttpsImageUrl(img.image_path) })) });
+  } catch(err) {
+    console.error('MO Reference upload error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.get('/projects/:id/mo-references', auth, async (req, res) => {
+  const db = await getPool();
+  const projectId = req.params.id;
+  try {
+    const [images] = await db.query('SELECT * FROM project_mo_references WHERE project_id=? ORDER BY created_at DESC', [projectId]);
+    res.json(images.map(img => ({ ...img, image_url: toHttpsImageUrl(img.image_path) })));
+  } catch(err) {
+    console.error('MO Reference fetch error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.get('/reports/mo-references', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [rows] = await db.query(`
+      SELECT p.id AS project_id, p.project_id AS proj_code, p.name AS project_name,
+        COUNT(mr.id) AS image_count,
+        MAX(mr.created_at) AS latest_image_created_at,
+        MAX(mr.image_path) AS latest_image_path
+      FROM projects p
+      LEFT JOIN project_mo_references mr ON mr.project_id=p.id
+      GROUP BY p.id
+      ORDER BY image_count DESC, p.created_at DESC
+      LIMIT 500`
+    );
+    const result = rows.map(r => ({
+      ...r,
+      latest_image_url: r.latest_image_path ? toHttpsImageUrl(r.latest_image_path) : null
+    }));
+    res.json(result);
+  } catch(err) {
+    console.error('MO references report error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.delete('/projects/:id', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   try {

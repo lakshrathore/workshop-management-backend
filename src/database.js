@@ -358,6 +358,17 @@ async function initializeDatabase() {
     FOREIGN KEY (uploaded_by) REFERENCES users(id)
   )`);
 
+  // Admin MO Reference images for projects
+  await db.query(`CREATE TABLE IF NOT EXISTS project_mo_references (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    project_id INT NOT NULL,
+    uploaded_by INT NOT NULL,
+    image_path VARCHAR(500) NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
+  )`);
+
   // Push Subscriptions table
   await db.query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
     id INT AUTO_INCREMENT PRIMARY KEY,
