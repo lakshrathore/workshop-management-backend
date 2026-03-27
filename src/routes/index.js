@@ -441,10 +441,17 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
   const db = await getPool();
   const projectId = parseInt(req.params.id, 10);
   try {
-    console.log(`📤 MO Reference upload: project ${projectId}, files: ${req.files?.length || 0}`);
+    console.log(`📤 MO Reference upload: project ${projectId}`);
+    console.log(`   req.files exists: ${!!req.files}, count: ${req.files?.length || 0}`);
+    console.log(`   req.body keys: ${Object.keys(req.body).join(', ')}`);
 
     if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ message: 'No files uploaded' });
+      console.warn(`⚠️ No files in request. This usually means multer didn't parse multipart correctly.`);
+      console.warn(`   Middleware: moReferenceUpload.array('images', 10)`);
+      return res.status(400).json({ 
+        message: 'No files uploaded. Check file selection and multipart encoding.',
+        debug: { filesReceived: req.files?.length || 0 }
+      });
     }
 
     const [[project]] = await db.query('SELECT id FROM projects WHERE id=?', [projectId]);
@@ -472,6 +479,7 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
 
         if (!publicId) {
           console.warn(`⚠️ Skipping file - no public_id found. File object keys:`, Object.keys(f));
+          console.warn(`   Available:`, { filename: f.filename, public_id: f.public_id, key: f.key, location: f.location });
           continue;
         }
 
@@ -500,7 +508,7 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
     }
 
     if (saved === 0) {
-      return res.status(400).json({ message: 'No files were successfully uploaded' });
+      return res.status(400).json({ message: 'No files were successfully uploaded. Check Cloudinary credentials and file formats.' });
     }
 
     const [images] = await db.query(
