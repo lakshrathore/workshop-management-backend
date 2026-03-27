@@ -322,10 +322,23 @@ async function initializeDatabase() {
     }
   }
 
-  // Safely add columns that might be missing in existing installations
-  const safeAlter = async (sql) => { try { await db.query(sql); } catch(e) { /* column exists */ } };
+  // Safely execute ALTER TABLE statement without crashing startup
+  const safeAlter = async (sql) => { try { await db.query(sql); } catch(e) { /* table/column might already exist or unsupported syntax */ } };
+
+  // Ensure column exists in older MySQL / MariaDB versions that might not support ADD COLUMN IF NOT EXISTS
+  const ensureColumn = async (table, column, definition) => {
+    const [rows] = await db.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+      [table, column]
+    );
+
+    if (!rows || rows.length === 0) {
+      await db.query(`ALTER TABLE \`${table}\` ADD COLUMN ${definition}`);
+    }
+  };
+
   await safeAlter('ALTER TABLE daily_progress MODIFY COLUMN department_id INT NULL');
-    await safeAlter("ALTER TABLE projects MODIFY COLUMN status ENUM('active','completed','on_hold','cancelled','deleted') DEFAULT 'active'");
+  await safeAlter("ALTER TABLE projects MODIFY COLUMN status ENUM('active','completed','on_hold','cancelled','deleted') DEFAULT 'active'");
   await safeAlter('ALTER TABLE task_assignments ADD COLUMN stage_order INT DEFAULT 0');
   await safeAlter("ALTER TABLE task_assignments MODIFY COLUMN status ENUM('pending','in_progress','completed','on_hold','waiting') DEFAULT 'pending'");
   await safeAlter('ALTER TABLE project_items ADD COLUMN proto_code VARCHAR(100)');
@@ -372,6 +385,10 @@ async function initializeDatabase() {
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
   )`);
+  
+  // Ensure resource_type column exists (for existing tables that might not have it)
+  await safeAlter('ALTER TABLE project_mo_references ADD COLUMN IF NOT EXISTS resource_type ENUM(\'image\',\'raw\') DEFAULT \'image\'');
+  await ensureColumn('project_mo_references', 'resource_type', "resource_type ENUM('image','raw') DEFAULT 'image'");
   await safeAlter('ALTER TABLE project_mo_references MODIFY COLUMN resource_type ENUM(\'image\',\'raw\') DEFAULT \'image\'');
 
   // Push Subscriptions table

@@ -533,10 +533,24 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
 
         console.log(`   INSERT: publicId='${publicId}', resourceType='${resourceType}', file='${f.originalname}'`);
 
-        await db.query(
-          'INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)',
-          [projectId, req.user.id, publicId, resourceType]
-        );
+        try {
+          // Try with resource_type (new schema)
+          await db.query(
+            'INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)',
+            [projectId, req.user.id, publicId, resourceType]
+          );
+        } catch (dbErr) {
+          // If resource_type column doesn't exist yet, insert without it (fallback for old schema)
+          if (dbErr.message.includes('Unknown column') && dbErr.message.includes('resource_type')) {
+            console.warn(`⚠️ Falling back: resource_type column missing, inserting without it`);
+            await db.query(
+              'INSERT INTO project_mo_references (project_id, uploaded_by, image_path) VALUES (?,?,?)',
+              [projectId, req.user.id, publicId]
+            );
+          } else {
+            throw dbErr; // Re-throw if it's a different error
+          }
+        }
 
         console.log(`   ✅ SAVED to DB`);
         saved++;
@@ -567,7 +581,7 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
       error_count: errors.length,
       images: images.map(img => ({
         ...img,
-        image_url: toHttpsImageUrl(img.image_path, img.resource_type),
+        image_url: toHttpsImageUrl(img.image_path, img.resource_type || 'image'),
       })),
     });
   } catch(err) {
@@ -584,8 +598,8 @@ router.get('/projects/:id/mo-references', auth, async (req, res) => {
     const [images] = await db.query('SELECT * FROM project_mo_references WHERE project_id=? ORDER BY created_at DESC', [projectId]);
     res.json(images.map(img => ({
       ...img,
-      image_url: toHttpsImageUrl(img.image_path, img.resource_type),
-      download_url: toHttpsImageUrl(img.image_path, img.resource_type),
+      image_url: toHttpsImageUrl(img.image_path, img.resource_type || 'image'),
+      download_url: toHttpsImageUrl(img.image_path, img.resource_type || 'image'),
     })));
 
   } catch(err) {
