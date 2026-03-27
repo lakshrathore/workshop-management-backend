@@ -425,7 +425,7 @@ router.put('/projects/:id', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   const { name, client_name, client_phone, description, status, priority, order_date, deadline, total_amount, notes } = req.body;
   await db.query('UPDATE projects SET name=?,client_name=?,client_phone=?,description=?,status=?,priority=?,order_date=?,deadline=?,total_amount=?,notes=? WHERE id=?',
-    [name, client_name, client_phone, description, status, priority, order_date, deadline, total_amount, notes, req.params.id]);
+    [name, client_name, client_phone, description, status, priority, order_date || null, deadline || null, total_amount, notes, req.params.id]);
   res.json({ message: 'Updated' });
 });
 
