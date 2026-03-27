@@ -546,6 +546,32 @@ router.get('/projects/:id/mo-references', auth, async (req, res) => {
   }
 });
 
+router.delete('/projects/:projectId/mo-references/:fileId', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  const { projectId, fileId } = req.params;
+  try {
+    const [file] = await db.query('SELECT * FROM project_mo_references WHERE id=? AND project_id=?', [fileId, projectId]);
+    if (!file.length) return res.status(404).json({ message: 'File not found' });
+
+    // Delete from Cloudinary
+    if (file[0].image_path) {
+      try {
+        await deleteFile(file[0].image_path);
+        console.log(`🗑️ Deleted from Cloudinary: ${file[0].image_path}`);
+      } catch (e) {
+        console.warn(`⚠️ Cloudinary delete failed: ${e.message}`);
+      }
+    }
+
+    // Delete from database
+    await db.query('DELETE FROM project_mo_references WHERE id=?', [fileId]);
+    res.json({ message: 'File deleted successfully' });
+  } catch(err) {
+    console.error('MO Reference delete error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.get('/reports/mo-references', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   try {
