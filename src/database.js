@@ -367,10 +367,12 @@ async function initializeDatabase() {
     project_id INT NOT NULL,
     uploaded_by INT NULL,
     image_path VARCHAR(500) NOT NULL,
+    resource_type ENUM('image','raw') DEFAULT 'image',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
   )`);
+  await safeAlter('ALTER TABLE project_mo_references MODIFY COLUMN resource_type ENUM(\'image\',\'raw\') DEFAULT \'image\'');
 
   // Push Subscriptions table
   await db.query(`CREATE TABLE IF NOT EXISTS push_subscriptions (

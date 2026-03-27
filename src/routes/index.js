@@ -36,21 +36,29 @@ function adminOnly(req, res, next) {
 const { imgUpload, galleryUpload, moReferenceUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 
 // Helper: always return https Cloudinary URL from any image_path format
-function toHttpsImageUrl(imagePath) {
+function toHttpsImageUrl(imagePath, resourceType = 'image') {
   if (!imagePath) return null;
   const p = String(imagePath).trim();
   if (!p) return null;
+
   // Already https Cloudinary URL
   if (p.startsWith('https://res.cloudinary.com')) return p;
+
   // http Cloudinary URL → force https
   if (p.startsWith('http://res.cloudinary.com')) return p.replace('http://', 'https://');
-  // Any URL with /uploads/ → extract public_id
-  if (p.includes('/uploads/')) {
-    const publicId = p.split('/uploads/').pop();
-    return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload/${publicId}`;
+
+  // Determine resource type for URL building
+  const type = resourceType === 'raw' ? 'raw' : 'image';
+
+  // Any URL with /upload/ → extract public_id
+  if (p.includes('/upload/')) {
+    const publicId = p.split('/upload/').pop();
+    if (!publicId) return null;
+    return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/${type}/upload/${publicId}`;
   }
+
   // Plain public_id (e.g. workshop/task-images/abc123)
-  return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload/${p}`;
+  return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/${type}/upload/${p}`;
 }
 
 // Helper: Send push notification to a user
@@ -452,16 +460,26 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
         const match = f.location.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
         if (match && match[1]) publicId = match[1];
       }
-      publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
-      if (!publicId) continue;
 
-      await db.query('INSERT INTO project_mo_references (project_id, uploaded_by, image_path) VALUES (?,?,?)', [projectId, req.user.id, publicId]);
+      // If we have full URL or path that includes extension, strip config extension when keeping public_id
+      if (!publicId) continue;
+      publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp|pdf)$/i, '');
+
+      const resourceType = f.resource_type || (/(jpg|jpeg|png|gif|webp)$/i.test(f.originalname) ? 'image' : 'raw');
+
+      await db.query('INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)', [projectId, req.user.id, publicId, resourceType]);
       saved++;
     }
     if (saved === 0) return res.status(400).json({ message: 'No valid images saved' });
 
     const [images] = await db.query('SELECT * FROM project_mo_references WHERE project_id=? ORDER BY created_at DESC', [projectId]);
-    res.json({ message: `${saved} images uploaded`, images: images.map(img => ({ ...img, image_url: toHttpsImageUrl(img.image_path) })) });
+    res.json({
+      message: `${saved} files uploaded`,
+      images: images.map(img => ({
+        ...img,
+        image_url: toHttpsImageUrl(img.image_path, img.resource_type),
+      })),
+    });
   } catch(err) {
     console.error('MO Reference upload error:', err.message);
     res.status(500).json({ message: err.message });
@@ -473,7 +491,12 @@ router.get('/projects/:id/mo-references', auth, async (req, res) => {
   const projectId = req.params.id;
   try {
     const [images] = await db.query('SELECT * FROM project_mo_references WHERE project_id=? ORDER BY created_at DESC', [projectId]);
-    res.json(images.map(img => ({ ...img, image_url: toHttpsImageUrl(img.image_path) })));
+    res.json(images.map(img => ({
+      ...img,
+      image_url: toHttpsImageUrl(img.image_path, img.resource_type),
+      download_url: toHttpsImageUrl(img.image_path, img.resource_type),
+    })));
+
   } catch(err) {
     console.error('MO Reference fetch error:', err.message);
     res.status(500).json({ message: err.message });
@@ -484,10 +507,14 @@ router.get('/reports/mo-references', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   try {
     const [rows] = await db.query(`
-      SELECT p.id AS project_id, p.project_id AS proj_code, p.name AS project_name,
+      SELECT
+        p.id AS project_id,
+        p.project_id AS proj_code,
+        p.name AS project_name,
         COUNT(mr.id) AS image_count,
         MAX(mr.created_at) AS latest_image_created_at,
-        MAX(mr.image_path) AS latest_image_path
+        (SELECT mr2.image_path FROM project_mo_references mr2 WHERE mr2.project_id=p.id ORDER BY mr2.created_at DESC LIMIT 1) AS latest_image_path,
+        (SELECT mr2.resource_type FROM project_mo_references mr2 WHERE mr2.project_id=p.id ORDER BY mr2.created_at DESC LIMIT 1) AS latest_resource_type
       FROM projects p
       LEFT JOIN project_mo_references mr ON mr.project_id=p.id
       GROUP BY p.id
@@ -496,7 +523,7 @@ router.get('/reports/mo-references', auth, adminOnly, async (req, res) => {
     );
     const result = rows.map(r => ({
       ...r,
-      latest_image_url: r.latest_image_path ? toHttpsImageUrl(r.latest_image_path) : null
+      latest_image_url: r.latest_image_path ? toHttpsImageUrl(r.latest_image_path, r.latest_resource_type) : null,
     }));
     res.json(result);
   } catch(err) {
