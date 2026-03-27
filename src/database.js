@@ -255,7 +255,7 @@ async function initializeDatabase() {
     id INT AUTO_INCREMENT PRIMARY KEY,
     query_id INT NOT NULL,
     project_id INT NOT NULL,
-    uploaded_by INT NOT NULL,
+    uploaded_by INT NULL,
     image_path VARCHAR(500) NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (query_id) REFERENCES worker_queries(id) ON DELETE CASCADE,
@@ -329,6 +329,9 @@ async function initializeDatabase() {
   await safeAlter('ALTER TABLE task_assignments ADD COLUMN stage_order INT DEFAULT 0');
   await safeAlter("ALTER TABLE task_assignments MODIFY COLUMN status ENUM('pending','in_progress','completed','on_hold','waiting') DEFAULT 'pending'");
   await safeAlter('ALTER TABLE project_items ADD COLUMN proto_code VARCHAR(100)');
+  await safeAlter('ALTER TABLE worker_query_images MODIFY COLUMN uploaded_by INT NULL');
+  await safeAlter('ALTER TABLE project_item_images MODIFY COLUMN uploaded_by INT NULL');
+  await safeAlter('ALTER TABLE project_mo_references MODIFY COLUMN uploaded_by INT NULL');
   await safeAlter('ALTER TABLE project_items ADD COLUMN current_stage_id INT DEFAULT NULL');
   await safeAlter('ALTER TABLE users ADD COLUMN hourly_rate DECIMAL(10,2) DEFAULT 0');
   // Notifications table
@@ -352,7 +355,7 @@ async function initializeDatabase() {
     project_id INT NOT NULL,
     image_path VARCHAR(500) NOT NULL,
     caption VARCHAR(255) DEFAULT '',
-    uploaded_by INT NOT NULL,
+    uploaded_by INT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_item_id) REFERENCES project_items(id) ON DELETE CASCADE,
     FOREIGN KEY (uploaded_by) REFERENCES users(id)
@@ -362,7 +365,7 @@ async function initializeDatabase() {
   await db.query(`CREATE TABLE IF NOT EXISTS project_mo_references (
     id INT AUTO_INCREMENT PRIMARY KEY,
     project_id INT NOT NULL,
-    uploaded_by INT NOT NULL,
+    uploaded_by INT NULL,
     image_path VARCHAR(500) NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
