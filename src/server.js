@@ -88,19 +88,42 @@ app.use('/api', apiRoutes);
 
 // Multer error handling middleware
 app.use((err, req, res, next) => {
+  console.error('🔴 Middleware error caught:', err.message, err.code);
+
+  // Multer file size error
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ message: 'File bahut bada hai! Max size check karo.' });
   }
+
+  // Multer file count error
   if (err.code === 'LIMIT_FILE_COUNT') {
     return res.status(413).json({ message: 'Zyada saare files upload karne ki koshish ki' });
   }
-  if (err.message && err.message.includes('File type')) {
-    return res.status(400).json({ message: 'Yeh file type supported nahi hai' });
+
+  // Multer file type error
+  if (err instanceof multer.MulterError) {
+    console.error('MulterError:', err.code, err.message);
+    return res.status(400).json({ message: `Upload error: ${err.message}` });
   }
+
+  // File type not allowed
+  if (err.message && (err.message.includes('File type') || err.message.includes('only') || err.message.includes('allowed'))) {
+    return res.status(400).json({ message: err.message || 'Yeh file type supported nahi hai' });
+  }
+
+  // Cloudinary errors
   if (err.message && err.message.includes('cloudinary')) {
     console.error('Cloudinary error:', err);
     return res.status(500).json({ message: 'Image service abhi kaam nahi kar raha, baad mein try karo' });
   }
+
+  // Any other error with message
+  if (err.message && req.path.includes('/mo-references')) {
+    console.error('MO Reference route error:', err.message);
+    return res.status(500).json({ message: `Upload error: ${err.message}` });
+  }
+
+  // Pass to next handler if not caught
   next(err);
 });
 

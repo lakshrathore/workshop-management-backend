@@ -59,19 +59,32 @@ const moReferenceUpload = multer({
   storage: new CloudinaryStorage({
     cloudinary,
     params: async (req, file) => {
-      const isImage = /\.(png|jpg|jpeg|gif|webp)$/i.test(file.originalname);
-      return {
-        folder: 'workshop/mo-references',
-        resource_type: isImage ? 'image' : 'raw',
-        allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf'],
-      };
+      try {
+        const isImage = /\.(png|jpg|jpeg|gif|webp)$/i.test(file.originalname);
+        const rt = isImage ? 'image' : 'raw';
+        console.log(`📤 Cloudinary MO upload: ${file.originalname} -> type: ${rt}`);
+        return {
+          folder: 'workshop/mo-references',
+          resource_type: rt,
+          allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf'],
+        };
+      } catch(e) {
+        console.error('Cloudinary params error:', e.message);
+        throw new Error(`Cloudinary config error: ${e.message}`);
+      }
     },
   }),
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = /\.(jpg|jpeg|png|gif|webp|pdf)$/i;
-    if (allowed.test(file.originalname)) cb(null, true);
-    else cb(new Error('Only images and PDFs allowed'), false);
+    if (allowed.test(file.originalname)) {
+      console.log(`✅ File allowed: ${file.originalname}`);
+      cb(null, true);
+    } else {
+      const err = new Error(`Only images and PDFs allowed. Got: ${file.originalname}`);
+      console.warn(`❌ File rejected: ${file.originalname}`);
+      cb(err, false);
+    }
   },
 });
 

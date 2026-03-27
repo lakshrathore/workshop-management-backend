@@ -439,50 +439,85 @@ router.put('/projects/:id', auth, adminOnly, async (req, res) => {
 
 router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.array('images', 10), async (req, res) => {
   const db = await getPool();
-  const projectId = req.params.id;
+  const projectId = parseInt(req.params.id, 10);
   try {
+    console.log(`📤 MO Reference upload: project ${projectId}, files: ${req.files?.length || 0}`);
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ message: 'No files uploaded' });
+    }
+
     const [[project]] = await db.query('SELECT id FROM projects WHERE id=?', [projectId]);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
-    const files = req.files || [];
-    if (!files.length) return res.status(400).json({ message: 'No files uploaded' });
-
+    const files = req.files;
     let saved = 0;
+    const insertedRows = [];
+
     for (const f of files) {
-      let publicId = '';
-      if (f.filename) publicId = f.filename;
-      else if (f.public_id) publicId = f.public_id;
-      else if (f.key) publicId = f.key;
-      else if (f.path && (f.path.startsWith('http') || f.path.includes('cloudinary'))) {
-        const match = f.path.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
-        if (match && match[1]) publicId = match[1];
-      } else if (f.location) {
-        const match = f.location.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
-        if (match && match[1]) publicId = match[1];
+      try {
+        let publicId = '';
+
+        // Try multiple ways to extract public_id from file object
+        if (f.filename) publicId = f.filename;
+        else if (f.public_id) publicId = f.public_id;
+        else if (f.key) publicId = f.key;
+        else if (f.path && (f.path.startsWith('http') || f.path.includes('cloudinary'))) {
+          const match = f.path.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+          if (match && match[1]) publicId = match[1];
+        } else if (f.location) {
+          const match = f.location.match(/\/upload\/(?:v[\d]+\/)?(.+?)(?:\?|$)/);
+          if (match && match[1]) publicId = match[1];
+        }
+
+        if (!publicId) {
+          console.warn(`⚠️ Skipping file - no public_id found. File object keys:`, Object.keys(f));
+          continue;
+        }
+
+        // Strip extension from public_id
+        publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp|pdf)$/i, '');
+
+        if (!publicId) {
+          console.warn(`⚠️ Skipping file - public_id empty after extension strip`);
+          continue;
+        }
+
+        // Determine resource type
+        const resourceType = f.resource_type || (/(jpg|jpeg|png|gif|webp)$/i.test(f.originalname) ? 'image' : 'raw');
+
+        console.log(`✅ Inserting: publicId='${publicId}', resourceType='${resourceType}', originalName='${f.originalname}'`);
+
+        await db.query(
+          'INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)',
+          [projectId, req.user.id, publicId, resourceType]
+        );
+        insertedRows.push({ publicId, resourceType });
+        saved++;
+      } catch (fileErr) {
+        console.error(`❌ Error processing file ${f.originalname}:`, fileErr.message);
       }
-
-      // If we have full URL or path that includes extension, strip config extension when keeping public_id
-      if (!publicId) continue;
-      publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp|pdf)$/i, '');
-
-      const resourceType = f.resource_type || (/(jpg|jpeg|png|gif|webp)$/i.test(f.originalname) ? 'image' : 'raw');
-
-      await db.query('INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)', [projectId, req.user.id, publicId, resourceType]);
-      saved++;
     }
-    if (saved === 0) return res.status(400).json({ message: 'No valid images saved' });
 
-    const [images] = await db.query('SELECT * FROM project_mo_references WHERE project_id=? ORDER BY created_at DESC', [projectId]);
+    if (saved === 0) {
+      return res.status(400).json({ message: 'No files were successfully uploaded' });
+    }
+
+    const [images] = await db.query(
+      'SELECT id, project_id, image_path, resource_type, created_at FROM project_mo_references WHERE project_id=? ORDER BY created_at DESC',
+      [projectId]
+    );
+
     res.json({
-      message: `${saved} files uploaded`,
+      message: `${saved} file(s) uploaded successfully`,
       images: images.map(img => ({
         ...img,
         image_url: toHttpsImageUrl(img.image_path, img.resource_type),
       })),
     });
   } catch(err) {
-    console.error('MO Reference upload error:', err.message);
-    res.status(500).json({ message: err.message });
+    console.error('❌ MO Reference upload error:', err.message, err.stack);
+    res.status(500).json({ message: `Upload failed: ${err.message}` });
   }
 });
 
