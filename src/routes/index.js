@@ -752,36 +752,39 @@ router.get('/projects/:id', auth, async (req, res) => {
 router.get('/projects/:id/images-by-stage', auth, async (req, res) => {
   const db = await getPool();
   try {
+    // Single query — get chains + all images together (no N+1 loop)
     const [chains] = await db.query(`
-      SELECT pc.*, d.name as dept_name, d.color as dept_color
+      SELECT DISTINCT pc.stage_order, pc.department_id, d.name as dept_name, d.color as dept_color
       FROM production_chains pc
       JOIN departments d ON d.id=pc.department_id
       WHERE pc.project_id=? ORDER BY pc.stage_order`, [req.params.id]);
-    
-    const result = [];
-    for (const chain of chains) {
-      // Get all tasks for this stage and their images
-      const [images] = await db.query(`
-        SELECT ti.*, u.name as uploaded_by_name, ta.task_title
-        FROM task_images ti
-        JOIN task_assignments ta ON ta.id=ti.task_id
-        JOIN users u ON u.id=ti.uploaded_by
-        WHERE ta.project_id=? AND ta.department_id=? AND ta.stage_order=?
-        ORDER BY ti.created_at DESC`, [req.params.id, chain.department_id, chain.stage_order]);
-      
-      // Add full Cloudinary URL to each image object
-      const imagesWithUrl = images.map(img => ({
-        ...img,
-        image_url: toHttpsImageUrl(img.image_path)
-      }));
 
-      result.push({
-        stage_order: chain.stage_order,
-        dept_name: chain.dept_name,
-        dept_color: chain.dept_color,
-        images: imagesWithUrl
-      });
-    }
+    if (chains.length === 0) return res.json([]);
+
+    const [allImages] = await db.query(`
+      SELECT ti.*, u.name as uploaded_by_name, ta.task_title,
+             ta.department_id, ta.stage_order
+      FROM task_images ti
+      JOIN task_assignments ta ON ta.id=ti.task_id
+      JOIN users u ON u.id=ti.uploaded_by
+      WHERE ta.project_id=?
+      ORDER BY ta.stage_order, ti.created_at DESC`, [req.params.id]);
+
+    // Group images by stage_order + department_id
+    const imageMap = {};
+    allImages.forEach(img => {
+      const key = img.stage_order + '_' + img.department_id;
+      if (!imageMap[key]) imageMap[key] = [];
+      imageMap[key].push({ ...img, image_url: toHttpsImageUrl(img.image_path) });
+    });
+
+    const result = chains.map(chain => ({
+      stage_order: chain.stage_order,
+      dept_name: chain.dept_name,
+      dept_color: chain.dept_color,
+      images: imageMap[chain.stage_order + '_' + chain.department_id] || []
+    }));
+
     res.json(result);
   } catch(err) {
     res.status(500).json({ message: err.message });
