@@ -44,28 +44,21 @@ function toHttpsImageUrl(imagePath, resourceType = 'image') {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const type = resourceType === 'raw' ? 'raw' : 'image';
 
-  // For images: add f_auto,q_auto transformation so Cloudinary serves correct format
-  const transform = type === 'image' ? 'f_auto,q_auto/' : '';
+  // Already full https Cloudinary URL — return as-is
+  if (p.startsWith('https://res.cloudinary.com')) return p;
 
-  // Already a full https Cloudinary URL — ensure transformation is present for images
-  if (p.startsWith('https://res.cloudinary.com') || p.startsWith('http://res.cloudinary.com')) {
-    const https = p.replace('http://', 'https://');
-    // If already has /upload/ and no transform yet, inject f_auto,q_auto
-    if (type === 'image' && https.includes('/upload/') && !https.includes('/upload/f_auto')) {
-      return https.replace('/upload/', '/upload/f_auto,q_auto/');
-    }
-    return https;
-  }
+  // http → force https
+  if (p.startsWith('http://res.cloudinary.com')) return p.replace('http://', 'https://');
 
   // Any URL with /upload/ → extract public_id
   if (p.includes('/upload/')) {
     const publicId = p.split('/upload/').pop();
     if (!publicId) return null;
-    return `https://res.cloudinary.com/${cloudName}/${type}/upload/${transform}${publicId}`;
+    return `https://res.cloudinary.com/${cloudName}/${type}/upload/${publicId}`;
   }
 
   // Plain public_id (e.g. workshop/mo-references/abc123)
-  return `https://res.cloudinary.com/${cloudName}/${type}/upload/${transform}${p}`;
+  return `https://res.cloudinary.com/${cloudName}/${type}/upload/${p}`;
 }
 
 // Helper: Send push notification to a user
@@ -538,39 +531,32 @@ router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.ar
           continue;
         }
 
-        // Clean up public_id
-        publicId = String(publicId).replace(/\.(jpg|jpeg|png|gif|webp|pdf)$/i, '').trim();
+        // Store full secure URL directly — extension intact, no parsing issues
+        // f.path ya f.location Cloudinary ki full URL hoti hai
+        let storeUrl = '';
+        if (f.path && f.path.startsWith('http')) {
+          storeUrl = f.path.replace('http://', 'https://');
+        } else if (f.location && f.location.startsWith('http')) {
+          storeUrl = f.location.replace('http://', 'https://');
+        } else {
+          // Fallback: plain publicId se URL banao
+          storeUrl = publicId;
+        }
 
-        if (!publicId || publicId.length === 0) {
-          const err = `publicId empty after cleanup`;
-          console.error(`❌ ${err}`);
-          errors.push({ file: f.originalname, error: err });
+        if (!storeUrl) {
+          errors.push({ file: f.originalname, error: 'Could not determine file URL' });
           continue;
         }
 
         // Determine resource type
         const resourceType = f.resource_type || (/(jpg|jpeg|png|gif|webp)$/i.test(f.originalname) ? 'image' : 'raw');
 
-        console.log(`   INSERT: publicId='${publicId}', resourceType='${resourceType}', file='${f.originalname}'`);
+        console.log(`   INSERT: url='${storeUrl}', resourceType='${resourceType}', file='${f.originalname}'`);
 
-        try {
-          // Try with resource_type (new schema)
-          await db.query(
-            'INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)',
-            [projectId, req.user.id, publicId, resourceType]
-          );
-        } catch (dbErr) {
-          // If resource_type column doesn't exist yet, insert without it (fallback for old schema)
-          if (dbErr.message.includes('Unknown column') && dbErr.message.includes('resource_type')) {
-            console.warn(`⚠️ Falling back: resource_type column missing, inserting without it`);
-            await db.query(
-              'INSERT INTO project_mo_references (project_id, uploaded_by, image_path) VALUES (?,?,?)',
-              [projectId, req.user.id, publicId]
-            );
-          } else {
-            throw dbErr; // Re-throw if it's a different error
-          }
-        }
+        await db.query(
+          'INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)',
+          [projectId, req.user.id, storeUrl, resourceType]
+        );
 
         console.log(`   ✅ SAVED to DB`);
         saved++;
@@ -615,13 +601,23 @@ router.get('/projects/:id/mo-references', auth, async (req, res) => {
   const db = await getPool();
   const projectId = req.params.id;
   try {
+    const cloudinary = require('cloudinary').v2;
     const [images] = await db.query('SELECT * FROM project_mo_references WHERE project_id=? ORDER BY created_at DESC', [projectId]);
-    res.json(images.map(img => ({
-      ...img,
-      image_url: toHttpsImageUrl(img.image_path, img.resource_type || 'image'),
-      download_url: toHttpsImageUrl(img.image_path, img.resource_type || 'image'),
-    })));
-
+    res.json(images.map(img => {
+      const resourceType = img.resource_type || 'image';
+      // Use cloudinary.url() — yeh proper URL banata hai version number ke saath
+      // jo bina extension ke bhi kaam karta hai
+      let image_url;
+      try {
+        image_url = cloudinary.url(img.image_path, {
+          secure: true,
+          resource_type: resourceType,
+        });
+      } catch(e) {
+        image_url = toHttpsImageUrl(img.image_path, resourceType);
+      }
+      return { ...img, image_url, download_url: image_url };
+    }));
   } catch(err) {
     console.error('MO Reference fetch error:', err.message);
     res.status(500).json({ message: err.message });
