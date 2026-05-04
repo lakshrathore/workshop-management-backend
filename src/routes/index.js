@@ -41,24 +41,31 @@ function toHttpsImageUrl(imagePath, resourceType = 'image') {
   const p = String(imagePath).trim();
   if (!p) return null;
 
-  // Already https Cloudinary URL
-  if (p.startsWith('https://res.cloudinary.com')) return p;
-
-  // http Cloudinary URL → force https
-  if (p.startsWith('http://res.cloudinary.com')) return p.replace('http://', 'https://');
-
-  // Determine resource type for URL building
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const type = resourceType === 'raw' ? 'raw' : 'image';
+
+  // For images: add f_auto,q_auto transformation so Cloudinary serves correct format
+  const transform = type === 'image' ? 'f_auto,q_auto/' : '';
+
+  // Already a full https Cloudinary URL — ensure transformation is present for images
+  if (p.startsWith('https://res.cloudinary.com') || p.startsWith('http://res.cloudinary.com')) {
+    const https = p.replace('http://', 'https://');
+    // If already has /upload/ and no transform yet, inject f_auto,q_auto
+    if (type === 'image' && https.includes('/upload/') && !https.includes('/upload/f_auto')) {
+      return https.replace('/upload/', '/upload/f_auto,q_auto/');
+    }
+    return https;
+  }
 
   // Any URL with /upload/ → extract public_id
   if (p.includes('/upload/')) {
     const publicId = p.split('/upload/').pop();
     if (!publicId) return null;
-    return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/${type}/upload/${publicId}`;
+    return `https://res.cloudinary.com/${cloudName}/${type}/upload/${transform}${publicId}`;
   }
 
-  // Plain public_id (e.g. workshop/task-images/abc123)
-  return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/${type}/upload/${p}`;
+  // Plain public_id (e.g. workshop/mo-references/abc123)
+  return `https://res.cloudinary.com/${cloudName}/${type}/upload/${transform}${p}`;
 }
 
 // Helper: Send push notification to a user
