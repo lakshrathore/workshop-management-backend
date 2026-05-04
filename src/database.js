@@ -403,6 +403,8 @@ async function initializeDatabase() {
   await safeAlter('ALTER TABLE packing_boxes ADD COLUMN photo_code VARCHAR(100) DEFAULT NULL');
   await safeAlter('ALTER TABLE packing_boxes ADD COLUMN main_item VARCHAR(255) DEFAULT NULL');
   await safeAlter('ALTER TABLE departments ADD COLUMN stage_order INT DEFAULT 999');
+  // is_ready flag — project start hone ke liye ready hai ya nahi
+  await safeAlter('ALTER TABLE projects ADD COLUMN is_ready TINYINT(1) DEFAULT 0');
 
   // Packing Boxes table — manual + auto box management
   await db.query(`CREATE TABLE IF NOT EXISTS packing_boxes (

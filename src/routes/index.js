@@ -338,15 +338,21 @@ router.patch('/workers/:id/rate', auth, adminOnly, async (req, res) => {
 // ── PROJECTS ──────────────────────────────────────────────────────────────────
 router.get('/projects', auth, async (req, res) => {
   const db = await getPool();
-  const { status, search } = req.query;
+  const { status, search, ready } = req.query;
   let where = "WHERE p.status != 'deleted'";
   const params = [];
   if (status && status !== 'all') {
-    where = 'WHERE p.status=?';
+    where = "WHERE p.status=? AND p.status != 'deleted'";
     params.push(status);
   }
+  // is_ready filter: 'yes' = ready only, 'no' = not-ready only
+  if (ready === 'yes') {
+    where += ' AND p.is_ready = 1';
+  } else if (ready === 'no') {
+    where += ' AND (p.is_ready = 0 OR p.is_ready IS NULL)';
+  }
   if (search) {
-    where += (where.includes('WHERE') ? ' AND' : ' WHERE') + ' (p.name LIKE ? OR p.client_name LIKE ? OR p.project_id LIKE ?)';
+    where += ' AND (p.name LIKE ? OR p.client_name LIKE ? OR p.project_id LIKE ?)';
     params.push(`%${search}%`, `%${search}%`, `%${search}%`);
   }
   try {
@@ -421,8 +427,9 @@ router.post('/projects', auth, adminOnly, async (req, res) => {
     }
   }
   try {
-    const [r] = await db.query('INSERT INTO projects (project_id,name,client_name,client_phone,description,priority,order_date,deadline,total_amount,notes,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-      [finalProjectId, name, client_name, client_phone, description, priority || 'medium', order_date || null, deadline || null, total_amount || 0, notes, req.user.id]);
+    const isReady = req.body.is_ready ? 1 : 0;
+    const [r] = await db.query('INSERT INTO projects (project_id,name,client_name,client_phone,description,priority,order_date,deadline,total_amount,notes,created_by,is_ready) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+      [finalProjectId, name, client_name, client_phone, description, priority || 'medium', order_date || null, deadline || null, total_amount || 0, notes, req.user.id, isReady]);
     res.json({ id: r.insertId, project_id: finalProjectId });
   } catch(err) {
     console.error('Create project error:', err.message);
@@ -431,9 +438,15 @@ router.post('/projects', auth, adminOnly, async (req, res) => {
 });
 router.put('/projects/:id', auth, adminOnly, async (req, res) => {
   const db = await getPool();
-  const { name, client_name, client_phone, description, status, priority, order_date, deadline, total_amount, notes } = req.body;
-  await db.query('UPDATE projects SET name=?,client_name=?,client_phone=?,description=?,status=?,priority=?,order_date=?,deadline=?,total_amount=?,notes=? WHERE id=?',
-    [name, client_name, client_phone, description, status, priority, order_date || null, deadline || null, total_amount, notes, req.params.id]);
+  const { name, client_name, client_phone, description, status, priority, order_date, deadline, total_amount, notes, is_ready } = req.body;
+  const isReadyVal = is_ready !== undefined ? (is_ready ? 1 : 0) : undefined;
+  const updateQuery = isReadyVal !== undefined
+    ? 'UPDATE projects SET name=?,client_name=?,client_phone=?,description=?,status=?,priority=?,order_date=?,deadline=?,total_amount=?,notes=?,is_ready=? WHERE id=?'
+    : 'UPDATE projects SET name=?,client_name=?,client_phone=?,description=?,status=?,priority=?,order_date=?,deadline=?,total_amount=?,notes=? WHERE id=?';
+  const updateParams = isReadyVal !== undefined
+    ? [name, client_name, client_phone, description, status, priority, order_date || null, deadline || null, total_amount, notes, isReadyVal, req.params.id]
+    : [name, client_name, client_phone, description, status, priority, order_date || null, deadline || null, total_amount, notes, req.params.id];
+  await db.query(updateQuery, updateParams);
   res.json({ message: 'Updated' });
 });
 

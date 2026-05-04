@@ -262,6 +262,7 @@ router.get('/client/projects', clientAuth, clientOnly, async (req, res) => {
       JOIN projects p ON p.id = cpa.project_id
       WHERE cpa.client_id = ?
         AND p.status != 'deleted'
+        AND p.is_ready = 1
       ORDER BY p.created_at DESC
     `, [req.user.id]);
 
