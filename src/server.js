@@ -101,7 +101,7 @@ app.use((err, req, res, next) => {
 
   // Multer file count error
   if (err.code === 'LIMIT_FILE_COUNT') {
-    return res.status(413).json({ message: 'Jyada saare files upload karne ki koshish ki' });
+    return res.status(413).json({ message: 'Zyada saare files upload karne ki koshish ki' });
   }
 
   // Multer file type error
@@ -140,8 +140,13 @@ app.get('*', (req, res) => {
 
 initializeDatabase().then(async () => {
   // Client portal tables initialize karo
-  const { initClientTables } = require('./routes/clientRoutes');
-  await initClientTables().catch(err => console.error('Client tables init error:', err.message));
+  const clientRoutesModule = require('./routes/clientRoutes');
+  const initFn = clientRoutesModule.initClientTables;
+  if (typeof initFn === 'function') {
+    await initFn().catch(err => console.error('Client tables init error:', err.message));
+  } else {
+    console.warn('⚠️ initClientTables not found — skipping client table init');
+  }
   const os = require('os');
   const interfaces = os.networkInterfaces();
   let localIP = 'localhost';

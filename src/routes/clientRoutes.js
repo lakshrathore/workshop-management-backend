@@ -76,8 +76,8 @@ async function initClientTables() {
   console.log('✅ Client portal tables ready');
 }
 
-// Export for use in server.js
-module.exports.initClientTables = initClientTables;
+
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADMIN ROUTES — Client management (admin ke liye)
@@ -331,5 +331,8 @@ router.get('/client/projects/:id', clientAuth, clientOnly, async (req, res) => {
     res.status(500).json({ message: 'Project detail laane mein error' });
   }
 });
+
+// Attach initClientTables to router so both are accessible from same require()
+router.initClientTables = initClientTables;
 
 module.exports = router;
