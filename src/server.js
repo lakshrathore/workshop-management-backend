@@ -101,7 +101,7 @@ app.use((err, req, res, next) => {
 
   // Multer file count error
   if (err.code === 'LIMIT_FILE_COUNT') {
-    return res.status(413).json({ message: 'Zyada saare files upload karne ki koshish ki' });
+    return res.status(413).json({ message: 'Jyada saare files upload karne ki koshish ki' });
   }
 
   // Multer file type error
