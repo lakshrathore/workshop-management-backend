@@ -84,6 +84,10 @@ app.post('/api/auth/login', async (req, res) => {
 const apiRoutes = require('./routes');
 // const backupRoutes = require('./routes/backupRoutes');  // BACKUP SYSTEM DISABLED
 app.use('/api', apiRoutes);
+
+// ── CLIENT PORTAL ROUTES ──────────────────────────────────────────────────────
+const clientRoutes = require('./routes/clientRoutes');
+app.use('/api', clientRoutes);
 // app.use('/api', backupRoutes);  // BACKUP SYSTEM DISABLED
 
 // Multer error handling middleware
@@ -134,7 +138,10 @@ app.get('*', (req, res) => {
   res.status(404).json({ message: 'API endpoint not found. Frontend is at https://workshop-management-frontend-885d.vercel.app' });
 });
 
-initializeDatabase().then(() => {
+initializeDatabase().then(async () => {
+  // Client portal tables initialize karo
+  const { initClientTables } = require('./routes/clientRoutes');
+  await initClientTables().catch(err => console.error('Client tables init error:', err.message));
   const os = require('os');
   const interfaces = os.networkInterfaces();
   let localIP = 'localhost';
