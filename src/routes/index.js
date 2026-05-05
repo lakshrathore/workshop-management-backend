@@ -370,7 +370,9 @@ router.get('/projects', auth, async (req, res) => {
         (SELECT COUNT(id) FROM task_assignments WHERE project_id=p.id AND stage_order=1) as task_count,
         (SELECT SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) FROM task_assignments WHERE project_id=p.id AND stage_order=1) as completed_tasks,
         (SELECT SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) FROM task_assignments WHERE project_id=p.id AND stage_order=1) as active_tasks,
-        (SELECT COUNT(id) FROM task_assignments WHERE project_id=p.id AND status='delayed') as delayed_tasks
+        (SELECT COUNT(id) FROM task_assignments WHERE project_id=p.id AND status='delayed') as delayed_tasks,
+        (SELECT image_path FROM project_mo_references WHERE project_id=p.id ORDER BY created_at ASC LIMIT 1) as thumbnail_path,
+        (SELECT resource_type FROM project_mo_references WHERE project_id=p.id ORDER BY created_at ASC LIMIT 1) as thumbnail_type
       FROM projects p
       ${where} ORDER BY p.created_at DESC`, params);
     
@@ -738,7 +740,12 @@ router.get('/projects/:id', auth, async (req, res) => {
   const db = await getPool();
   const [[project]] = await db.query('SELECT * FROM projects WHERE id=?', [req.params.id]);
   if (!project) return res.status(404).json({ message: 'Not found' });
-  const [items] = await db.query('SELECT * FROM project_items WHERE project_id=? ORDER BY id', [req.params.id]);
+  const [items] = await db.query(`
+    SELECT pi.*,
+      (SELECT pii.image_path FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_path,
+      (SELECT pii.resource_type FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_type
+    FROM project_items pi WHERE pi.project_id=? ORDER BY pi.id
+  `, [req.params.id]);
   const [tasks] = await db.query(`
     SELECT ta.*, 
       COALESCE(u.name, dept_workers.worker_names) as worker_name,
@@ -2685,7 +2692,7 @@ router.get('/packing/boxes', auth, async (req, res) => {
     const where = project_id ? 'WHERE pb.project_id=?' : 'WHERE 1=1';
     const params = project_id ? [project_id] : [];
     const [boxes] = await db.query(`
-      SELECT pb.*, u.name as created_by_name,
+      SELECT pb.*, pb.sub_label, u.name as created_by_name,
         p.name as project_name, p.project_id as proj_code, p.client_name,
         pi.item_name,
         (SELECT COUNT(*) FROM packing_box_photos pbp WHERE pbp.box_id = pb.id) as photo_count
@@ -2711,12 +2718,13 @@ router.get('/packing/boxes', auth, async (req, res) => {
 router.post('/packing/boxes', auth, async (req, res) => {
   const db = await getPool();
   try {
-    const { project_id, project_item_id, mode, items, notes, box_number, photo_code, main_item } = req.body;
+    const { project_id, project_item_id, mode, items, notes, box_number, photo_code, main_item, sub_label } = req.body;
     const finalBoxNum = box_number || await generateBoxNumber(db);
+    const finalSubLabel = sub_label ? sub_label.trim().toUpperCase() : null;
 
     const [r] = await db.query(
-      'INSERT INTO packing_boxes (box_number, project_id, project_item_id, photo_code, main_item, mode, created_by, notes) VALUES (?,?,?,?,?,?,?,?)',
-      [finalBoxNum, project_id || null, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '']
+      'INSERT INTO packing_boxes (box_number, sub_label, project_id, project_item_id, photo_code, main_item, mode, created_by, notes) VALUES (?,?,?,?,?,?,?,?,?)',
+      [finalBoxNum, finalSubLabel, project_id || null, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '']
     );
     const boxId = r.insertId;
 

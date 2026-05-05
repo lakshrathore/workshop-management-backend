@@ -405,6 +405,9 @@ async function initializeDatabase() {
   await safeAlter('ALTER TABLE departments ADD COLUMN stage_order INT DEFAULT 999');
   // is_ready flag — project start hone ke liye ready hai ya nahi
   await safeAlter('ALTER TABLE projects ADD COLUMN is_ready TINYINT(1) DEFAULT 0');
+  // Sub-box label support: BOX-01 (A), BOX-01 (B) etc.
+  await safeAlter("ALTER TABLE packing_boxes ADD COLUMN sub_label VARCHAR(10) DEFAULT NULL COMMENT 'A, B, C etc for sub-boxes'");
+  await safeAlter("ALTER TABLE project_item_images ADD COLUMN resource_type VARCHAR(20) DEFAULT 'image'");
 
   // Packing Boxes table — manual + auto box management
   await db.query(`CREATE TABLE IF NOT EXISTS packing_boxes (
