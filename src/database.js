@@ -56,7 +56,7 @@ async function initializeDatabase() {
   await db.query(`CREATE TABLE IF NOT EXISTS projects (
     id INT AUTO_INCREMENT PRIMARY KEY, project_id VARCHAR(50) UNIQUE NOT NULL,
     name VARCHAR(255) NOT NULL, client_name VARCHAR(255), client_phone VARCHAR(50),
-    description TEXT, status ENUM('active','completed','on_hold','cancelled','deleted') DEFAULT 'active',
+    description TEXT, status ENUM('active','inactive','completed','on_hold','cancelled','deleted') DEFAULT 'active',
     priority ENUM('low','medium','high','urgent') DEFAULT 'medium',
     order_date DATE, deadline DATE, total_amount DECIMAL(12,2) DEFAULT 0,
     notes TEXT, created_by INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -338,7 +338,7 @@ async function initializeDatabase() {
   };
 
   await safeAlter('ALTER TABLE daily_progress MODIFY COLUMN department_id INT NULL');
-  await safeAlter("ALTER TABLE projects MODIFY COLUMN status ENUM('active','completed','on_hold','cancelled','deleted') DEFAULT 'active'");
+  await safeAlter("ALTER TABLE projects MODIFY COLUMN status ENUM('active','inactive','completed','on_hold','cancelled','deleted') DEFAULT 'active'");
   await safeAlter('ALTER TABLE task_assignments ADD COLUMN stage_order INT DEFAULT 0');
   await safeAlter("ALTER TABLE task_assignments MODIFY COLUMN status ENUM('pending','in_progress','completed','on_hold','waiting') DEFAULT 'pending'");
   await safeAlter('ALTER TABLE project_items ADD COLUMN proto_code VARCHAR(100)');
