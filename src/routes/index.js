@@ -394,7 +394,12 @@ router.get('/projects', auth, async (req, res) => {
       project.workers = workers;
     }
     
-    res.json(rows);
+    // Apply toHttpsImageUrl on thumbnail_path for projects list
+    const projects = rows.map(p => ({
+      ...p,
+      thumbnail_path: p.thumbnail_path ? toHttpsImageUrl(p.thumbnail_path, p.thumbnail_type || 'image') : null
+    }));
+    res.json(projects);
   } catch(err) {
     res.status(500).json({ message: err.message });
   }
@@ -740,12 +745,17 @@ router.get('/projects/:id', auth, async (req, res) => {
   const db = await getPool();
   const [[project]] = await db.query('SELECT * FROM projects WHERE id=?', [req.params.id]);
   if (!project) return res.status(404).json({ message: 'Not found' });
-  const [items] = await db.query(`
+  const [itemsRaw] = await db.query(`
     SELECT pi.*,
       (SELECT pii.image_path FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_path,
       (SELECT pii.resource_type FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_type
     FROM project_items pi WHERE pi.project_id=? ORDER BY pi.id
   `, [req.params.id]);
+  // Apply toHttpsImageUrl on thumbnail_path so full URLs pass through correctly
+  const items = itemsRaw.map(item => ({
+    ...item,
+    thumbnail_path: item.thumbnail_path ? toHttpsImageUrl(item.thumbnail_path, item.thumbnail_type || 'image') : null
+  }));
   const [tasks] = await db.query(`
     SELECT ta.*, 
       COALESCE(u.name, dept_workers.worker_names) as worker_name,
@@ -904,13 +914,21 @@ router.post('/projects/:projectId/items/:itemId/images', auth, adminOnly, imgUpl
         if (match && match[1]) publicId = match[1];
       }
 
-      // Remove extension
-      publicId = publicId.replace(/\.(jpg|jpeg|png|gif|webp)$/i, '');
+      // Store full URL — extension intact, resource_type saved
+      let storeUrl = '';
+      if (f.path && f.path.startsWith('http')) {
+        storeUrl = f.path.replace('http://', 'https://');
+      } else if (f.location && f.location.startsWith('http')) {
+        storeUrl = f.location.replace('http://', 'https://');
+      } else if (publicId) {
+        storeUrl = publicId;
+      }
+      const itemResourceType = f.resource_type || 'image';
 
-      if (publicId) {
+      if (storeUrl) {
         await db.query(
-          'INSERT INTO project_item_images (project_item_id, project_id, image_path, uploaded_by) VALUES (?,?,?,?)',
-          [req.params.itemId, req.params.projectId, publicId, req.user.id]
+          'INSERT INTO project_item_images (project_item_id, project_id, image_path, resource_type, uploaded_by) VALUES (?,?,?,?,?)',
+          [req.params.itemId, req.params.projectId, storeUrl, itemResourceType, req.user.id]
         );
         savedCount++;
       }
