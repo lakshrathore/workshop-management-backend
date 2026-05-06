@@ -3018,4 +3018,31 @@ router.post('/admin/delete-all-data', auth, adminOnly, async (req, res) => {
   }
 });
 
+
+// ── Barcode Generator API ─────────────────────────────────────────────────────
+// GET /api/barcodes/items — all project items that have proto_code set
+router.get('/barcodes/items', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { project_id } = req.query;
+    let query = `
+      SELECT 
+        pi.id, pi.item_name, pi.proto_code, pi.quantity, pi.unit,
+        p.id as project_id, p.name as project_name, p.project_id as proj_code, p.client_name
+      FROM project_items pi
+      JOIN projects p ON p.id = pi.project_id
+      WHERE pi.proto_code IS NOT NULL AND pi.proto_code != ''
+        AND p.status != 'deleted'
+    `;
+    const params = [];
+    if (project_id) { query += ' AND p.id = ?'; params.push(project_id); }
+    query += ' ORDER BY p.name, pi.item_name';
+    const [items] = await db.query(query, params);
+    res.json(items);
+  } catch (err) {
+    console.error('Barcode items error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 module.exports = router;
