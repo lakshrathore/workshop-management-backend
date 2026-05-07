@@ -3063,6 +3063,30 @@ router.get('/barcodes/items', auth, async (req, res) => {
   }
 });
 
+
+// GET /api/barcodes/lookup?code=XYZ — scan se item dhundo
+router.get('/barcodes/lookup', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { code } = req.query;
+    if (!code?.trim()) return res.status(400).json({ message: 'Barcode code required' });
+    const [items] = await db.query(`
+      SELECT
+        pi.id, pi.item_name, pi.proto_code, pi.quantity, pi.unit,
+        pi.unit_price, pi.description, pi.dimensions,
+        p.id as project_id, p.name as project_name, p.project_id as proj_code, p.client_name
+      FROM project_items pi
+      JOIN projects p ON p.id = pi.project_id
+      WHERE pi.proto_code = ? AND p.status != 'deleted'
+      LIMIT 5
+    `, [code.trim()]);
+    if (!items.length) return res.status(404).json({ message: `No item found for barcode: ${code}` });
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ── PURCHASE ORDERS ──────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
