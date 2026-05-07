@@ -3063,4 +3063,316 @@ router.get('/barcodes/items', auth, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ── PURCHASE ORDERS ──────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helper: generate next PO number
+async function getNextPONumber(db) {
+  const [[prefixRow]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='po_prefix'");
+  const [[startRow]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='po_start_number'");
+  const prefix = prefixRow?.setting_value || 'PO';
+  const startNum = parseInt(startRow?.setting_value || '1001');
+  const [[maxRow]] = await db.query("SELECT MAX(CAST(SUBSTRING(po_number, ?) AS UNSIGNED)) as maxn FROM purchase_orders WHERE po_number LIKE ?", [prefix.length + 2, prefix + '-%']);
+  const maxn = maxRow?.maxn || (startNum - 1);
+  const next = Math.max(maxn + 1, startNum);
+  return `${prefix}-${String(next).padStart(4, '0')}`;
+}
+
+// GET all purchase orders
+router.get('/purchase-orders', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { project_id, status, search } = req.query;
+    let sql = `
+      SELECT po.*, p.name as project_name, p.project_id as proj_code,
+        u.name as created_by_name,
+        (SELECT COUNT(*) FROM purchase_order_items WHERE po_id=po.id) as item_count
+      FROM purchase_orders po
+      LEFT JOIN projects p ON p.id = po.project_id
+      JOIN users u ON u.id = po.created_by
+      WHERE 1=1`;
+    const params = [];
+    if (project_id) { sql += ' AND po.project_id=?'; params.push(project_id); }
+    if (status) { sql += ' AND po.status=?'; params.push(status); }
+    if (search) { sql += ' AND (po.po_number LIKE ? OR po.supplier_name LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
+    sql += ' ORDER BY po.created_at DESC';
+    const [rows] = await db.query(sql, params);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET single PO with items
+router.get('/purchase-orders/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[po]] = await db.query(`
+      SELECT po.*, p.name as project_name, p.project_id as proj_code,
+        u.name as created_by_name
+      FROM purchase_orders po
+      LEFT JOIN projects p ON p.id = po.project_id
+      JOIN users u ON u.id = po.created_by
+      WHERE po.id=?`, [req.params.id]);
+    if (!po) return res.status(404).json({ message: 'Purchase Order nahi mila' });
+    const [items] = await db.query('SELECT * FROM purchase_order_items WHERE po_id=? ORDER BY sort_order, id', [req.params.id]);
+    res.json({ ...po, items });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// POST create PO
+router.post('/purchase-orders', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { supplier_name, supplier_phone, supplier_address, supplier_gstin,
+      project_id, order_date, expected_delivery, status, notes,
+      tax_percent, discount_amount, items } = req.body;
+    if (!supplier_name?.trim()) return res.status(400).json({ message: 'Supplier name required' });
+    if (!items?.length) return res.status(400).json({ message: 'Kam se kam ek item add karo' });
+
+    const po_number = await getNextPONumber(db);
+    let subtotal = 0;
+    for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
+    const taxPct = parseFloat(tax_percent) || 0;
+    const disc = parseFloat(discount_amount) || 0;
+    const tax_amount = parseFloat(((subtotal - disc) * taxPct / 100).toFixed(2));
+    const total_amount = parseFloat((subtotal - disc + tax_amount).toFixed(2));
+
+    const [r] = await db.query(
+      `INSERT INTO purchase_orders (po_number,supplier_name,supplier_phone,supplier_address,supplier_gstin,
+        project_id,order_date,expected_delivery,status,subtotal,tax_percent,tax_amount,discount_amount,total_amount,notes,created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [po_number, supplier_name.trim(), supplier_phone||'', supplier_address||'', supplier_gstin||'',
+        project_id||null, order_date, expected_delivery||null, status||'draft',
+        subtotal, taxPct, tax_amount, disc, total_amount, notes||'', req.user.id]
+    );
+    const poId = r.insertId;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const qty = parseFloat(it.quantity) || 0;
+      const rate = parseFloat(it.rate) || 0;
+      await db.query(
+        'INSERT INTO purchase_order_items (po_id,item_name,description,quantity,unit,rate,total,sort_order) VALUES (?,?,?,?,?,?,?,?)',
+        [poId, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
+      );
+    }
+    res.json({ id: poId, po_number, message: 'Purchase Order bana diya ✅' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// PUT update PO
+router.put('/purchase-orders/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { supplier_name, supplier_phone, supplier_address, supplier_gstin,
+      project_id, order_date, expected_delivery, status, notes,
+      tax_percent, discount_amount, items } = req.body;
+    if (!supplier_name?.trim()) return res.status(400).json({ message: 'Supplier name required' });
+    if (!items?.length) return res.status(400).json({ message: 'Kam se kam ek item add karo' });
+
+    let subtotal = 0;
+    for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
+    const taxPct = parseFloat(tax_percent) || 0;
+    const disc = parseFloat(discount_amount) || 0;
+    const tax_amount = parseFloat(((subtotal - disc) * taxPct / 100).toFixed(2));
+    const total_amount = parseFloat((subtotal - disc + tax_amount).toFixed(2));
+
+    await db.query(
+      `UPDATE purchase_orders SET supplier_name=?,supplier_phone=?,supplier_address=?,supplier_gstin=?,
+        project_id=?,order_date=?,expected_delivery=?,status=?,subtotal=?,tax_percent=?,
+        tax_amount=?,discount_amount=?,total_amount=?,notes=? WHERE id=?`,
+      [supplier_name.trim(), supplier_phone||'', supplier_address||'', supplier_gstin||'',
+        project_id||null, order_date, expected_delivery||null, status||'draft',
+        subtotal, taxPct, tax_amount, disc, total_amount, notes||'', req.params.id]
+    );
+    await db.query('DELETE FROM purchase_order_items WHERE po_id=?', [req.params.id]);
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const qty = parseFloat(it.quantity) || 0;
+      const rate = parseFloat(it.rate) || 0;
+      await db.query(
+        'INSERT INTO purchase_order_items (po_id,item_name,description,quantity,unit,rate,total,sort_order) VALUES (?,?,?,?,?,?,?,?)',
+        [req.params.id, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
+      );
+    }
+    res.json({ message: 'Purchase Order update ho gaya ✅' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// PATCH status only
+router.patch('/purchase-orders/:id/status', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { status } = req.body;
+    await db.query('UPDATE purchase_orders SET status=? WHERE id=?', [status, req.params.id]);
+    res.json({ message: 'Status update ho gaya' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// DELETE PO
+router.delete('/purchase-orders/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    await db.query('DELETE FROM purchase_orders WHERE id=?', [req.params.id]);
+    res.json({ message: 'Purchase Order delete ho gaya' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── SALE CHALLANS ─────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helper: generate next Challan number
+async function getNextChallanNumber(db) {
+  const [[prefixRow]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='challan_prefix'");
+  const [[startRow]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='challan_start_number'");
+  const prefix = prefixRow?.setting_value || 'DC';
+  const startNum = parseInt(startRow?.setting_value || '1001');
+  const [[maxRow]] = await db.query("SELECT MAX(CAST(SUBSTRING(challan_number, ?) AS UNSIGNED)) as maxn FROM sale_challans WHERE challan_number LIKE ?", [prefix.length + 2, prefix + '-%']);
+  const maxn = maxRow?.maxn || (startNum - 1);
+  const next = Math.max(maxn + 1, startNum);
+  return `${prefix}-${String(next).padStart(4, '0')}`;
+}
+
+// GET all challans
+router.get('/sale-challans', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { project_id, status, search } = req.query;
+    let sql = `
+      SELECT sc.*, p.name as project_name, p.project_id as proj_code,
+        u.name as created_by_name,
+        (SELECT COUNT(*) FROM sale_challan_items WHERE challan_id=sc.id) as item_count
+      FROM sale_challans sc
+      LEFT JOIN projects p ON p.id = sc.project_id
+      JOIN users u ON u.id = sc.created_by
+      WHERE 1=1`;
+    const params = [];
+    if (project_id) { sql += ' AND sc.project_id=?'; params.push(project_id); }
+    if (status) { sql += ' AND sc.status=?'; params.push(status); }
+    if (search) { sql += ' AND (sc.challan_number LIKE ? OR sc.client_name LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
+    sql += ' ORDER BY sc.created_at DESC';
+    const [rows] = await db.query(sql, params);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET single challan with items
+router.get('/sale-challans/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[challan]] = await db.query(`
+      SELECT sc.*, p.name as project_name, p.project_id as proj_code,
+        u.name as created_by_name
+      FROM sale_challans sc
+      LEFT JOIN projects p ON p.id = sc.project_id
+      JOIN users u ON u.id = sc.created_by
+      WHERE sc.id=?`, [req.params.id]);
+    if (!challan) return res.status(404).json({ message: 'Challan nahi mila' });
+    const [items] = await db.query('SELECT * FROM sale_challan_items WHERE challan_id=? ORDER BY sort_order, id', [req.params.id]);
+    res.json({ ...challan, items });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// POST create challan
+router.post('/sale-challans', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { client_name, client_phone, client_address, client_gstin, challan_type,
+      project_id, challan_date, delivery_date, status, notes,
+      tax_percent, discount_amount, transport_name, vehicle_number, items } = req.body;
+    if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
+    if (!items?.length) return res.status(400).json({ message: 'Kam se kam ek item add karo' });
+
+    const challan_number = await getNextChallanNumber(db);
+    let subtotal = 0;
+    for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
+    const taxPct = parseFloat(tax_percent) || 0;
+    const disc = parseFloat(discount_amount) || 0;
+    const tax_amount = parseFloat(((subtotal - disc) * taxPct / 100).toFixed(2));
+    const total_amount = parseFloat((subtotal - disc + tax_amount).toFixed(2));
+
+    const [r] = await db.query(
+      `INSERT INTO sale_challans (challan_number,client_name,client_phone,client_address,client_gstin,challan_type,
+        project_id,challan_date,delivery_date,status,subtotal,tax_percent,tax_amount,discount_amount,
+        total_amount,transport_name,vehicle_number,notes,created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [challan_number, client_name.trim(), client_phone||'', client_address||'', client_gstin||'',
+        challan_type||'delivery', project_id||null, challan_date, delivery_date||null, status||'draft',
+        subtotal, taxPct, tax_amount, disc, total_amount,
+        transport_name||'', vehicle_number||'', notes||'', req.user.id]
+    );
+    const challanId = r.insertId;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const qty = parseFloat(it.quantity) || 0;
+      const rate = parseFloat(it.rate) || 0;
+      await db.query(
+        'INSERT INTO sale_challan_items (challan_id,item_name,description,quantity,unit,rate,total,sort_order) VALUES (?,?,?,?,?,?,?,?)',
+        [challanId, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
+      );
+    }
+    res.json({ id: challanId, challan_number, message: 'Sale Challan bana diya ✅' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// PUT update challan
+router.put('/sale-challans/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { client_name, client_phone, client_address, client_gstin, challan_type,
+      project_id, challan_date, delivery_date, status, notes,
+      tax_percent, discount_amount, transport_name, vehicle_number, items } = req.body;
+    if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
+    if (!items?.length) return res.status(400).json({ message: 'Kam se kam ek item add karo' });
+
+    let subtotal = 0;
+    for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
+    const taxPct = parseFloat(tax_percent) || 0;
+    const disc = parseFloat(discount_amount) || 0;
+    const tax_amount = parseFloat(((subtotal - disc) * taxPct / 100).toFixed(2));
+    const total_amount = parseFloat((subtotal - disc + tax_amount).toFixed(2));
+
+    await db.query(
+      `UPDATE sale_challans SET client_name=?,client_phone=?,client_address=?,client_gstin=?,challan_type=?,
+        project_id=?,challan_date=?,delivery_date=?,status=?,subtotal=?,tax_percent=?,
+        tax_amount=?,discount_amount=?,total_amount=?,transport_name=?,vehicle_number=?,notes=? WHERE id=?`,
+      [client_name.trim(), client_phone||'', client_address||'', client_gstin||'', challan_type||'delivery',
+        project_id||null, challan_date, delivery_date||null, status||'draft',
+        subtotal, taxPct, tax_amount, disc, total_amount,
+        transport_name||'', vehicle_number||'', notes||'', req.params.id]
+    );
+    await db.query('DELETE FROM sale_challan_items WHERE challan_id=?', [req.params.id]);
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const qty = parseFloat(it.quantity) || 0;
+      const rate = parseFloat(it.rate) || 0;
+      await db.query(
+        'INSERT INTO sale_challan_items (challan_id,item_name,description,quantity,unit,rate,total,sort_order) VALUES (?,?,?,?,?,?,?,?)',
+        [req.params.id, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
+      );
+    }
+    res.json({ message: 'Sale Challan update ho gaya ✅' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// PATCH status only
+router.patch('/sale-challans/:id/status', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { status } = req.body;
+    await db.query('UPDATE sale_challans SET status=? WHERE id=?', [status, req.params.id]);
+    res.json({ message: 'Status update ho gaya' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// DELETE challan
+router.delete('/sale-challans/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    await db.query('DELETE FROM sale_challans WHERE id=?', [req.params.id]);
+    res.json({ message: 'Challan delete ho gaya' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 module.exports = router;

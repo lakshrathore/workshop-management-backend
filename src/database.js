@@ -470,6 +470,96 @@ async function initializeDatabase() {
     FOREIGN KEY (packed_by) REFERENCES users(id)
   )`);
 
+  // ── PURCHASE ORDERS ────────────────────────────────────────────────────────
+  await db.query(`CREATE TABLE IF NOT EXISTS purchase_orders (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    po_number VARCHAR(50) UNIQUE NOT NULL,
+    supplier_name VARCHAR(255) NOT NULL,
+    supplier_phone VARCHAR(50),
+    supplier_address TEXT,
+    supplier_gstin VARCHAR(20),
+    project_id INT,
+    order_date DATE NOT NULL,
+    expected_delivery DATE,
+    status ENUM('draft','ordered','partial','received','cancelled') DEFAULT 'draft',
+    subtotal DECIMAL(12,2) DEFAULT 0,
+    tax_percent DECIMAL(5,2) DEFAULT 0,
+    tax_amount DECIMAL(12,2) DEFAULT 0,
+    discount_amount DECIMAL(12,2) DEFAULT 0,
+    total_amount DECIMAL(12,2) DEFAULT 0,
+    notes TEXT,
+    created_by INT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
+    FOREIGN KEY (created_by) REFERENCES users(id)
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS purchase_order_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    po_id INT NOT NULL,
+    item_name VARCHAR(255) NOT NULL,
+    description TEXT,
+    quantity DECIMAL(10,3) NOT NULL DEFAULT 1,
+    unit VARCHAR(50) DEFAULT 'pcs',
+    rate DECIMAL(10,2) DEFAULT 0,
+    total DECIMAL(12,2) DEFAULT 0,
+    received_qty DECIMAL(10,3) DEFAULT 0,
+    sort_order INT DEFAULT 0,
+    FOREIGN KEY (po_id) REFERENCES purchase_orders(id) ON DELETE CASCADE
+  )`);
+
+  // ── SALE CHALLANS ──────────────────────────────────────────────────────────
+  await db.query(`CREATE TABLE IF NOT EXISTS sale_challans (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    challan_number VARCHAR(50) UNIQUE NOT NULL,
+    client_name VARCHAR(255) NOT NULL,
+    client_phone VARCHAR(50),
+    client_address TEXT,
+    client_gstin VARCHAR(20),
+    project_id INT,
+    challan_date DATE NOT NULL,
+    delivery_date DATE,
+    status ENUM('draft','sent','delivered','cancelled') DEFAULT 'draft',
+    challan_type ENUM('sale','delivery','proforma') DEFAULT 'delivery',
+    subtotal DECIMAL(12,2) DEFAULT 0,
+    tax_percent DECIMAL(5,2) DEFAULT 0,
+    tax_amount DECIMAL(12,2) DEFAULT 0,
+    discount_amount DECIMAL(12,2) DEFAULT 0,
+    total_amount DECIMAL(12,2) DEFAULT 0,
+    transport_name VARCHAR(255),
+    vehicle_number VARCHAR(50),
+    notes TEXT,
+    created_by INT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
+    FOREIGN KEY (created_by) REFERENCES users(id)
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS sale_challan_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    challan_id INT NOT NULL,
+    item_name VARCHAR(255) NOT NULL,
+    description TEXT,
+    quantity DECIMAL(10,3) NOT NULL DEFAULT 1,
+    unit VARCHAR(50) DEFAULT 'pcs',
+    rate DECIMAL(10,2) DEFAULT 0,
+    total DECIMAL(12,2) DEFAULT 0,
+    sort_order INT DEFAULT 0,
+    FOREIGN KEY (challan_id) REFERENCES sale_challans(id) ON DELETE CASCADE
+  )`);
+
+  // Auto-seed PO number prefix setting
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('po_prefix', 'PO')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('po_start_number', '1001')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('challan_prefix', 'DC')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('challan_start_number', '1001')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_phone', '')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_gstin', '')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_email', '')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_address', '')").catch(()=>{});
+
   console.log('✅ Workshop App Database initialized');
   return db;
 }
