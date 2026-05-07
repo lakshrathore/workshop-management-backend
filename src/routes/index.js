@@ -3113,7 +3113,7 @@ router.get('/purchase-orders/:id', auth, adminOnly, async (req, res) => {
       LEFT JOIN projects p ON p.id = po.project_id
       JOIN users u ON u.id = po.created_by
       WHERE po.id=?`, [req.params.id]);
-    if (!po) return res.status(404).json({ message: 'Purchase Order nahi mila' });
+    if (!po) return res.status(404).json({ message: 'Purchase Order not found' });
     const [items] = await db.query('SELECT * FROM purchase_order_items WHERE po_id=? ORDER BY sort_order, id', [req.params.id]);
     res.json({ ...po, items });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -3127,7 +3127,7 @@ router.post('/purchase-orders', auth, adminOnly, async (req, res) => {
       project_id, order_date, expected_delivery, status, notes,
       tax_percent, discount_amount, items } = req.body;
     if (!supplier_name?.trim()) return res.status(400).json({ message: 'Supplier name required' });
-    if (!items?.length) return res.status(400).json({ message: 'Kam se kam ek item add karo' });
+    if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
     const po_number = await getNextPONumber(db);
     let subtotal = 0;
@@ -3155,7 +3155,7 @@ router.post('/purchase-orders', auth, adminOnly, async (req, res) => {
         [poId, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
       );
     }
-    res.json({ id: poId, po_number, message: 'Purchase Order bana diya ✅' });
+    res.json({ id: poId, po_number, message: 'Purchase Order created successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -3167,7 +3167,7 @@ router.put('/purchase-orders/:id', auth, adminOnly, async (req, res) => {
       project_id, order_date, expected_delivery, status, notes,
       tax_percent, discount_amount, items } = req.body;
     if (!supplier_name?.trim()) return res.status(400).json({ message: 'Supplier name required' });
-    if (!items?.length) return res.status(400).json({ message: 'Kam se kam ek item add karo' });
+    if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
     let subtotal = 0;
     for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
@@ -3194,7 +3194,7 @@ router.put('/purchase-orders/:id', auth, adminOnly, async (req, res) => {
         [req.params.id, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
       );
     }
-    res.json({ message: 'Purchase Order update ho gaya ✅' });
+    res.json({ message: 'Purchase Order updated successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -3204,7 +3204,7 @@ router.patch('/purchase-orders/:id/status', auth, adminOnly, async (req, res) =>
   try {
     const { status } = req.body;
     await db.query('UPDATE purchase_orders SET status=? WHERE id=?', [status, req.params.id]);
-    res.json({ message: 'Status update ho gaya' });
+    res.json({ message: 'Status updated successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -3213,7 +3213,7 @@ router.delete('/purchase-orders/:id', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   try {
     await db.query('DELETE FROM purchase_orders WHERE id=?', [req.params.id]);
-    res.json({ message: 'Purchase Order delete ho gaya' });
+    res.json({ message: 'Purchase Order deleted successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -3268,7 +3268,7 @@ router.get('/sale-challans/:id', auth, adminOnly, async (req, res) => {
       LEFT JOIN projects p ON p.id = sc.project_id
       JOIN users u ON u.id = sc.created_by
       WHERE sc.id=?`, [req.params.id]);
-    if (!challan) return res.status(404).json({ message: 'Challan nahi mila' });
+    if (!challan) return res.status(404).json({ message: 'Challan not found' });
     const [items] = await db.query('SELECT * FROM sale_challan_items WHERE challan_id=? ORDER BY sort_order, id', [req.params.id]);
     res.json({ ...challan, items });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -3282,7 +3282,7 @@ router.post('/sale-challans', auth, adminOnly, async (req, res) => {
       project_id, challan_date, delivery_date, status, notes,
       tax_percent, discount_amount, transport_name, vehicle_number, items } = req.body;
     if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
-    if (!items?.length) return res.status(400).json({ message: 'Kam se kam ek item add karo' });
+    if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
     const challan_number = await getNextChallanNumber(db);
     let subtotal = 0;
@@ -3312,7 +3312,7 @@ router.post('/sale-challans', auth, adminOnly, async (req, res) => {
         [challanId, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
       );
     }
-    res.json({ id: challanId, challan_number, message: 'Sale Challan bana diya ✅' });
+    res.json({ id: challanId, challan_number, message: 'Sale Challan created successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -3324,7 +3324,7 @@ router.put('/sale-challans/:id', auth, adminOnly, async (req, res) => {
       project_id, challan_date, delivery_date, status, notes,
       tax_percent, discount_amount, transport_name, vehicle_number, items } = req.body;
     if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
-    if (!items?.length) return res.status(400).json({ message: 'Kam se kam ek item add karo' });
+    if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
     let subtotal = 0;
     for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
@@ -3352,7 +3352,7 @@ router.put('/sale-challans/:id', auth, adminOnly, async (req, res) => {
         [req.params.id, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
       );
     }
-    res.json({ message: 'Sale Challan update ho gaya ✅' });
+    res.json({ message: 'Sale Challan updated successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -3362,7 +3362,7 @@ router.patch('/sale-challans/:id/status', auth, adminOnly, async (req, res) => {
   try {
     const { status } = req.body;
     await db.query('UPDATE sale_challans SET status=? WHERE id=?', [status, req.params.id]);
-    res.json({ message: 'Status update ho gaya' });
+    res.json({ message: 'Status updated successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -3371,7 +3371,7 @@ router.delete('/sale-challans/:id', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   try {
     await db.query('DELETE FROM sale_challans WHERE id=?', [req.params.id]);
-    res.json({ message: 'Challan delete ho gaya' });
+    res.json({ message: 'Challan deleted successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
