@@ -551,10 +551,22 @@ async function initializeDatabase() {
   )`);
 
   // Auto-seed PO number prefix setting
+  // Purchase Order numbering
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('po_numbering_mode', 'auto')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('po_prefix', 'PO')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('po_start_number', '1001')").catch(()=>{});
-  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('challan_prefix', 'DC')").catch(()=>{});
-  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('challan_start_number', '1001')").catch(()=>{});
+  // Sale Invoice numbering
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('sale_numbering_mode', 'auto')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('sale_prefix', 'INV')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('sale_start_number', '1001')").catch(()=>{});
+  // Delivery Challan numbering
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('delivery_numbering_mode', 'auto')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('delivery_prefix', 'DC')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('delivery_start_number', '1001')").catch(()=>{});
+  // Proforma numbering
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('proforma_numbering_mode', 'auto')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('proforma_prefix', 'PRO')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('proforma_start_number', '1001')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_phone', '')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_gstin', '')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_email', '')").catch(()=>{});

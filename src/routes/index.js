@@ -3068,16 +3068,55 @@ router.get('/barcodes/items', auth, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Helper: generate next PO number
-async function getNextPONumber(db) {
-  const [[prefixRow]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='po_prefix'");
-  const [[startRow]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='po_start_number'");
-  const prefix = prefixRow?.setting_value || 'PO';
+// ── Numbering helpers (per-type: po | sale | delivery | proforma) ──────────
+
+async function getNextAutoNumber(db, docType) {
+  const prefixKey = `${docType}_prefix`;
+  const startKey  = `${docType}_start_number`;
+  const defaults  = { po: 'PO', sale: 'INV', delivery: 'DC', proforma: 'PRO' };
+
+  const [[prefixRow]] = await db.query('SELECT setting_value FROM app_settings WHERE setting_key=?', [prefixKey]);
+  const [[startRow]]  = await db.query('SELECT setting_value FROM app_settings WHERE setting_key=?', [startKey]);
+
+  const prefix   = (prefixRow?.setting_value || defaults[docType] || docType.toUpperCase()).trim();
   const startNum = parseInt(startRow?.setting_value || '1001');
-  const [[maxRow]] = await db.query("SELECT MAX(CAST(SUBSTRING(po_number, ?) AS UNSIGNED)) as maxn FROM purchase_orders WHERE po_number LIKE ?", [prefix.length + 2, prefix + '-%']);
+
+  const table      = docType === 'po' ? 'purchase_orders' : 'sale_challans';
+  const col        = docType === 'po' ? 'po_number'       : 'challan_number';
+  const typeFilter = docType !== 'po' ? ` AND challan_type='${docType}'` : '';
+
+  const [[maxRow]] = await db.query(
+    `SELECT MAX(CAST(SUBSTRING(${col}, ?) AS UNSIGNED)) as maxn FROM ${table} WHERE ${col} LIKE ?${typeFilter}`,
+    [prefix.length + 2, prefix + '-%']
+  );
   const maxn = maxRow?.maxn || (startNum - 1);
   const next = Math.max(maxn + 1, startNum);
   return `${prefix}-${String(next).padStart(4, '0')}`;
 }
+
+async function getLastUsedNumber(db, docType) {
+  const prefixKey = `${docType}_prefix`;
+  const defaults  = { po: 'PO', sale: 'INV', delivery: 'DC', proforma: 'PRO' };
+  const [[prefixRow]] = await db.query('SELECT setting_value FROM app_settings WHERE setting_key=?', [prefixKey]);
+  const prefix = (prefixRow?.setting_value || defaults[docType] || docType.toUpperCase()).trim();
+
+  const table      = docType === 'po' ? 'purchase_orders' : 'sale_challans';
+  const col        = docType === 'po' ? 'po_number'       : 'challan_number';
+  const typeFilter = docType !== 'po' ? ` AND challan_type='${docType}'` : '';
+
+  const [[row]] = await db.query(
+    `SELECT ${col} as num FROM ${table} WHERE ${col} LIKE ?${typeFilter} ORDER BY id DESC LIMIT 1`,
+    [prefix + '-%']
+  );
+  return row?.num || null;
+}
+
+async function getNumberingMode(db, docType) {
+  const [[row]] = await db.query('SELECT setting_value FROM app_settings WHERE setting_key=?', [`${docType}_numbering_mode`]);
+  return row?.setting_value || 'auto';
+}
+
+async function getNextPONumber(db) { return getNextAutoNumber(db, 'po'); }
 
 // GET all purchase orders
 router.get('/purchase-orders', auth, adminOnly, async (req, res) => {
@@ -3125,11 +3164,18 @@ router.post('/purchase-orders', auth, adminOnly, async (req, res) => {
   try {
     const { supplier_name, supplier_phone, supplier_address, supplier_gstin,
       project_id, order_date, expected_delivery, status, notes,
-      tax_percent, discount_amount, items } = req.body;
+      tax_percent, discount_amount, items, manual_number } = req.body;
     if (!supplier_name?.trim()) return res.status(400).json({ message: 'Supplier name required' });
     if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
-    const po_number = await getNextPONumber(db);
+    const poMode = await getNumberingMode(db, 'po');
+    let po_number;
+    if (poMode === 'manual') {
+      if (!manual_number?.trim()) return res.status(400).json({ message: 'PO number is required in manual mode' });
+      po_number = manual_number.trim();
+    } else {
+      po_number = await getNextAutoNumber(db, 'po');
+    }
     let subtotal = 0;
     for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
     const taxPct = parseFloat(tax_percent) || 0;
@@ -3223,16 +3269,7 @@ router.delete('/purchase-orders/:id', auth, adminOnly, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Helper: generate next Challan number
-async function getNextChallanNumber(db) {
-  const [[prefixRow]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='challan_prefix'");
-  const [[startRow]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='challan_start_number'");
-  const prefix = prefixRow?.setting_value || 'DC';
-  const startNum = parseInt(startRow?.setting_value || '1001');
-  const [[maxRow]] = await db.query("SELECT MAX(CAST(SUBSTRING(challan_number, ?) AS UNSIGNED)) as maxn FROM sale_challans WHERE challan_number LIKE ?", [prefix.length + 2, prefix + '-%']);
-  const maxn = maxRow?.maxn || (startNum - 1);
-  const next = Math.max(maxn + 1, startNum);
-  return `${prefix}-${String(next).padStart(4, '0')}`;
-}
+// getNextChallanNumber is now type-aware (uses getNextAutoNumber)
 
 // GET all challans
 router.get('/sale-challans', auth, adminOnly, async (req, res) => {
@@ -3280,11 +3317,19 @@ router.post('/sale-challans', auth, adminOnly, async (req, res) => {
   try {
     const { client_name, client_phone, client_address, client_gstin, challan_type,
       project_id, challan_date, delivery_date, status, notes,
-      tax_percent, discount_amount, transport_name, vehicle_number, items } = req.body;
+      tax_percent, discount_amount, transport_name, vehicle_number, items, manual_number } = req.body;
     if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
     if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
-    const challan_number = await getNextChallanNumber(db);
+    const cType = challan_type || 'delivery';
+    const challanMode = await getNumberingMode(db, cType);
+    let challan_number;
+    if (challanMode === 'manual') {
+      if (!manual_number?.trim()) return res.status(400).json({ message: 'Challan number is required in manual mode' });
+      challan_number = manual_number.trim();
+    } else {
+      challan_number = await getNextAutoNumber(db, cType);
+    }
     let subtotal = 0;
     for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
     const taxPct = parseFloat(tax_percent) || 0;
@@ -3372,6 +3417,33 @@ router.delete('/sale-challans/:id', auth, adminOnly, async (req, res) => {
   try {
     await db.query('DELETE FROM sale_challans WHERE id=?', [req.params.id]);
     res.json({ message: 'Challan deleted successfully' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Numbering Info API (for Settings page & manual mode) ──────────────────
+// GET last used numbers + modes for all doc types
+router.get('/numbering-info', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const types = ['po', 'sale', 'delivery', 'proforma'];
+    const result = {};
+    for (const t of types) {
+      const mode = await getNumberingMode(db, t);
+      const last = await getLastUsedNumber(db, t);
+      const [[pfxRow]]   = await db.query('SELECT setting_value FROM app_settings WHERE setting_key=?', [`${t}_prefix`]);
+      const [[startRow]] = await db.query('SELECT setting_value FROM app_settings WHERE setting_key=?', [`${t}_start_number`]);
+      const defaults = { po: 'PO', sale: 'INV', delivery: 'DC', proforma: 'PRO' };
+      result[t] = {
+        mode,
+        prefix: pfxRow?.setting_value || defaults[t],
+        start_number: startRow?.setting_value || '1001',
+        last_used: last,
+      };
+      if (mode === 'auto') {
+        try { result[t].next_number = await getNextAutoNumber(db, t); } catch { result[t].next_number = null; }
+      }
+    }
+    res.json(result);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
