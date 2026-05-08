@@ -172,7 +172,7 @@ router.post('/auth/login', async (req, res) => {
           [user.id, user.role, user.name, 'LOGIN_FAILED', ip, ua]
         );
       }
-    } catch (e) { /* audit table may not exist yet */ }
+    } catch (e) { console.error('Audit insert error:', e.message); }
     return res.status(401).json({ message: 'Invalid credentials' });
   }
 
@@ -182,7 +182,8 @@ router.post('/auth/login', async (req, res) => {
       'INSERT INTO login_logs (user_id, user_role, user_name, action, ip_address, user_agent) VALUES (?,?,?,?,?,?)',
       [user.id, user.role, user.name, 'LOGIN', ip, ua]
     );
-  } catch (e) { /* audit table may not exist yet */ }
+    console.log('Login logged for:', user.name, user.role);
+  } catch (e) { console.error('Audit insert error:', e.message); }
 
   const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, user: { id: user.id, name: user.name, username: user.username, role: user.role } });
