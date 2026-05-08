@@ -158,9 +158,32 @@ router.post('/auth/emergency-reset', async (req, res) => {
 router.post('/auth/login', async (req, res) => {
   const db = await getPool();
   const { username, password } = req.body;
+  const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+  const ua = req.headers['user-agent'] || 'unknown';
+
   const [[user]] = await db.query('SELECT * FROM users WHERE username=? AND is_active=1', [username]);
-  if (!user || !bcrypt.compareSync(password, user.password))
+
+  // Log failed attempt
+  if (!user || !bcrypt.compareSync(password, user.password)) {
+    try {
+      if (user) {
+        await db.query(
+          'INSERT INTO login_logs (user_id, user_role, user_name, action, ip_address, user_agent) VALUES (?,?,?,?,?,?)',
+          [user.id, user.role, user.name, 'LOGIN_FAILED', ip, ua]
+        );
+      }
+    } catch (e) { /* audit table may not exist yet */ }
     return res.status(401).json({ message: 'Invalid credentials' });
+  }
+
+  // Log successful login
+  try {
+    await db.query(
+      'INSERT INTO login_logs (user_id, user_role, user_name, action, ip_address, user_agent) VALUES (?,?,?,?,?,?)',
+      [user.id, user.role, user.name, 'LOGIN', ip, ua]
+    );
+  } catch (e) { /* audit table may not exist yet */ }
+
   const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, user: { id: user.id, name: user.name, username: user.username, role: user.role } });
 });
@@ -3444,6 +3467,148 @@ router.delete('/sale-challans/:id', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ── DISPATCH WORKER — Sale Challan routes (auth only, no adminOnly) ───────
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET all challans — dispatch worker sees only delivery type + own challans
+router.get('/dispatch/challans', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const isAdmin = req.user.role === 'admin';
+    let sql = `
+      SELECT sc.*, p.name as project_name, p.project_id as proj_code,
+        u.name as created_by_name,
+        (SELECT COUNT(*) FROM sale_challan_items WHERE challan_id=sc.id) as item_count
+      FROM sale_challans sc
+      LEFT JOIN projects p ON p.id = sc.project_id
+      JOIN users u ON u.id = sc.created_by
+      WHERE 1=1`;
+    const params = [];
+    if (!isAdmin) {
+      sql += ' AND sc.created_by = ?';
+      params.push(req.user.id);
+    }
+    sql += ' ORDER BY sc.created_at DESC LIMIT 50';
+    const [rows] = await db.query(sql, params);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET single challan with items — dispatch worker can view
+router.get('/dispatch/challans/:id', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[challan]] = await db.query(`
+      SELECT sc.*, p.name as project_name, p.project_id as proj_code,
+        u.name as created_by_name
+      FROM sale_challans sc
+      LEFT JOIN projects p ON p.id = sc.project_id
+      JOIN users u ON u.id = sc.created_by
+      WHERE sc.id=?`, [req.params.id]);
+    if (!challan) return res.status(404).json({ message: 'Challan not found' });
+    // Non-admin can only view own challans
+    if (req.user.role !== 'admin' && challan.created_by !== req.user.id) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const [items] = await db.query('SELECT * FROM sale_challan_items WHERE challan_id=? ORDER BY sort_order, id', [req.params.id]);
+    res.json({ ...challan, items });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// POST create challan — dispatch worker can create delivery challan
+router.post('/dispatch/challans', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { client_name, client_phone, client_address, client_gstin,
+      project_id, challan_date, delivery_date, notes,
+      tax_percent, discount_amount, transport_name, vehicle_number,
+      items, manual_number } = req.body;
+    if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
+    if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
+
+    const challan_type = 'delivery'; // dispatch worker only creates delivery challans
+    const cType = challan_type;
+    const challanMode = await getNumberingMode(db, cType);
+    let challan_number;
+    if (challanMode === 'manual') {
+      if (!manual_number?.trim()) return res.status(400).json({ message: 'Challan number is required in manual mode' });
+      challan_number = manual_number.trim();
+    } else {
+      challan_number = await getNextAutoNumber(db, cType);
+    }
+
+    let subtotal = 0;
+    for (const item of items) { subtotal += (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0); }
+    const taxPct = parseFloat(tax_percent) || 0;
+    const disc = parseFloat(discount_amount) || 0;
+    const tax_amount = parseFloat(((subtotal - disc) * taxPct / 100).toFixed(2));
+    const total_amount = parseFloat((subtotal - disc + tax_amount).toFixed(2));
+
+    const [r] = await db.query(
+      `INSERT INTO sale_challans (challan_number,client_name,client_phone,client_address,client_gstin,challan_type,
+        project_id,challan_date,delivery_date,status,subtotal,tax_percent,tax_amount,discount_amount,
+        total_amount,transport_name,vehicle_number,notes,created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [challan_number, client_name.trim(), client_phone||'', client_address||'', client_gstin||'',
+        challan_type, project_id||null, challan_date, delivery_date||null, 'draft',
+        subtotal, taxPct, tax_amount, disc, total_amount,
+        transport_name||'', vehicle_number||'', notes||'', req.user.id]
+    );
+    const challanId = r.insertId;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const qty = parseFloat(it.quantity) || 0;
+      const rate = parseFloat(it.rate) || 0;
+      await db.query(
+        'INSERT INTO sale_challan_items (challan_id,item_name,description,quantity,unit,rate,total,sort_order) VALUES (?,?,?,?,?,?,?,?)',
+        [challanId, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
+      );
+    }
+    res.json({ id: challanId, challan_number, message: 'Delivery Challan created successfully' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// PATCH mark as delivered — dispatch worker can update status
+router.patch('/dispatch/challans/:id/status', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[challan]] = await db.query('SELECT created_by FROM sale_challans WHERE id=?', [req.params.id]);
+    if (!challan) return res.status(404).json({ message: 'Challan not found' });
+    if (req.user.role !== 'admin' && challan.created_by !== req.user.id) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const { status } = req.body;
+    await db.query('UPDATE sale_challans SET status=? WHERE id=?', [status, req.params.id]);
+    res.json({ message: 'Status updated successfully' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET projects list for dispatch worker
+router.get('/dispatch/projects', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [rows] = await db.query(`
+      SELECT id, name, project_id, client_name, client_phone, status
+      FROM projects WHERE status != 'deleted' ORDER BY name
+    `);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET project items for dispatch worker (to auto-fill challan)
+router.get('/dispatch/projects/:id/items', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [items] = await db.query(`
+      SELECT id, item_name, description, quantity, unit, unit_price, dimensions
+      FROM project_items WHERE project_id=? ORDER BY item_name
+    `, [req.params.id]);
+    res.json(items);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+
 // ── Numbering Info API (for Settings page & manual mode) ──────────────────
 // GET last used numbers + modes for all doc types
 router.get('/numbering-info', auth, adminOnly, async (req, res) => {
@@ -3472,3 +3637,60 @@ router.get('/numbering-info', auth, adminOnly, async (req, res) => {
 });
 
 module.exports = router;
+
+// ── AUDIT TRAIL ROUTES (Admin only) ──────────────────────────────────────────
+
+// GET /audit/login-logs — Login history with filters
+router.get('/audit/login-logs', auth, adminOnly, async (req, res) => {
+  try {
+    const db = await getPool();
+    const { user_id, role, action, date_from, date_to, limit = 200 } = req.query;
+    let where = ['1=1']; let params = [];
+    if (user_id)   { where.push('l.user_id=?');              params.push(user_id); }
+    if (role)      { where.push('l.user_role=?');             params.push(role); }
+    if (action)    { where.push('l.action=?');                params.push(action); }
+    if (date_from) { where.push('DATE(l.created_at)>=?');     params.push(date_from); }
+    if (date_to)   { where.push('DATE(l.created_at)<=?');     params.push(date_to); }
+    const [rows] = await db.query(
+      `SELECT l.* FROM login_logs l WHERE ${where.join(' AND ')} ORDER BY l.created_at DESC LIMIT ?`,
+      [...params, parseInt(limit)]
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET /audit/activity-logs — All activity (create/update/delete)
+router.get('/audit/activity-logs', auth, adminOnly, async (req, res) => {
+  try {
+    const db = await getPool();
+    const { user_id, role, action_type, module_name, date_from, date_to, limit = 200 } = req.query;
+    let where = ['1=1']; let params = [];
+    if (user_id)     { where.push('a.user_id=?');             params.push(user_id); }
+    if (role)        { where.push('a.user_role=?');            params.push(role); }
+    if (action_type) { where.push('a.action_type=?');          params.push(action_type); }
+    if (module_name) { where.push('a.module_name=?');          params.push(module_name); }
+    if (date_from)   { where.push('DATE(a.created_at)>=?');    params.push(date_from); }
+    if (date_to)     { where.push('DATE(a.created_at)<=?');    params.push(date_to); }
+    const [rows] = await db.query(
+      `SELECT a.* FROM audit_logs a WHERE ${where.join(' AND ')} ORDER BY a.created_at DESC LIMIT ?`,
+      [...params, parseInt(limit)]
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET /audit/summary — Quick stats
+router.get('/audit/summary', auth, adminOnly, async (req, res) => {
+  try {
+    const db = await getPool();
+    const [[loginToday]]    = await db.query("SELECT COUNT(*) as c FROM login_logs WHERE DATE(created_at)=CURDATE() AND action='LOGIN'");
+    const [[failedToday]]   = await db.query("SELECT COUNT(*) as c FROM login_logs WHERE DATE(created_at)=CURDATE() AND action='LOGIN_FAILED'");
+    const [[activityToday]] = await db.query("SELECT COUNT(*) as c FROM audit_logs WHERE DATE(created_at)=CURDATE()");
+    const [activeUsers]     = await db.query(
+      `SELECT user_id, user_name, user_role, MAX(created_at) as last_login
+       FROM login_logs WHERE action='LOGIN' AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+       GROUP BY user_id, user_name, user_role ORDER BY last_login DESC LIMIT 10`
+    );
+    res.json({ logins_today: loginToday.c, failed_today: failedToday.c, activity_today: activityToday.c, recent_active_users: activeUsers });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
