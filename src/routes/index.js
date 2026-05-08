@@ -15,7 +15,7 @@ try {
   const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || 'BDT3sQDeaJhvQHe_CrbmKifgygdtlppVCbDe7OAY7oobL5D5pnWIOYLy-bVPr30xJLqkHDRZcGVXVIwXLQloeGQ';
   const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '5mJhC6k1qkVZnsFPUhmT5B-3-Komog0pn2xJtEPz66I';
   webpush.setVapidDetails('mailto:admin@workshop.com', VAPID_PUBLIC, VAPID_PRIVATE);
-  console.log('✅ Web Push initialized');
+  console.log('✅ Web Push initialized.');
 } catch (e) {
   console.log('⚠️ web-push not installed — push notifications disabled');
 }
