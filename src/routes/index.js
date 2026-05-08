@@ -3611,7 +3611,7 @@ router.get('/dispatch/projects/:id/items', auth, async (req, res) => {
 
 // ── Numbering Info API (for Settings page & manual mode) ──────────────────
 // GET last used numbers + modes for all doc types
-router.get('/numbering-info', auth, adminOnly, async (req, res) => {
+router.get('/numbering-info', auth, async (req, res) => {
   const db = await getPool();
   try {
     const types = ['po', 'sale', 'delivery', 'proforma'];
@@ -3636,7 +3636,6 @@ router.get('/numbering-info', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-module.exports = router;
 
 // ── AUDIT TRAIL ROUTES (Admin only) ──────────────────────────────────────────
 
@@ -3646,11 +3645,11 @@ router.get('/audit/login-logs', auth, adminOnly, async (req, res) => {
     const db = await getPool();
     const { user_id, role, action, date_from, date_to, limit = 200 } = req.query;
     let where = ['1=1']; let params = [];
-    if (user_id)   { where.push('l.user_id=?');              params.push(user_id); }
-    if (role)      { where.push('l.user_role=?');             params.push(role); }
-    if (action)    { where.push('l.action=?');                params.push(action); }
-    if (date_from) { where.push('DATE(l.created_at)>=?');     params.push(date_from); }
-    if (date_to)   { where.push('DATE(l.created_at)<=?');     params.push(date_to); }
+    if (user_id)   { where.push('l.user_id=?');           params.push(user_id); }
+    if (role)      { where.push('l.user_role=?');          params.push(role); }
+    if (action)    { where.push('l.action=?');             params.push(action); }
+    if (date_from) { where.push('DATE(l.created_at)>=?');  params.push(date_from); }
+    if (date_to)   { where.push('DATE(l.created_at)<=?');  params.push(date_to); }
     const [rows] = await db.query(
       `SELECT l.* FROM login_logs l WHERE ${where.join(' AND ')} ORDER BY l.created_at DESC LIMIT ?`,
       [...params, parseInt(limit)]
@@ -3665,12 +3664,12 @@ router.get('/audit/activity-logs', auth, adminOnly, async (req, res) => {
     const db = await getPool();
     const { user_id, role, action_type, module_name, date_from, date_to, limit = 200 } = req.query;
     let where = ['1=1']; let params = [];
-    if (user_id)     { where.push('a.user_id=?');             params.push(user_id); }
-    if (role)        { where.push('a.user_role=?');            params.push(role); }
-    if (action_type) { where.push('a.action_type=?');          params.push(action_type); }
-    if (module_name) { where.push('a.module_name=?');          params.push(module_name); }
-    if (date_from)   { where.push('DATE(a.created_at)>=?');    params.push(date_from); }
-    if (date_to)     { where.push('DATE(a.created_at)<=?');    params.push(date_to); }
+    if (user_id)     { where.push('a.user_id=?');          params.push(user_id); }
+    if (role)        { where.push('a.user_role=?');         params.push(role); }
+    if (action_type) { where.push('a.action_type=?');       params.push(action_type); }
+    if (module_name) { where.push('a.module_name=?');       params.push(module_name); }
+    if (date_from)   { where.push('DATE(a.created_at)>=?'); params.push(date_from); }
+    if (date_to)     { where.push('DATE(a.created_at)<=?'); params.push(date_to); }
     const [rows] = await db.query(
       `SELECT a.* FROM audit_logs a WHERE ${where.join(' AND ')} ORDER BY a.created_at DESC LIMIT ?`,
       [...params, parseInt(limit)]
@@ -3694,3 +3693,5 @@ router.get('/audit/summary', auth, adminOnly, async (req, res) => {
     res.json({ logins_today: loginToday.c, failed_today: failedToday.c, activity_today: activityToday.c, recent_active_users: activeUsers });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
+
+module.exports = router;
