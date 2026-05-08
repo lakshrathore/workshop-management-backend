@@ -1332,7 +1332,7 @@ async function getPreviousStageQuantity(db, projectItemId, currentStageOrder) {
 }
 
 // Worker progress update
-router.patch('/tasks/:id/progress', auth, async (req, res) => {
+router.patch('/tasks/:id/progress', auth, auditLog('UPDATE','Task'), async (req, res) => {
   const db = await getPool();
   const { quantity_completed, status, worker_notes } = req.body;
   const [[task]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
@@ -2465,7 +2465,7 @@ router.post('/queries', auth, auditLog('CREATE','Query'), async (req, res) => {
 });
 
 // Admin responds to query
-router.patch('/queries/:id/respond', auth, adminOnly, async (req, res) => {
+router.patch('/queries/:id/respond', auth, adminOnly, auditLog('UPDATE','Query'), async (req, res) => {
   const db = await getPool();
   const { admin_response, status } = req.body;
   try {
@@ -2479,7 +2479,7 @@ router.patch('/queries/:id/respond', auth, adminOnly, async (req, res) => {
   }
 });
 
-router.patch('/queries/:id/status', auth, adminOnly, async (req, res) => {
+router.patch('/queries/:id/status', auth, adminOnly, auditLog('UPDATE','Query'), async (req, res) => {
   const db = await getPool();
   await db.query('UPDATE worker_queries SET status=?, updated_at=NOW() WHERE id=?',
     [req.body.status, req.params.id]);
@@ -3308,7 +3308,7 @@ router.put('/purchase-orders/:id', auth, adminOnly, auditLog('UPDATE','PurchaseO
 });
 
 // PATCH status only
-router.patch('/purchase-orders/:id/status', auth, adminOnly, async (req, res) => {
+router.patch('/purchase-orders/:id/status', auth, adminOnly, auditLog('UPDATE','PurchaseOrder'), async (req, res) => {
   const db = await getPool();
   try {
     const { status } = req.body;
@@ -3465,7 +3465,7 @@ router.put('/sale-challans/:id', auth, adminOnly, auditLog('UPDATE','SaleChallan
 });
 
 // PATCH status only
-router.patch('/sale-challans/:id/status', auth, adminOnly, async (req, res) => {
+router.patch('/sale-challans/:id/status', auth, adminOnly, auditLog('UPDATE','SaleChallan'), async (req, res) => {
   const db = await getPool();
   try {
     const { status } = req.body;
