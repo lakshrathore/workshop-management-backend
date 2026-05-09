@@ -1806,19 +1806,17 @@ router.get('/reports/dashboard', auth, async (req, res) => {
 
     const [[workerStats]] = await db.query(`SELECT COUNT(*) as total FROM users WHERE role='worker' AND is_active=1`);
 
-    // Top 10 projects by recency — all statuses except deleted
+    // Top 10 projects by recency — subqueries avoid cartesian product from joining both items+tasks
     const [recentProjects] = await db.query(`
       SELECT p.id, p.project_id, p.name, p.client_name, p.status, p.deadline, p.priority, p.created_at,
-        COUNT(DISTINCT pi.id) as item_count,
-        COUNT(DISTINCT ta.id) as task_count,
-        COALESCE(SUM(ta.status='completed'),0) as done_tasks,
-        COALESCE(SUM(ta.status='in_progress'),0) as active_tasks,
-        COALESCE(SUM(ta.status='pending'),0) as pending_tasks
+        (SELECT COUNT(*) FROM project_items WHERE project_id=p.id) as item_count,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id=p.id) as task_count,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id=p.id AND status='completed') as done_tasks,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id=p.id AND status='in_progress') as active_tasks,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id=p.id AND status='pending') as pending_tasks
       FROM projects p
-      LEFT JOIN project_items pi ON pi.project_id=p.id
-      LEFT JOIN task_assignments ta ON ta.project_id=p.id
       WHERE p.status NOT IN ('deleted','cancelled')
-      GROUP BY p.id ORDER BY p.created_at DESC LIMIT 10`);
+      ORDER BY p.created_at DESC LIMIT 10`);
 
     // Delayed tasks with days overdue
     const [delayedTasks] = await db.query(`
