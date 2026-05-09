@@ -1840,7 +1840,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         COUNT(DISTINCT ta.id) as total_tasks,
         COALESCE(SUM(ta.status='completed'),0) as completed,
         COALESCE(SUM(ta.status='in_progress'),0) as in_progress,
-        COALESCE(SUM(ta.status!='completed' AND ta.due_date IS NOT NULL AND ta.due_date<CURDATE()),0) as delayed,
+        COALESCE(SUM(ta.status!='completed' AND ta.due_date IS NOT NULL AND ta.due_date<CURDATE()),0) as delayed_count,
         COALESCE(SUM(ta.quantity_assigned),0) as qty_assigned,
         COALESCE(SUM(ta.quantity_completed),0) as qty_done
       FROM users u
