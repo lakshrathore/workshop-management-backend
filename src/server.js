@@ -89,7 +89,7 @@ app.post('/api/auth/login', async (req, res) => {
       );
       console.log('Login logged for:', rows[0].name, rows[0].role);
     } catch(e) { console.error('Audit insert error:', e.message); }
-    const token = jwt.sign({ id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, process.env.JWT_SECRET, { expiresIn: '24h' });
+    const token = jwt.sign({ id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, process.env.JWT_SECRET, { expiresIn: '30m' });
     const [depts] = await db.query(`SELECT d.* FROM departments d LEFT JOIN worker_departments wd ON wd.department_id=d.id WHERE wd.worker_id=?`, [rows[0].id]).catch(() => [[]]);
     res.json({ token, user: { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role, departments: depts[0] || [] } });
   } catch(err) {

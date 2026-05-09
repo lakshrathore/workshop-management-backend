@@ -186,7 +186,7 @@ router.post('/auth/login', async (req, res) => {
     console.log('Login logged for:', user.name, user.role);
   } catch (e) { console.error('Audit insert error:', e.message); }
 
-  const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
+  const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '30m' });
   res.json({ token, user: { id: user.id, name: user.name, username: user.username, role: user.role } });
 });
 
