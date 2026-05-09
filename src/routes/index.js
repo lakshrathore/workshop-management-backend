@@ -1794,30 +1794,38 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       SUM(status='pending') as pending, SUM(status='waiting') as waiting,
       SUM(status!='completed' AND due_date IS NOT NULL AND due_date<CURDATE()) as delayed_count
       FROM task_assignments`);
+
     const [[projStats]] = await db.query(`SELECT COUNT(*) as total,
-      SUM(status='active') as active, SUM(status='completed') as completed,
-      SUM(status='deleted') as deleted_count
+      SUM(status='active') as active,
+      SUM(status='completed') as completed,
+      SUM(status='pending') as pending,
+      SUM(status='in_progress') as in_progress,
+      SUM(status='deleted') as deleted_count,
+      SUM(status NOT IN ('deleted','cancelled','completed') AND deadline IS NOT NULL AND deadline < CURDATE()) as overdue
       FROM projects`);
+
     const [[workerStats]] = await db.query(`SELECT COUNT(*) as total FROM users WHERE role='worker' AND is_active=1`);
 
-    // Recent active projects with pipeline summary
+    // Top 10 projects by recency — all statuses except deleted
     const [recentProjects] = await db.query(`
-      SELECT p.id, p.project_id, p.name, p.client_name, p.status, p.deadline, p.priority,
+      SELECT p.id, p.project_id, p.name, p.client_name, p.status, p.deadline, p.priority, p.created_at,
         COUNT(DISTINCT pi.id) as item_count,
         COUNT(DISTINCT ta.id) as task_count,
-        SUM(ta.status='completed') as done_tasks,
-        SUM(ta.status='in_progress') as active_tasks
+        COALESCE(SUM(ta.status='completed'),0) as done_tasks,
+        COALESCE(SUM(ta.status='in_progress'),0) as active_tasks,
+        COALESCE(SUM(ta.status='pending'),0) as pending_tasks
       FROM projects p
       LEFT JOIN project_items pi ON pi.project_id=p.id
       LEFT JOIN task_assignments ta ON ta.project_id=p.id
       WHERE p.status NOT IN ('deleted','cancelled')
-      GROUP BY p.id ORDER BY p.created_at DESC LIMIT 8`);
+      GROUP BY p.id ORDER BY p.created_at DESC LIMIT 10`);
 
-    // Delayed tasks
+    // Delayed tasks with days overdue
     const [delayedTasks] = await db.query(`
-      SELECT ta.id, ta.task_title, ta.due_date, ta.status,
-        p.name as project_name, p.project_id as proj_code,
-        u.name as worker_name, d.name as dept_name
+      SELECT ta.id, ta.task_title, ta.due_date, ta.status, ta.priority,
+        p.name as project_name, p.project_id as proj_code, p.id as project_db_id,
+        u.name as worker_name, d.name as dept_name,
+        DATEDIFF(CURDATE(), ta.due_date) as days_overdue
       FROM task_assignments ta
       JOIN projects p ON p.id=ta.project_id
       LEFT JOIN users u ON u.id=ta.worker_id
@@ -1826,20 +1834,51 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         AND ta.due_date IS NOT NULL AND ta.due_date < CURDATE()
       ORDER BY ta.due_date ASC LIMIT 10`);
 
-    // Excel-style pipeline: active products + their department stage status
+    // Worker performance summary
+    const [workerPerformance] = await db.query(`
+      SELECT u.id, u.name,
+        COUNT(DISTINCT ta.id) as total_tasks,
+        COALESCE(SUM(ta.status='completed'),0) as completed,
+        COALESCE(SUM(ta.status='in_progress'),0) as in_progress,
+        COALESCE(SUM(ta.status!='completed' AND ta.due_date IS NOT NULL AND ta.due_date<CURDATE()),0) as delayed,
+        COALESCE(SUM(ta.quantity_assigned),0) as qty_assigned,
+        COALESCE(SUM(ta.quantity_completed),0) as qty_done
+      FROM users u
+      LEFT JOIN task_assignments ta ON ta.worker_id=u.id
+      WHERE u.role='worker' AND u.is_active=1
+      GROUP BY u.id
+      ORDER BY completed DESC
+      LIMIT 8`);
+
+    // Department workload summary
+    const [deptLoad] = await db.query(`
+      SELECT d.id, d.name, d.color,
+        COUNT(DISTINCT wd.worker_id) as worker_count,
+        COUNT(ta.id) as total_tasks,
+        COALESCE(SUM(ta.status='completed'),0) as completed,
+        COALESCE(SUM(ta.status='in_progress'),0) as in_progress,
+        COALESCE(SUM(ta.status='pending'),0) as pending,
+        COALESCE(SUM(ta.quantity_assigned),0) as qty_assigned,
+        COALESCE(SUM(ta.quantity_completed),0) as qty_done
+      FROM departments d
+      LEFT JOIN worker_departments wd ON wd.department_id=d.id
+      LEFT JOIN task_assignments ta ON ta.department_id=d.id
+      WHERE d.is_active=1
+      GROUP BY d.id ORDER BY total_tasks DESC LIMIT 8`);
+
+    // Pipeline: active products + dept stage status (top 20 items)
     const [pipelineItems] = await db.query(`
       SELECT pi.id, pi.item_name, pi.proto_code, pi.quantity,
-        p.name as project_name, p.project_id as proj_code, p.client_name,
+        p.name as project_name, p.project_id as proj_code, p.client_name, p.id as project_db_id,
         COUNT(ta.id) as total_stages,
-        SUM(ta.status='completed') as completed_stages,
-        SUM(ta.status='in_progress') as active_stages
+        COALESCE(SUM(ta.status='completed'),0) as completed_stages,
+        COALESCE(SUM(ta.status='in_progress'),0) as active_stages
       FROM project_items pi
       JOIN projects p ON p.id=pi.project_id
       LEFT JOIN task_assignments ta ON ta.project_item_id=pi.id
       WHERE p.status='active'
       GROUP BY pi.id ORDER BY p.created_at DESC, pi.id LIMIT 20`);
 
-    // For pipeline: get dept-wise status per item
     const itemIds = pipelineItems.map(i => i.id);
     let deptTasks = [];
     if (itemIds.length > 0) {
@@ -1855,7 +1894,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
 
     const deptMap = {};
     for (const t of deptTasks) {
-      if (!t.dept_name) continue; // skip tasks without department
+      if (!t.dept_name) continue;
       if (!deptMap[t.project_item_id]) deptMap[t.project_item_id] = [];
       deptMap[t.project_item_id].push(t);
     }
@@ -1865,7 +1904,16 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       departments: deptMap[item.id] || []
     }));
 
-    res.json({ tasks: taskStats, projects: projStats, workers: workerStats, recentProjects, delayedTasks, pipeline });
+    res.json({
+      tasks: taskStats,
+      projects: projStats,
+      workers: workerStats,
+      recentProjects,
+      delayedTasks,
+      pipeline,
+      workerPerformance,
+      deptLoad
+    });
   } catch(err) {
     console.error('dashboard error:', err.message);
     res.status(500).json({ message: err.message });
