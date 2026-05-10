@@ -1832,7 +1832,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         AND ta.due_date IS NOT NULL AND ta.due_date < CURDATE()
       ORDER BY ta.due_date ASC LIMIT 10`);
 
-    // Worker performance summary
+    // Worker performance summary — include both directly assigned & dept-assigned tasks
     const [workerPerformance] = await db.query(`
       SELECT u.id, u.name,
         COUNT(DISTINCT ta.id) as total_tasks,
@@ -1842,7 +1842,8 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         COALESCE(SUM(ta.quantity_assigned),0) as qty_assigned,
         COALESCE(SUM(ta.quantity_completed),0) as qty_done
       FROM users u
-      LEFT JOIN task_assignments ta ON ta.worker_id=u.id
+      LEFT JOIN worker_departments wd ON wd.worker_id=u.id
+      LEFT JOIN task_assignments ta ON (ta.worker_id=u.id OR ta.department_id=wd.department_id)
       WHERE u.role='worker' AND u.is_active=1
       GROUP BY u.id
       ORDER BY completed DESC
