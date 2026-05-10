@@ -35,6 +35,7 @@ function adminOnly(req, res, next) {
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
 const { imgUpload, galleryUpload, moReferenceUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 const auditLog = require('../middleware/auditLog');
+const { sendEmail, emailAdmins, getAdminEmails, getWorkerEmail, taskAssignedEmail, taskProgressEmail, taskCompletedEmail, itemCompletedEmail } = require('../services/emailService');
 
 // Helper: always return https Cloudinary URL from any image_path format
 function toHttpsImageUrl(imagePath, resourceType = 'image') {
@@ -1068,13 +1069,24 @@ async function _createChainTasks(db, project_id, item, stages, created_by) {
         'SELECT worker_id FROM worker_departments WHERE department_id=?', [s.department_id]
       );
       for (const w of deptWorkers) {
+        const workerEmail = await getWorkerEmail(db, w.worker_id);
         await createNotification(db, {
           user_id: w.worker_id,
           type: 'stage_activated',
-          title: '🔔 Naya Kaam Assign Hua!',
-          message: `"${item.item_name} — ${dept.name}" — Stage 1 ka kaam shuru karo! Qty: ${item.quantity}`,
+          title: 'New Task Assigned!',
+          message: `"${item.item_name} — ${dept.name}" — Stage 1 is ready to start! Qty: ${item.quantity}`,
           task_id: taskId,
-          project_id
+          project_id,
+          workerEmail,
+          emailPayload: taskAssignedEmail({
+            workerName: 'Team Member',
+            taskTitle: `${item.item_name} — ${dept.name}`,
+            projectName: '',
+            itemName: item.item_name,
+            quantity: item.quantity,
+            dueDate: null,
+            deptName: dept.name
+          })
         });
       }
     }
@@ -1241,23 +1253,30 @@ router.delete('/tasks/:id', auth, adminOnly, auditLog('DELETE','Task'), async (r
 
 // Helper: Check and activate next waiting stage — triggers on ANY progress (partial or full)
 // Helper: Create notification + send push
-async function createNotification(db, { user_id, type, title, message, task_id, project_id }) {
+async function createNotification(db, { user_id, type, title, message, task_id, project_id, workerEmail, emailPayload }) {
   try {
     await db.query(
       'INSERT INTO notifications (user_id, type, title, message, task_id, project_id) VALUES (?,?,?,?,?,?)',
       [user_id, type, title, message, task_id || null, project_id || null]
     );
-    // Also send push notification
     await sendPushToUser(db, user_id, { title, body: message, tag: type, task_id, project_id });
+    // Send email to worker if provided
+    if (workerEmail && emailPayload) {
+      await sendEmail(db, { to: workerEmail, ...emailPayload });
+    }
   } catch (err) { console.error('Notification error:', err.message); }
 }
 
 // Helper: Notify all admins
-async function notifyAdmins(db, { type, title, message, task_id, project_id }) {
+async function notifyAdmins(db, { type, title, message, task_id, project_id, emailPayload }) {
   try {
     const [admins] = await db.query("SELECT id FROM users WHERE role='admin' AND is_active=1");
     for (const admin of admins) {
       await createNotification(db, { user_id: admin.id, type, title, message, task_id, project_id });
+    }
+    // Send email to all admin emails
+    if (emailPayload) {
+      await emailAdmins(db, emailPayload);
     }
   } catch (err) { console.error('Notify admins error:', err.message); }
 }
@@ -1307,9 +1326,10 @@ async function checkAndActivateNextStage(db, task) {
     await db.query("UPDATE project_items SET status='completed' WHERE id=?", [task.project_item_id]);
     await notifyAdmins(db, {
       type: 'item_completed',
-      title: '✅ Item Complete!',
-      message: `Project item ke saare stages complete ho gaye!`,
-      project_id: task.project_id
+      title: '✅ Item Completed!',
+      message: `All stages of the project item have been completed!`,
+      project_id: task.project_id,
+      emailPayload: itemCompletedEmail({ projectName: task.project_name || 'Project' })
     });
   }
 }
@@ -1404,10 +1424,19 @@ router.patch('/tasks/:id/progress', auth, auditLog('UPDATE','Task'), async (req,
   // Notify admins about progress update
   await notifyAdmins(db, {
     type: 'progress_update',
-    title: `📊 Progress Update`,
-    message: `${req.user.name} ne "${task.task_title}" mein ${newQty}/${task.quantity_assigned} complete kiya (${newStatus})`,
+    title: `Task Progress Update`,
+    message: `${req.user.name} updated "${task.task_title}": ${newQty}/${task.quantity_assigned} (${newStatus})`,
     task_id: req.params.id,
-    project_id: task.project_id
+    project_id: task.project_id,
+    emailPayload: taskProgressEmail({
+      workerName: req.user.name,
+      taskTitle: task.task_title,
+      projectName: task.project_name || '',
+      oldQty: task.quantity_completed,
+      newQty,
+      totalQty: task.quantity_assigned,
+      newStatus
+    })
   });
 
   // Auto-advance chain — call on any progress (qty > 0)
@@ -3699,6 +3728,36 @@ router.get('/numbering-info', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+
+
+// POST /settings/test-email — Send test email
+router.post('/settings/test-email', auth, adminOnly, async (req, res) => {
+  try {
+    const db = await getPool();
+    const emails = await getAdminEmails(db);
+    if (!emails.length) return res.status(400).json({ message: 'No admin emails configured. Add admin emails in Email Setup first.' });
+
+    const { sendEmail } = require('../services/emailService');
+    const { baseTemplate } = require('../services/emailService');
+
+    for (const email of emails) {
+      await sendEmail(db, {
+        to: email,
+        subject: '✅ Test Email — Workshop Manager',
+        html: `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;padding:20px;background:#f3f4f6">
+          <div style="max-width:500px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;border:1px solid #e5e7eb">
+            <h2 style="color:#1e293b;margin:0 0 16px">✅ Email Setup Successful!</h2>
+            <p style="color:#374151">Your Workshop Manager email system is working correctly.</p>
+            <p style="color:#6b7280;font-size:13px;margin-top:16px">This is a test email sent from your settings page.</p>
+          </div>
+        </body></html>`
+      });
+    }
+    res.json({ message: `Test email sent to ${emails.join(', ')}` });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // ── AUDIT TRAIL ROUTES (Admin only) ──────────────────────────────────────────
 
