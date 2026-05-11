@@ -15,6 +15,21 @@ const jwt = require('jsonwebtoken');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'workshop_secret_2024';
 
+// Helper: Cloudinary image URL banana
+function toHttpsImageUrl(imagePath, resourceType) {
+  if (!imagePath) return null;
+  const p = String(imagePath).trim();
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const type = resourceType === 'raw' ? 'raw' : 'image';
+  if (p.startsWith('https://res.cloudinary.com')) return p;
+  if (p.startsWith('http://res.cloudinary.com')) return p.replace('http://', 'https://');
+  if (p.includes('/upload/')) {
+    const publicId = p.split('/upload/').pop();
+    return `https://res.cloudinary.com/${cloudName}/${type}/upload/${publicId}`;
+  }
+  return `https://res.cloudinary.com/${cloudName}/${type}/upload/${p}`;
+}
+
 // ── Client Auth Middleware ────────────────────────────────────────────────────
 function clientAuth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
@@ -257,7 +272,9 @@ router.get('/client/projects', clientAuth, clientOnly, async (req, res) => {
         p.order_date, p.deadline, p.description,
         (SELECT COUNT(id) FROM project_items WHERE project_id = p.id) as item_count,
         (SELECT COUNT(id) FROM task_assignments WHERE project_id = p.id) as task_count,
-        (SELECT COUNT(id) FROM task_assignments WHERE project_id = p.id AND status = 'completed') as completed_tasks
+        (SELECT COUNT(id) FROM task_assignments WHERE project_id = p.id AND status = 'completed') as completed_tasks,
+        (SELECT image_path FROM project_mo_references WHERE project_id = p.id ORDER BY created_at ASC LIMIT 1) as thumbnail_path,
+        (SELECT resource_type FROM project_mo_references WHERE project_id = p.id ORDER BY created_at ASC LIMIT 1) as thumbnail_type
       FROM client_project_access cpa
       JOIN projects p ON p.id = cpa.project_id
       WHERE cpa.client_id = ?
@@ -266,7 +283,10 @@ router.get('/client/projects', clientAuth, clientOnly, async (req, res) => {
       ORDER BY p.created_at DESC
     `, [req.user.id]);
 
-    res.json(projects);
+    res.json(projects.map(p => ({
+      ...p,
+      thumbnail_url: p.thumbnail_path ? toHttpsImageUrl(p.thumbnail_path, p.thumbnail_type || 'image') : null
+    })));
   } catch (err) {
     console.error('Client get projects error:', err.message);
     res.status(500).json({ message: 'Projects laane mein error' });
@@ -326,7 +346,30 @@ router.get('/client/projects/:id', clientAuth, clientOnly, async (req, res) => {
       ORDER BY pc.project_item_id, pc.stage_order
     `, [projectId]);
 
-    res.json({ project, items, tasks, chains });
+    // Images — task images grouped by item + stage
+    const [allImages] = await db.query(`
+      SELECT ti.id, ti.image_path, ti.image_type, ti.caption, ti.created_at,
+             ta.project_item_id, ta.department_id, ta.stage_order
+      FROM task_images ti
+      JOIN task_assignments ta ON ta.id = ti.task_id
+      WHERE ta.project_id = ?
+      ORDER BY ta.project_item_id, ta.stage_order, ti.created_at DESC
+    `, [projectId]);
+
+    // Group images: { "itemId_stageOrder_deptId": [images...] }
+    const imageMap = {};
+    allImages.forEach(img => {
+      const key = `${img.project_item_id}_${img.stage_order}_${img.department_id}`;
+      if (!imageMap[key]) imageMap[key] = [];
+      imageMap[key].push({
+        id: img.id,
+        image_url: toHttpsImageUrl(img.image_path),
+        caption: img.caption,
+        created_at: img.created_at
+      });
+    });
+
+    res.json({ project, items, tasks, chains, imageMap });
   } catch (err) {
     console.error('Client project detail error:', err.message);
     res.status(500).json({ message: 'Project detail laane mein error' });
