@@ -864,6 +864,72 @@ router.get('/projects/:id/images-by-stage', auth, async (req, res) => {
   }
 });
 
+// Get images grouped by project item — for admin Images tab (project-wise view)
+router.get('/projects/:id/images-by-item', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const projectId = req.params.id;
+
+    // Get all project items
+    const [items] = await db.query(
+      'SELECT id, item_name, proto_code FROM project_items WHERE project_id=? ORDER BY id',
+      [projectId]
+    );
+
+    if (items.length === 0) return res.json([]);
+
+    // Get all task images for this project with item + stage info
+    const [allImages] = await db.query(`
+      SELECT ti.id, ti.image_path, ti.image_type, ti.created_at,
+             u.name as uploaded_by_name,
+             ta.task_title, ta.department_id, ta.stage_order, ta.project_item_id,
+             d.name as dept_name, d.color as dept_color
+      FROM task_images ti
+      JOIN task_assignments ta ON ta.id = ti.task_id
+      JOIN users u ON u.id = ti.uploaded_by
+      LEFT JOIN departments d ON d.id = ta.department_id
+      WHERE ta.project_id = ?
+      ORDER BY ta.project_item_id, ta.stage_order, ti.created_at DESC
+    `, [projectId]);
+
+    // Build stage image map: { itemId: { stageKey: { stage info + images[] } } }
+    const stageImageMap = {};
+    allImages.forEach(img => {
+      const itemId = img.project_item_id;
+      const stageKey = img.stage_order + '_' + img.department_id;
+      if (!stageImageMap[itemId]) stageImageMap[itemId] = {};
+      if (!stageImageMap[itemId][stageKey]) {
+        stageImageMap[itemId][stageKey] = {
+          stage_order: img.stage_order,
+          dept_name: img.dept_name,
+          dept_color: img.dept_color,
+          images: []
+        };
+      }
+      stageImageMap[itemId][stageKey].images.push({
+        id: img.id,
+        image_url: toHttpsImageUrl(img.image_path),
+        task_title: img.task_title,
+        uploaded_by_name: img.uploaded_by_name,
+        created_at: img.created_at
+      });
+    });
+
+    // Build result: items with their stages and photos
+    const result = items.map(item => ({
+      item_id: item.id,
+      item_name: item.item_name,
+      proto_code: item.proto_code,
+      stages: Object.values(stageImageMap[item.id] || {}).sort((a, b) => a.stage_order - b.stage_order)
+    }));
+
+    res.json(result);
+  } catch(err) {
+    console.error('images-by-item error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ── CHANGE PASSWORD ─────────────────────────────────────────────────────────────
 router.put('/auth/change-password', auth, async (req, res) => {
   const db = await getPool();
