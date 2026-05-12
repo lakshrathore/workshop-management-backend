@@ -1971,9 +1971,11 @@ router.get('/reports/dashboard', auth, async (req, res) => {
 // Product tracking — stage-wise per product
 router.get('/reports/product-tracking', auth, async (req, res) => {
   const db = await getPool();
-  const { project_id } = req.query;
-  const where = project_id ? 'WHERE pi.project_id=?' : 'WHERE 1=1';
-  const params = project_id ? [project_id] : [];
+  const { project_id, proto_code } = req.query;
+  let where, params;
+  if (proto_code) { where = "WHERE LOWER(COALESCE(pi.proto_code,'')) LIKE ?"; params = ['%' + proto_code.toLowerCase() + '%']; }
+  else if (project_id) { where = 'WHERE pi.project_id=?'; params = [project_id]; }
+  else { where = 'WHERE 1=1'; params = []; }
   const [items] = await db.query(`
     SELECT pi.*,p.name as project_name,p.project_id as proj_code,p.client_name,p.status as project_status
     FROM project_items pi JOIN projects p ON p.id=pi.project_id ${where}
