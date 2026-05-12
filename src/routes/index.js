@@ -1977,7 +1977,9 @@ router.get('/reports/product-tracking', auth, async (req, res) => {
   else if (project_id) { where = 'WHERE pi.project_id=?'; params = [project_id]; }
   else { where = 'WHERE 1=1'; params = []; }
   const [items] = await db.query(`
-    SELECT pi.*,p.name as project_name,p.project_id as proj_code,p.client_name,p.status as project_status
+    SELECT pi.*,p.name as project_name,p.project_id as proj_code,p.client_name,p.status as project_status,
+      (SELECT pii.image_path FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_path,
+      (SELECT pii.resource_type FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_type
     FROM project_items pi JOIN projects p ON p.id=pi.project_id ${where}
     ORDER BY p.created_at DESC,pi.id`, params);
   if (!items.length) return res.json({ items: [], stages: [] });
@@ -2030,7 +2032,8 @@ router.get('/reports/product-tracking', auth, async (req, res) => {
     const overallPct = totalStages > 0
       ? Math.round(stages.reduce((sum, s) => sum + s.pct, 0) / totalStages)
       : 0;
-    return { ...item, stages, overallPct, doneStages, totalStages };
+    const thumbnail_url = item.thumbnail_path ? toHttpsImageUrl(item.thumbnail_path, item.thumbnail_type || 'image') : null;
+    return { ...item, stages, overallPct, doneStages, totalStages, thumbnail_url };
   });
   res.json({ items: result });
 });
