@@ -315,11 +315,18 @@ router.get('/client/projects/:id', clientAuth, clientOnly, async (req, res) => {
     );
     if (!project) return res.status(404).json({ message: 'Project nahi mila' });
 
-    // Project items
-    const [items] = await db.query(
-      'SELECT id, item_name, proto_code, description, quantity, unit, material, dimensions, status FROM project_items WHERE project_id = ? ORDER BY id',
-      [projectId]
-    );
+    // Project items with thumbnails
+    const [itemsRaw] = await db.query(`
+      SELECT pi.id, pi.item_name, pi.proto_code, pi.description, pi.quantity, pi.unit, pi.material, pi.dimensions, pi.status,
+        (SELECT pii.image_path FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_path,
+        (SELECT pii.resource_type FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_type
+      FROM project_items pi WHERE pi.project_id = ? ORDER BY pi.id
+    `, [projectId]);
+
+    const items = itemsRaw.map(item => ({
+      ...item,
+      thumbnail_url: item.thumbnail_path ? toHttpsImageUrl(item.thumbnail_path, item.thumbnail_type || 'image') : null
+    }));
 
     // Tasks — worker name nahi dikhana client ko, sirf department + progress
     const [tasks] = await db.query(`
