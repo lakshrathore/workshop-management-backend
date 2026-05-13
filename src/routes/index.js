@@ -33,7 +33,7 @@ function adminOnly(req, res, next) {
 }
 
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
-const { imgUpload, galleryUpload, moReferenceUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
+const { imgUpload, galleryUpload, moReferenceUpload, clientPoUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 const auditLog = require('../middleware/auditLog');
 const { sendEmail, emailAdmins, getAdminEmails, getWorkerEmail, taskAssignedEmail, taskProgressEmail, taskCompletedEmail, itemCompletedEmail } = require('../services/emailService');
 
@@ -3842,3 +3842,368 @@ router.get('/audit/summary', auth, adminOnly, async (req, res) => {
 });
 
 module.exports = router;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLIENT PURCHASE ORDERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function clientAuth(req, res, next) {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'No token' });
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { res.status(401).json({ message: 'Invalid token' }); }
+}
+function clientOnly(req, res, next) {
+  if (req.user.role !== 'client') return res.status(403).json({ message: 'Client only' });
+  next();
+}
+
+// Helper: notify all admins
+async function notifyAdmins(db, type, title, message, extraData = {}) {
+  try {
+    const [admins] = await db.query("SELECT id FROM users WHERE role='admin' AND is_active=1");
+    for (const admin of admins) {
+      await db.query(
+        `INSERT INTO notifications (user_id, type, title, message, project_id) VALUES (?,?,?,?,?)`,
+        [admin.id, type, title, message, extraData.project_id || null]
+      );
+    }
+  } catch(e) { console.error('notifyAdmins error:', e.message); }
+}
+
+// GET /api/client/purchase-orders — client's own POs
+router.get('/client/purchase-orders', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [pos] = await db.query(
+      `SELECT cpo.*, 
+        COALESCE((SELECT SUM(amount) FROM client_po_payments WHERE po_id=cpo.id),0) as paid_amount
+       FROM client_purchase_orders cpo
+       WHERE cpo.client_id=? ORDER BY cpo.created_at DESC`,
+      [req.user.id]
+    );
+    res.json(pos);
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /api/client/purchase-orders/:id — detail with payments
+router.get('/client/purchase-orders/:id', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[po]] = await db.query(
+      `SELECT * FROM client_purchase_orders WHERE id=? AND client_id=?`,
+      [req.params.id, req.user.id]
+    );
+    if (!po) return res.status(404).json({ message: 'Not found' });
+    const [payments] = await db.query(
+      `SELECT * FROM client_po_payments WHERE po_id=? ORDER BY payment_date ASC`,
+      [req.params.id]
+    );
+    res.json({ ...po, payments });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/client/purchase-orders — create with PDF upload
+router.post('/client/purchase-orders', clientAuth, clientOnly, clientPoUpload.single('pdf'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const { po_number, order_date, due_date, remark, total_amount } = req.body;
+    if (!po_number || !order_date) return res.status(400).json({ message: 'PO number and date required' });
+
+    // Check duplicate PO number for this client
+    const [[dup]] = await db.query(
+      'SELECT id FROM client_purchase_orders WHERE po_number=? AND client_id=?',
+      [po_number, req.user.id]
+    );
+    if (dup) return res.status(400).json({ message: 'PO number already exists' });
+
+    let pdf_url = null, pdf_public_id = null;
+    if (req.file) {
+      pdf_url = req.file.path || req.file.secure_url || req.file.url;
+      pdf_public_id = req.file.filename || req.file.public_id;
+    }
+
+    const [result] = await db.query(
+      `INSERT INTO client_purchase_orders (po_number,client_id,order_date,due_date,remark,pdf_url,pdf_public_id,total_amount)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [po_number, req.user.id, order_date, due_date||null, remark||'', pdf_url, pdf_public_id, total_amount||0]
+    );
+
+    // Get client name for notification
+    const [[client]] = await db.query('SELECT name FROM users WHERE id=?', [req.user.id]);
+    await notifyAdmins(db, 'client_po', `New Purchase Order from ${client.name}`,
+      `PO #${po_number} submitted${remark ? ': ' + remark.substring(0,80) : ''}`, {});
+
+    res.json({ id: result.insertId, message: 'Purchase order submitted successfully' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/client/purchase-orders/:id/payments — add payment
+router.post('/client/purchase-orders/:id/payments', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[po]] = await db.query(
+      'SELECT * FROM client_purchase_orders WHERE id=? AND client_id=?',
+      [req.params.id, req.user.id]
+    );
+    if (!po) return res.status(404).json({ message: 'PO not found' });
+
+    const { payment_date, amount, payment_mode, bank_name, cheque_number, utr_reference, remark } = req.body;
+    if (!payment_date || !amount) return res.status(400).json({ message: 'Date and amount required' });
+
+    // Determine if advance: payment_date < po.order_date
+    const isAdvance = new Date(payment_date) < new Date(po.order_date) ? 1 : 0;
+
+    await db.query(
+      `INSERT INTO client_po_payments (po_id,client_id,payment_date,amount,payment_mode,bank_name,cheque_number,utr_reference,remark,is_advance)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [req.params.id, req.user.id, payment_date, amount, payment_mode||'bank_transfer',
+       bank_name||'', cheque_number||'', utr_reference||'', remark||'', isAdvance]
+    );
+
+    const [[client]] = await db.query('SELECT name FROM users WHERE id=?', [req.user.id]);
+    await notifyAdmins(db, 'client_payment',
+      `Payment received from ${client.name}`,
+      `₹${amount} for PO #${po.po_number} via ${payment_mode||'bank'}`, {}
+    );
+
+    res.json({ message: 'Payment recorded', is_advance: isAdvance });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// DELETE /api/client/purchase-orders/:id/payments/:pid
+router.delete('/client/purchase-orders/:id/payments/:pid', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    await db.query(
+      'DELETE FROM client_po_payments WHERE id=? AND client_id=?',
+      [req.params.pid, req.user.id]
+    );
+    res.json({ message: 'Payment deleted' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── ADMIN: view all client POs ─────────────────────────────────────────────
+router.get('/admin/client-purchase-orders', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [pos] = await db.query(
+      `SELECT cpo.*, u.name as client_name,
+        COALESCE((SELECT SUM(amount) FROM client_po_payments WHERE po_id=cpo.id),0) as paid_amount
+       FROM client_purchase_orders cpo
+       JOIN users u ON u.id=cpo.client_id
+       ORDER BY cpo.created_at DESC`
+    );
+    res.json(pos);
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+router.get('/admin/client-purchase-orders/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[po]] = await db.query(
+      `SELECT cpo.*, u.name as client_name, u.phone as client_phone
+       FROM client_purchase_orders cpo JOIN users u ON u.id=cpo.client_id WHERE cpo.id=?`,
+      [req.params.id]
+    );
+    if (!po) return res.status(404).json({ message: 'Not found' });
+    const [payments] = await db.query(
+      'SELECT * FROM client_po_payments WHERE po_id=? ORDER BY payment_date ASC',
+      [req.params.id]
+    );
+    res.json({ ...po, payments });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+router.patch('/admin/client-purchase-orders/:id/status', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { status } = req.body;
+    await db.query('UPDATE client_purchase_orders SET status=? WHERE id=?', [status, req.params.id]);
+    res.json({ message: 'Status updated' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLIENT SUPPORT TICKETS (CHAT)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/client/tickets
+router.get('/client/tickets', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [tickets] = await db.query(
+      `SELECT ct.*, p.name as project_name,
+         (SELECT COUNT(*) FROM client_ticket_messages WHERE ticket_id=ct.id) as msg_count,
+         (SELECT COUNT(*) FROM client_ticket_messages WHERE ticket_id=ct.id AND sender_role='admin' AND is_read=0) as unread_admin
+       FROM client_tickets ct
+       LEFT JOIN projects p ON p.id=ct.project_id
+       WHERE ct.client_id=? ORDER BY ct.updated_at DESC`,
+      [req.user.id]
+    );
+    res.json(tickets);
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/client/tickets — create new ticket
+router.post('/client/tickets', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { subject, project_id, priority, message } = req.body;
+    if (!subject || !message) return res.status(400).json({ message: 'Subject and message required' });
+
+    const [r] = await db.query(
+      `INSERT INTO client_tickets (client_id, project_id, subject, priority) VALUES (?,?,?,?)`,
+      [req.user.id, project_id||null, subject, priority||'medium']
+    );
+    const ticketId = r.insertId;
+
+    await db.query(
+      `INSERT INTO client_ticket_messages (ticket_id, sender_id, sender_role, message) VALUES (?,?,?,?)`,
+      [ticketId, req.user.id, 'client', message]
+    );
+
+    const [[client]] = await db.query('SELECT name FROM users WHERE id=?', [req.user.id]);
+    await notifyAdmins(db, 'client_ticket',
+      `🎫 New support ticket from ${client.name}`,
+      `${subject}: ${message.substring(0,100)}`,
+      { project_id: project_id||null }
+    );
+
+    res.json({ id: ticketId, message: 'Ticket created' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /api/client/tickets/:id — ticket + messages
+router.get('/client/tickets/:id', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[ticket]] = await db.query(
+      `SELECT ct.*, p.name as project_name FROM client_tickets ct
+       LEFT JOIN projects p ON p.id=ct.project_id
+       WHERE ct.id=? AND ct.client_id=?`,
+      [req.params.id, req.user.id]
+    );
+    if (!ticket) return res.status(404).json({ message: 'Not found' });
+    const [messages] = await db.query(
+      'SELECT * FROM client_ticket_messages WHERE ticket_id=? ORDER BY created_at ASC',
+      [req.params.id]
+    );
+    // Mark admin messages as read
+    await db.query(
+      `UPDATE client_ticket_messages SET is_read=1 WHERE ticket_id=? AND sender_role='admin' AND is_read=0`,
+      [req.params.id]
+    );
+    res.json({ ...ticket, messages });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/client/tickets/:id/messages — client sends message
+router.post('/client/tickets/:id/messages', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[ticket]] = await db.query(
+      'SELECT * FROM client_tickets WHERE id=? AND client_id=?',
+      [req.params.id, req.user.id]
+    );
+    if (!ticket) return res.status(404).json({ message: 'Not found' });
+    const { message } = req.body;
+    if (!message?.trim()) return res.status(400).json({ message: 'Message required' });
+
+    await db.query(
+      `INSERT INTO client_ticket_messages (ticket_id, sender_id, sender_role, message) VALUES (?,?,?,?)`,
+      [req.params.id, req.user.id, 'client', message]
+    );
+    await db.query('UPDATE client_tickets SET updated_at=NOW(), status=IF(status="closed","open",status) WHERE id=?', [req.params.id]);
+
+    const [[client]] = await db.query('SELECT name FROM users WHERE id=?', [req.user.id]);
+    await notifyAdmins(db, 'client_ticket_reply',
+      `💬 Reply from ${client.name}`,
+      `Ticket: ${ticket.subject} — ${message.substring(0,80)}`,
+      {}
+    );
+
+    res.json({ message: 'Message sent' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── ADMIN: all tickets ─────────────────────────────────────────────────────
+router.get('/admin/tickets', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { status } = req.query;
+    let q = `SELECT ct.*, u.name as client_name, p.name as project_name,
+       (SELECT COUNT(*) FROM client_ticket_messages WHERE ticket_id=ct.id) as msg_count,
+       (SELECT COUNT(*) FROM client_ticket_messages WHERE ticket_id=ct.id AND sender_role='client' AND is_read=0) as unread_client
+     FROM client_tickets ct
+     JOIN users u ON u.id=ct.client_id
+     LEFT JOIN projects p ON p.id=ct.project_id`;
+    const params = [];
+    if (status) { q += ' WHERE ct.status=?'; params.push(status); }
+    q += ' ORDER BY ct.updated_at DESC';
+    const [tickets] = await db.query(q, params);
+    res.json(tickets);
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+router.get('/admin/tickets/:id', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[ticket]] = await db.query(
+      `SELECT ct.*, u.name as client_name, p.name as project_name
+       FROM client_tickets ct JOIN users u ON u.id=ct.client_id
+       LEFT JOIN projects p ON p.id=ct.project_id WHERE ct.id=?`,
+      [req.params.id]
+    );
+    if (!ticket) return res.status(404).json({ message: 'Not found' });
+    const [messages] = await db.query(
+      'SELECT * FROM client_ticket_messages WHERE ticket_id=? ORDER BY created_at ASC',
+      [req.params.id]
+    );
+    // Mark client messages as read
+    await db.query(
+      `UPDATE client_ticket_messages SET is_read=1 WHERE ticket_id=? AND sender_role='client' AND is_read=0`,
+      [req.params.id]
+    );
+    res.json({ ...ticket, messages });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /api/admin/tickets/:id/messages — admin replies
+router.post('/admin/tickets/:id/messages', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { message } = req.body;
+    if (!message?.trim()) return res.status(400).json({ message: 'Message required' });
+
+    const [[ticket]] = await db.query('SELECT * FROM client_tickets WHERE id=?', [req.params.id]);
+    if (!ticket) return res.status(404).json({ message: 'Not found' });
+
+    await db.query(
+      `INSERT INTO client_ticket_messages (ticket_id, sender_id, sender_role, message) VALUES (?,?,?,?)`,
+      [req.params.id, req.user.id, 'admin', message]
+    );
+    await db.query(
+      "UPDATE client_tickets SET updated_at=NOW(), status=IF(status='open','in_progress',status) WHERE id=?",
+      [req.params.id]
+    );
+
+    // Notify client
+    await db.query(
+      `INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)`,
+      [ticket.client_id, 'ticket_reply', '💬 Admin replied to your ticket', `${ticket.subject}: ${message.substring(0,80)}`]
+    );
+
+    res.json({ message: 'Reply sent' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+router.patch('/admin/tickets/:id/status', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { status } = req.body;
+    await db.query('UPDATE client_tickets SET status=? WHERE id=?', [status, req.params.id]);
+    res.json({ message: 'Status updated' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+

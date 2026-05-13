@@ -572,6 +572,70 @@ async function initializeDatabase() {
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_email', '')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_address', '')").catch(()=>{});
 
+
+  // ── CLIENT PURCHASE ORDERS (client-submitted with PDF) ────────────────────
+  await db.query(`CREATE TABLE IF NOT EXISTS client_purchase_orders (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    po_number VARCHAR(100) NOT NULL,
+    client_id INT NOT NULL,
+    order_date DATE NOT NULL,
+    due_date DATE,
+    remark TEXT,
+    pdf_url VARCHAR(500),
+    pdf_public_id VARCHAR(300),
+    status ENUM('pending','acknowledged','processing','completed','cancelled') DEFAULT 'pending',
+    total_amount DECIMAL(12,2) DEFAULT 0,
+    paid_amount DECIMAL(12,2) DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (client_id) REFERENCES users(id) ON DELETE CASCADE
+  )`);
+
+  // ── CLIENT PO PAYMENTS ────────────────────────────────────────────────────
+  await db.query(`CREATE TABLE IF NOT EXISTS client_po_payments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    po_id INT NOT NULL,
+    client_id INT NOT NULL,
+    payment_date DATE NOT NULL,
+    amount DECIMAL(12,2) NOT NULL,
+    payment_mode ENUM('bank_transfer','cheque','upi','cash','other') DEFAULT 'bank_transfer',
+    bank_name VARCHAR(255),
+    cheque_number VARCHAR(100),
+    utr_reference VARCHAR(255),
+    remark TEXT,
+    is_advance TINYINT(1) DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (po_id) REFERENCES client_purchase_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (client_id) REFERENCES users(id) ON DELETE CASCADE
+  )`);
+
+  // ── CLIENT SUPPORT TICKETS (chat-style) ──────────────────────────────────
+  await db.query(`CREATE TABLE IF NOT EXISTS client_tickets (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    client_id INT NOT NULL,
+    project_id INT,
+    subject VARCHAR(255) NOT NULL,
+    status ENUM('open','in_progress','resolved','closed') DEFAULT 'open',
+    priority ENUM('low','medium','high','urgent') DEFAULT 'medium',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (client_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
+  )`);
+
+  // ── CLIENT TICKET MESSAGES ────────────────────────────────────────────────
+  await db.query(`CREATE TABLE IF NOT EXISTS client_ticket_messages (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    ticket_id INT NOT NULL,
+    sender_id INT NOT NULL,
+    sender_role ENUM('client','admin') NOT NULL,
+    message TEXT NOT NULL,
+    is_read TINYINT(1) DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (ticket_id) REFERENCES client_tickets(id) ON DELETE CASCADE,
+    FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
+  )`);
+
   console.log('✅ Workshop App Database initialized');
   return db;
 }

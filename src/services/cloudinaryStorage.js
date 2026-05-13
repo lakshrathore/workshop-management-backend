@@ -91,6 +91,28 @@ const moReferenceUpload = multer({
   },
 });
 
+
+// Client PO PDF uploader (PDF only, max 20MB)
+const clientPoUpload = multer({
+  storage: new CloudinaryStorage({
+    cloudinary,
+    params: async (req, file) => ({
+      folder: 'workshop/client-po',
+      resource_type: 'raw',
+      allowed_formats: ['pdf'],
+      public_id: `client_po_${Date.now()}`,
+    }),
+  }),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/\.pdf$/i.test(file.originalname) || file.mimetype === 'application/pdf') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are allowed'), false);
+    }
+  },
+});
+
 // Delete file from Cloudinary by public_id
 async function deleteFile(publicId) {
   try {
@@ -106,4 +128,4 @@ function getFileUrl(publicId) {
   return cloudinary.url(publicId, { secure: true });
 }
 
-module.exports = { imgUpload, galleryUpload, licenseUpload, moReferenceUpload, getFileUrl, deleteFile };
+module.exports = { imgUpload, galleryUpload, licenseUpload, moReferenceUpload, clientPoUpload, getFileUrl, deleteFile };
