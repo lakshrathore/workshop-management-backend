@@ -4102,9 +4102,10 @@ router.post('/admin/client-purchase-orders/:id/create-project', auth, adminOnly,
     }
     const finalProjectId = `${prefix}-${year}-${nextNum}`;
 
+    const { protocol_code } = req.body;
     const [r] = await db.query(
-      'INSERT INTO projects (project_id,name,client_name,client_phone,priority,created_by,is_ready,status) VALUES (?,?,?,?,?,?,?,?)',
-      [finalProjectId, projectName, po.client_user_name, po.client_user_phone||'', 'medium', req.user.id, 0, 'inactive']
+      'INSERT INTO projects (project_id,name,client_name,client_phone,priority,created_by,is_ready,status,protocol_code) VALUES (?,?,?,?,?,?,?,?,?)',
+      [finalProjectId, projectName, po.client_user_name, po.client_user_phone||'', 'medium', req.user.id, 0, 'inactive', protocol_code||null]
     );
 
     // Link project to this PO
