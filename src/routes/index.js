@@ -3841,8 +3841,6 @@ router.get('/audit/summary', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-module.exports = router;
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // CLIENT PURCHASE ORDERS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3980,6 +3978,27 @@ router.delete('/client/purchase-orders/:id/payments/:pid', clientAuth, clientOnl
       [req.params.pid, req.user.id]
     );
     res.json({ message: 'Payment deleted' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// DELETE /api/client/purchase-orders/:id — client deletes their own PO (only if pending)
+router.delete('/client/purchase-orders/:id', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[po]] = await db.query(
+      'SELECT * FROM client_purchase_orders WHERE id=? AND client_id=?',
+      [req.params.id, req.user.id]
+    );
+    if (!po) return res.status(404).json({ message: 'Purchase order not found' });
+    if (po.status !== 'pending') {
+      return res.status(400).json({ message: 'Only pending orders can be deleted' });
+    }
+    // Delete PDF from Cloudinary if stored
+    if (po.pdf_public_id) {
+      try { await deleteFile(po.pdf_public_id); } catch(e) { /* ignore */ }
+    }
+    await db.query('DELETE FROM client_purchase_orders WHERE id=?', [req.params.id]);
+    res.json({ message: 'Purchase order deleted' });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -4207,3 +4226,4 @@ router.patch('/admin/tickets/:id/status', auth, adminOnly, async (req, res) => {
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
+module.exports = router;
