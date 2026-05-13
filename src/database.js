@@ -409,6 +409,27 @@ async function initializeDatabase() {
   await safeAlter("ALTER TABLE packing_boxes ADD COLUMN sub_label VARCHAR(10) DEFAULT NULL COMMENT 'A, B, C etc for sub-boxes'");
   await safeAlter("ALTER TABLE project_item_images ADD COLUMN resource_type VARCHAR(20) DEFAULT 'image'");
 
+  // ── NEW COLUMNS: Client Purchase Orders — item/tax/project fields ──────────
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN item_name VARCHAR(255) DEFAULT ''");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN quantity DECIMAL(10,3) DEFAULT NULL");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN taxable_value DECIMAL(12,2) DEFAULT NULL");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN tax_rate DECIMAL(5,2) DEFAULT NULL");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN cgst DECIMAL(12,2) DEFAULT NULL");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN sgst DECIMAL(12,2) DEFAULT NULL");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN igst DECIMAL(12,2) DEFAULT NULL");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN project_name VARCHAR(255) DEFAULT ''");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN linked_project_id INT DEFAULT NULL");
+
+  // ── NEW COLUMNS: Sale Challans — client portal send + pdf + gst split ──────
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN sent_to_client TINYINT(1) DEFAULT 0");
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN sent_client_id INT DEFAULT NULL");
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN sent_at DATETIME DEFAULT NULL");
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN pdf_url VARCHAR(500) DEFAULT NULL");
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN cgst DECIMAL(12,2) DEFAULT NULL");
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN sgst DECIMAL(12,2) DEFAULT NULL");
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN igst DECIMAL(12,2) DEFAULT NULL");
+  await safeAlter("ALTER TABLE sale_challans MODIFY COLUMN challan_type ENUM('sale','delivery','proforma') DEFAULT 'delivery'");
+
   // Packing Boxes table — manual + auto box management
   await db.query(`CREATE TABLE IF NOT EXISTS packing_boxes (
     id INT AUTO_INCREMENT PRIMARY KEY,

@@ -3504,12 +3504,13 @@ router.post('/sale-challans', auth, adminOnly, auditLog('CREATE','SaleChallan'),
     const [r] = await db.query(
       `INSERT INTO sale_challans (challan_number,client_name,client_phone,client_address,client_gstin,challan_type,
         project_id,challan_date,delivery_date,status,subtotal,tax_percent,tax_amount,discount_amount,
-        total_amount,transport_name,vehicle_number,notes,created_by)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        total_amount,transport_name,vehicle_number,notes,cgst,sgst,igst,created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [challan_number, client_name.trim(), client_phone||'', client_address||'', client_gstin||'',
         challan_type||'delivery', project_id||null, challan_date, delivery_date||null, status||'draft',
         subtotal, taxPct, tax_amount, disc, total_amount,
-        transport_name||'', vehicle_number||'', notes||'', req.user.id]
+        transport_name||'', vehicle_number||'', notes||'',
+        req.body.cgst||null, req.body.sgst||null, req.body.igst||null, req.user.id]
     );
     const challanId = r.insertId;
     for (let i = 0; i < items.length; i++) {
@@ -3545,11 +3546,13 @@ router.put('/sale-challans/:id', auth, adminOnly, auditLog('UPDATE','SaleChallan
     await db.query(
       `UPDATE sale_challans SET client_name=?,client_phone=?,client_address=?,client_gstin=?,challan_type=?,
         project_id=?,challan_date=?,delivery_date=?,status=?,subtotal=?,tax_percent=?,
-        tax_amount=?,discount_amount=?,total_amount=?,transport_name=?,vehicle_number=?,notes=? WHERE id=?`,
+        tax_amount=?,discount_amount=?,total_amount=?,transport_name=?,vehicle_number=?,notes=?,
+        cgst=?,sgst=?,igst=? WHERE id=?`,
       [client_name.trim(), client_phone||'', client_address||'', client_gstin||'', challan_type||'delivery',
         project_id||null, challan_date, delivery_date||null, status||'draft',
         subtotal, taxPct, tax_amount, disc, total_amount,
-        transport_name||'', vehicle_number||'', notes||'', req.params.id]
+        transport_name||'', vehicle_number||'', notes||'',
+        req.body.cgst||null, req.body.sgst||null, req.body.igst||null, req.params.id]
     );
     await db.query('DELETE FROM sale_challan_items WHERE challan_id=?', [req.params.id]);
     for (let i = 0; i < items.length; i++) {
@@ -3905,7 +3908,10 @@ router.get('/client/purchase-orders/:id', clientAuth, clientOnly, async (req, re
 router.post('/client/purchase-orders', clientAuth, clientOnly, clientPoUpload.single('pdf'), async (req, res) => {
   const db = await getPool();
   try {
-    const { po_number, order_date, due_date, remark, total_amount } = req.body;
+    const {
+      po_number, order_date, due_date, remark, total_amount,
+      item_name, quantity, taxable_value, tax_rate, cgst, sgst, igst, project_name
+    } = req.body;
     if (!po_number || !order_date) return res.status(400).json({ message: 'PO number and date required' });
 
     // Check duplicate PO number for this client
@@ -3921,16 +3927,29 @@ router.post('/client/purchase-orders', clientAuth, clientOnly, clientPoUpload.si
       pdf_public_id = req.file.filename || req.file.public_id;
     }
 
+    // Auto-calculate total if not provided
+    let finalTotal = parseFloat(total_amount) || 0;
+    if (!finalTotal && taxable_value) {
+      const tv = parseFloat(taxable_value) || 0;
+      const cg = parseFloat(cgst) || 0;
+      const sg = parseFloat(sgst) || 0;
+      const ig = parseFloat(igst) || 0;
+      finalTotal = tv + cg + sg + ig;
+    }
+
     const [result] = await db.query(
-      `INSERT INTO client_purchase_orders (po_number,client_id,order_date,due_date,remark,pdf_url,pdf_public_id,total_amount)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [po_number, req.user.id, order_date, due_date||null, remark||'', pdf_url, pdf_public_id, total_amount||0]
+      `INSERT INTO client_purchase_orders
+        (po_number,client_id,order_date,due_date,remark,pdf_url,pdf_public_id,total_amount,
+         item_name,quantity,taxable_value,tax_rate,cgst,sgst,igst,project_name)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [po_number, req.user.id, order_date, due_date||null, remark||'', pdf_url, pdf_public_id, finalTotal,
+       item_name||'', quantity||null, taxable_value||null, tax_rate||null, cgst||null, sgst||null, igst||null, project_name||'']
     );
 
     // Get client name for notification
     const [[client]] = await db.query('SELECT name FROM users WHERE id=?', [req.user.id]);
     await notifyAdmins(db, 'client_po', `New Purchase Order from ${client.name}`,
-      `PO #${po_number} submitted${remark ? ': ' + remark.substring(0,80) : ''}`, {});
+      `PO #${po_number}${project_name ? ' — Project: '+project_name : ''}${remark ? ' — '+remark.substring(0,60) : ''}`, {});
 
     res.json({ id: result.insertId, message: 'Purchase order submitted successfully' });
   } catch(e) { res.status(500).json({ message: e.message }); }
@@ -4040,6 +4059,153 @@ router.patch('/admin/client-purchase-orders/:id/status', auth, adminOnly, async 
     const { status } = req.body;
     await db.query('UPDATE client_purchase_orders SET status=? WHERE id=?', [status, req.params.id]);
     res.json({ message: 'Status updated' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// PATCH /admin/client-purchase-orders/:id/project-name — admin edits project name from PO
+router.patch('/admin/client-purchase-orders/:id/project-name', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { project_name } = req.body;
+    await db.query('UPDATE client_purchase_orders SET project_name=? WHERE id=?', [project_name||'', req.params.id]);
+    res.json({ message: 'Project name updated' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /admin/client-purchase-orders/:id/create-project — admin creates a project from this PO
+router.post('/admin/client-purchase-orders/:id/create-project', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[po]] = await db.query(
+      `SELECT cpo.*, u.name as client_user_name, u.phone as client_user_phone
+       FROM client_purchase_orders cpo JOIN users u ON u.id=cpo.client_id WHERE cpo.id=?`,
+      [req.params.id]
+    );
+    if (!po) return res.status(404).json({ message: 'PO not found' });
+
+    const projectName = po.project_name || po.po_number;
+
+    // Auto-generate project_id
+    const [settings] = await db.query(
+      "SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('project_id_prefix','project_id_start_number')"
+    );
+    const sm = {}; settings.forEach(s => sm[s.setting_key] = s.setting_value);
+    const prefix = sm.project_id_prefix || 'WM';
+    const startNum = parseInt(sm.project_id_start_number || '1001');
+    const year = new Date().getFullYear().toString().slice(-2);
+    const [last] = await db.query('SELECT project_id FROM projects ORDER BY id DESC LIMIT 1');
+    let nextNum = startNum;
+    if (last.length > 0) {
+      const match = last[0].project_id?.match(/\d+$/);
+      if (match) nextNum = parseInt(match[0]) + 1;
+    }
+    const finalProjectId = `${prefix}-${year}-${nextNum}`;
+
+    const [r] = await db.query(
+      'INSERT INTO projects (project_id,name,client_name,client_phone,priority,created_by,is_ready,status) VALUES (?,?,?,?,?,?,?,?)',
+      [finalProjectId, projectName, po.client_user_name, po.client_user_phone||'', 'medium', req.user.id, 0, 'inactive']
+    );
+
+    // Link project to this PO
+    await db.query('UPDATE client_purchase_orders SET linked_project_id=? WHERE id=?', [r.insertId, req.params.id]);
+
+    res.json({ id: r.insertId, project_id: finalProjectId, message: 'Project created successfully' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST /admin/client-purchase-orders/:id/create-items — admin creates project items from PO line items
+router.post('/admin/client-purchase-orders/:id/create-items', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { project_id, items } = req.body;
+    if (!project_id || !items?.length) return res.status(400).json({ message: 'project_id and items required' });
+
+    const [[project]] = await db.query('SELECT id FROM projects WHERE id=?', [project_id]);
+    if (!project) return res.status(404).json({ message: 'Project not found' });
+
+    for (const item of items) {
+      if (!item.item_name?.trim()) continue;
+      await db.query(
+        'INSERT INTO project_items (project_id, item_name, description, quantity, unit) VALUES (?,?,?,?,?)',
+        [project_id, item.item_name.trim(), item.description||'', item.quantity||1, item.unit||'pcs']
+      );
+    }
+    res.json({ message: 'Items created successfully' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── SALE CHALLAN: Send to Client Portal ─────────────────────────────────────
+// PATCH /sale-challans/:id/send-to-client
+router.patch('/sale-challans/:id/send-to-client', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { client_id } = req.body;
+    if (!client_id) return res.status(400).json({ message: 'client_id required' });
+
+    const [[challan]] = await db.query('SELECT * FROM sale_challans WHERE id=?', [req.params.id]);
+    if (!challan) return res.status(404).json({ message: 'Challan not found' });
+
+    await db.query(
+      'UPDATE sale_challans SET sent_to_client=1, sent_client_id=?, sent_at=NOW() WHERE id=?',
+      [client_id, req.params.id]
+    );
+
+    // Notify the client
+    await db.query(
+      `INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)`,
+      [client_id, 'sale_invoice', '📄 New Sales Invoice', `Invoice ${challan.challan_number} has been shared with you`]
+    );
+
+    res.json({ message: 'Sent to client portal successfully' });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /client/sales — client views their sales invoices
+router.get('/client/sales', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [rows] = await db.query(`
+      SELECT sc.id, sc.challan_number, sc.challan_type, sc.challan_date, sc.delivery_date,
+        sc.status, sc.total_amount, sc.subtotal, sc.tax_percent, sc.tax_amount, sc.discount_amount,
+        sc.client_name, sc.notes, sc.pdf_url, sc.sent_at,
+        p.name as project_name, p.project_id as project_code,
+        (SELECT COUNT(*) FROM sale_challan_items WHERE challan_id=sc.id) as item_count
+      FROM sale_challans sc
+      LEFT JOIN projects p ON p.id = sc.project_id
+      WHERE sc.sent_to_client=1 AND sc.sent_client_id=?
+      ORDER BY sc.created_at DESC
+    `, [req.user.id]);
+    res.json(rows);
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /client/sales/:id — client views single sale invoice detail
+router.get('/client/sales/:id', clientAuth, clientOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[challan]] = await db.query(`
+      SELECT sc.*, p.name as project_name, p.project_id as project_code
+      FROM sale_challans sc
+      LEFT JOIN projects p ON p.id = sc.project_id
+      WHERE sc.id=? AND sc.sent_to_client=1 AND sc.sent_client_id=?
+    `, [req.params.id, req.user.id]);
+    if (!challan) return res.status(404).json({ message: 'Invoice not found' });
+    const [items] = await db.query(
+      'SELECT * FROM sale_challan_items WHERE challan_id=? ORDER BY sort_order, id',
+      [req.params.id]
+    );
+    res.json({ ...challan, items });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /admin/clients-list — lightweight client list for dropdowns
+router.get('/admin/clients-list', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [clients] = await db.query(
+      "SELECT id, name, username FROM users WHERE role='client' AND is_active=1 ORDER BY name"
+    );
+    res.json(clients);
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
