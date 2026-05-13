@@ -4084,7 +4084,9 @@ router.post('/admin/client-purchase-orders/:id/create-project', auth, adminOnly,
     );
     if (!po) return res.status(404).json({ message: 'PO not found' });
 
-    const projectName = po.project_name || po.po_number;
+    // Accept overrides from the admin preview screen
+    const { name: nameOverride, protocol_code, items: previewItems } = req.body;
+    const projectName = nameOverride?.trim() || po.project_name || po.po_number;
 
     // Auto-generate project_id
     const [settings] = await db.query(
@@ -4102,16 +4104,27 @@ router.post('/admin/client-purchase-orders/:id/create-project', auth, adminOnly,
     }
     const finalProjectId = `${prefix}-${year}-${nextNum}`;
 
-    const { protocol_code } = req.body;
     const [r] = await db.query(
       'INSERT INTO projects (project_id,name,client_name,client_phone,priority,created_by,is_ready,status,protocol_code) VALUES (?,?,?,?,?,?,?,?,?)',
       [finalProjectId, projectName, po.client_user_name, po.client_user_phone||'', 'medium', req.user.id, 0, 'inactive', protocol_code||null]
     );
+    const projectDbId = r.insertId;
 
-    // Link project to this PO
-    await db.query('UPDATE client_purchase_orders SET linked_project_id=? WHERE id=?', [r.insertId, req.params.id]);
+    // Create items if provided
+    if (Array.isArray(previewItems) && previewItems.length > 0) {
+      for (const item of previewItems) {
+        if (!item.item_name?.trim()) continue;
+        await db.query(
+          'INSERT INTO project_items (project_id, item_name, description, quantity, unit) VALUES (?,?,?,?,?)',
+          [projectDbId, item.item_name.trim(), item.description||'', item.quantity||1, item.unit||'pcs']
+        );
+      }
+    }
 
-    res.json({ id: r.insertId, project_id: finalProjectId, message: 'Project created successfully' });
+    // Link project back to this PO
+    await db.query('UPDATE client_purchase_orders SET linked_project_id=? WHERE id=?', [projectDbId, req.params.id]);
+
+    res.json({ id: projectDbId, project_id: finalProjectId, message: 'Project created successfully' });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
