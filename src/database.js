@@ -419,6 +419,7 @@ async function initializeDatabase() {
   await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN igst DECIMAL(12,2) DEFAULT NULL");
   await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN project_name VARCHAR(255) DEFAULT ''");
   await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN linked_project_id INT DEFAULT NULL");
+  await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN items_json LONGTEXT DEFAULT NULL");
 
   // ── NEW COLUMNS: Sale Challans — client portal send + pdf + gst split ──────
   await safeAlter("ALTER TABLE sale_challans ADD COLUMN sent_to_client TINYINT(1) DEFAULT 0");

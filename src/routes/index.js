@@ -3910,7 +3910,7 @@ router.post('/client/purchase-orders', clientAuth, clientOnly, clientPoUpload.si
   try {
     const {
       po_number, order_date, due_date, remark, total_amount,
-      item_name, quantity, taxable_value, tax_rate, cgst, sgst, igst, project_name
+      item_name, quantity, taxable_value, tax_rate, cgst, sgst, igst, project_name, items_json
     } = req.body;
     if (!po_number || !order_date) return res.status(400).json({ message: 'PO number and date required' });
 
@@ -3940,10 +3940,11 @@ router.post('/client/purchase-orders', clientAuth, clientOnly, clientPoUpload.si
     const [result] = await db.query(
       `INSERT INTO client_purchase_orders
         (po_number,client_id,order_date,due_date,remark,pdf_url,pdf_public_id,total_amount,
-         item_name,quantity,taxable_value,tax_rate,cgst,sgst,igst,project_name)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         item_name,quantity,taxable_value,tax_rate,cgst,sgst,igst,project_name,items_json)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [po_number, req.user.id, order_date, due_date||null, remark||'', pdf_url, pdf_public_id, finalTotal,
-       item_name||'', quantity||null, taxable_value||null, tax_rate||null, cgst||null, sgst||null, igst||null, project_name||'']
+       item_name||'', quantity||null, taxable_value||null, tax_rate||null, cgst||null, sgst||null, igst||null,
+       project_name||'', items_json||null]
     );
 
     // Get client name for notification
