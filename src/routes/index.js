@@ -4041,8 +4041,13 @@ router.get('/admin/client-purchase-orders/:id', auth, adminOnly, async (req, res
   const db = await getPool();
   try {
     const [[po]] = await db.query(
-      `SELECT cpo.*, u.name as client_name, u.phone as client_phone
-       FROM client_purchase_orders cpo JOIN users u ON u.id=cpo.client_id WHERE cpo.id=?`,
+      `SELECT cpo.*,
+        u.name as client_name, u.phone as client_phone,
+        CASE WHEN p.id IS NOT NULL THEN cpo.linked_project_id ELSE NULL END as linked_project_id
+       FROM client_purchase_orders cpo
+       JOIN users u ON u.id = cpo.client_id
+       LEFT JOIN projects p ON p.id = cpo.linked_project_id
+       WHERE cpo.id = ?`,
       [req.params.id]
     );
     if (!po) return res.status(404).json({ message: 'Not found' });
