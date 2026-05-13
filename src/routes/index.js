@@ -4115,8 +4115,8 @@ router.post('/admin/client-purchase-orders/:id/create-project', auth, adminOnly,
       for (const item of previewItems) {
         if (!item.item_name?.trim()) continue;
         await db.query(
-          'INSERT INTO project_items (project_id, item_name, description, quantity, unit) VALUES (?,?,?,?,?)',
-          [projectDbId, item.item_name.trim(), item.description||'', item.quantity||1, item.unit||'pcs']
+          'INSERT INTO project_items (project_id, item_name, proto_code, description, quantity, unit) VALUES (?,?,?,?,?,?)',
+          [projectDbId, item.item_name.trim(), item.proto_code||'', item.description||'', item.quantity||1, item.unit||'pcs']
         );
       }
     }
