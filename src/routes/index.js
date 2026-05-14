@@ -4199,17 +4199,26 @@ router.patch('/sale-challans/:id/send-to-client', auth, adminOnly, async (req, r
 router.get('/client/sales', clientAuth, clientOnly, async (req, res) => {
   const db = await getPool();
   try {
+    // Get client's own name as a fallback match (in case sent_client_id was not stored)
+    const [[clientUser]] = await db.query('SELECT name, username FROM users WHERE id=?', [req.user.id]);
+    const clientName = clientUser?.name || '';
+
     const [rows] = await db.query(`
       SELECT sc.id, sc.challan_number, sc.challan_type, sc.challan_date, sc.delivery_date,
         sc.status, sc.total_amount, sc.subtotal, sc.tax_percent, sc.tax_amount, sc.discount_amount,
-        sc.client_name, sc.notes, sc.pdf_url, sc.sent_at, sc.send_type,
+        sc.client_name, sc.notes, sc.pdf_url, sc.sent_at, sc.send_type, sc.sent_to_client, sc.sent_client_id,
         p.name as project_name, p.project_id as project_code,
         (SELECT COUNT(*) FROM sale_challan_items WHERE challan_id=sc.id) as item_count
       FROM sale_challans sc
       LEFT JOIN projects p ON p.id = sc.project_id
-      WHERE sc.sent_to_client=1 AND sc.sent_client_id=?
+      WHERE sc.sent_to_client = 1
+        AND sc.challan_type = 'sale'
+        AND (
+          sc.sent_client_id = ?
+          OR (sc.sent_client_id IS NULL AND LOWER(TRIM(sc.client_name)) = LOWER(TRIM(?)))
+        )
       ORDER BY sc.created_at DESC
-    `, [req.user.id]);
+    `, [req.user.id, clientName]);
     res.json(rows);
   } catch(e) { res.status(500).json({ message: e.message }); }
 });

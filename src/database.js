@@ -432,6 +432,10 @@ async function initializeDatabase() {
   await safeAlter("ALTER TABLE sale_challans ADD COLUMN sgst DECIMAL(12,2) DEFAULT NULL");
   await safeAlter("ALTER TABLE sale_challans ADD COLUMN igst DECIMAL(12,2) DEFAULT NULL");
   await safeAlter("ALTER TABLE sale_challans MODIFY COLUMN challan_type ENUM('sale','delivery','proforma') DEFAULT 'delivery'");
+  // Per-item tax rate for sale challan items
+  await safeAlter("ALTER TABLE sale_challan_items ADD COLUMN tax_rate DECIMAL(5,2) DEFAULT 0");
+  // Extend users role ENUM to include client
+  await safeAlter("ALTER TABLE users MODIFY COLUMN role ENUM('admin','worker','client') DEFAULT 'worker'");
 
   // Packing Boxes table — manual + auto box management
   await db.query(`CREATE TABLE IF NOT EXISTS packing_boxes (
