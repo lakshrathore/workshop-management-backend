@@ -3892,7 +3892,9 @@ router.get('/client/purchase-orders/:id', clientAuth, clientOnly, async (req, re
   const db = await getPool();
   try {
     const [[po]] = await db.query(
-      `SELECT * FROM client_purchase_orders WHERE id=? AND client_id=?`,
+      `SELECT cpo.*,
+        COALESCE((SELECT COUNT(*) FROM project_items pi WHERE pi.project_id = cpo.linked_project_id), 0) as linked_project_item_count
+       FROM client_purchase_orders cpo WHERE cpo.id=? AND cpo.client_id=?`,
       [req.params.id, req.user.id]
     );
     if (!po) return res.status(404).json({ message: 'Not found' });
@@ -4043,7 +4045,8 @@ router.get('/admin/client-purchase-orders/:id', auth, adminOnly, async (req, res
     const [[po]] = await db.query(
       `SELECT cpo.*,
         u.name as client_name, u.phone as client_phone,
-        CASE WHEN p.id IS NOT NULL THEN cpo.linked_project_id ELSE NULL END as linked_project_id
+        CASE WHEN p.id IS NOT NULL THEN cpo.linked_project_id ELSE NULL END as linked_project_id,
+        COALESCE((SELECT COUNT(*) FROM project_items pi WHERE pi.project_id = cpo.linked_project_id), 0) as linked_project_item_count
        FROM client_purchase_orders cpo
        JOIN users u ON u.id = cpo.client_id
        LEFT JOIN projects p ON p.id = cpo.linked_project_id
