@@ -422,6 +422,8 @@ async function initializeDatabase() {
   await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN project_name VARCHAR(255) DEFAULT ''");
   await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN linked_project_id INT DEFAULT NULL");
   await safeAlter("ALTER TABLE client_purchase_orders ADD COLUMN items_json LONGTEXT DEFAULT NULL");
+  // Expand status ENUM to include payment_pending + advance_pending for existing DBs
+  await safeAlter("ALTER TABLE client_purchase_orders MODIFY COLUMN status ENUM('pending','acknowledged','processing','payment_pending','advance_pending','completed','cancelled') DEFAULT 'pending'");
 
   // ── NEW COLUMNS: Sale Challans — client portal send + pdf + gst split ──────
   await safeAlter("ALTER TABLE sale_challans ADD COLUMN sent_to_client TINYINT(1) DEFAULT 0");
@@ -611,7 +613,7 @@ async function initializeDatabase() {
     remark TEXT,
     pdf_url VARCHAR(500),
     pdf_public_id VARCHAR(300),
-    status ENUM('pending','acknowledged','processing','completed','cancelled') DEFAULT 'pending',
+    status ENUM('pending','acknowledged','processing','payment_pending','advance_pending','completed','cancelled') DEFAULT 'pending',
     total_amount DECIMAL(12,2) DEFAULT 0,
     paid_amount DECIMAL(12,2) DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
