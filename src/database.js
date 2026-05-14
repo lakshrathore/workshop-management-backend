@@ -406,6 +406,7 @@ async function initializeDatabase() {
   // is_ready flag — project start hone ke liye ready hai ya nahi
   await safeAlter('ALTER TABLE projects ADD COLUMN is_ready TINYINT(1) DEFAULT 0');
   await safeAlter("ALTER TABLE projects ADD COLUMN protocol_code VARCHAR(255) DEFAULT NULL");
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN send_type VARCHAR(10) DEFAULT 'system' COMMENT 'system or pdf'");
   // Sub-box label support: BOX-01 (A), BOX-01 (B) etc.
   await safeAlter("ALTER TABLE packing_boxes ADD COLUMN sub_label VARCHAR(10) DEFAULT NULL COMMENT 'A, B, C etc for sub-boxes'");
   await safeAlter("ALTER TABLE project_item_images ADD COLUMN resource_type VARCHAR(20) DEFAULT 'image'");

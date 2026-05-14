@@ -4154,23 +4154,35 @@ router.post('/admin/client-purchase-orders/:id/create-items', auth, adminOnly, a
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
+// ── SALE CHALLAN: Upload PDF (for admin to attach uploaded PDF before sending) ─
+router.post('/sale-challans/:id/upload-pdf', auth, adminOnly, clientPoUpload.single('pdf'), async (req, res) => {
+  const db = await getPool();
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    const pdfUrl = getFileUrl(req.file);
+    await db.query('UPDATE sale_challans SET pdf_url=? WHERE id=?', [pdfUrl, req.params.id]);
+    res.json({ pdf_url: pdfUrl });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
 // ── SALE CHALLAN: Send to Client Portal ─────────────────────────────────────
 // PATCH /sale-challans/:id/send-to-client
 router.patch('/sale-challans/:id/send-to-client', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   try {
-    const { client_id } = req.body;
+    const { client_id, send_type, pdf_url } = req.body;
     if (!client_id) return res.status(400).json({ message: 'client_id required' });
+    if (!send_type || !['system', 'pdf'].includes(send_type)) return res.status(400).json({ message: 'send_type must be system or pdf' });
+    if (send_type === 'pdf' && !pdf_url) return res.status(400).json({ message: 'pdf_url required when send_type is pdf' });
 
     const [[challan]] = await db.query('SELECT * FROM sale_challans WHERE id=?', [req.params.id]);
     if (!challan) return res.status(404).json({ message: 'Challan not found' });
 
     await db.query(
-      'UPDATE sale_challans SET sent_to_client=1, sent_client_id=?, sent_at=NOW() WHERE id=?',
-      [client_id, req.params.id]
+      'UPDATE sale_challans SET sent_to_client=1, sent_client_id=?, sent_at=NOW(), send_type=?, pdf_url=COALESCE(?,pdf_url) WHERE id=?',
+      [client_id, send_type, pdf_url || null, req.params.id]
     );
 
-    // Notify the client
     await db.query(
       `INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)`,
       [client_id, 'sale_invoice', '📄 New Sales Invoice', `Invoice ${challan.challan_number} has been shared with you`]
@@ -4187,7 +4199,7 @@ router.get('/client/sales', clientAuth, clientOnly, async (req, res) => {
     const [rows] = await db.query(`
       SELECT sc.id, sc.challan_number, sc.challan_type, sc.challan_date, sc.delivery_date,
         sc.status, sc.total_amount, sc.subtotal, sc.tax_percent, sc.tax_amount, sc.discount_amount,
-        sc.client_name, sc.notes, sc.pdf_url, sc.sent_at,
+        sc.client_name, sc.notes, sc.pdf_url, sc.sent_at, sc.send_type,
         p.name as project_name, p.project_id as project_code,
         (SELECT COUNT(*) FROM sale_challan_items WHERE challan_id=sc.id) as item_count
       FROM sale_challans sc
