@@ -4203,7 +4203,9 @@ router.post('/sale-challans/:id/upload-pdf', auth, adminOnly, clientPoUpload.sin
   const db = await getPool();
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-    const pdfUrl = getFileUrl(req.file);
+    // Extract the actual URL string — req.file.path is the Cloudinary secure_url for multer-storage-cloudinary
+    const pdfUrl = req.file.path || req.file.secure_url || req.file.url || getFileUrl(req.file.filename || req.file.public_id || '');
+    if (!pdfUrl) return res.status(500).json({ message: 'Could not get file URL from upload' });
     await db.query('UPDATE sale_challans SET pdf_url=? WHERE id=?', [pdfUrl, req.params.id]);
     res.json({ pdf_url: pdfUrl });
   } catch(e) { res.status(500).json({ message: e.message }); }
@@ -4236,6 +4238,14 @@ router.patch('/sale-challans/:id/send-to-client', auth, adminOnly, async (req, r
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
+// Sanitize bad pdf_url values stored in DB (e.g. '[object Object]' from a previous bug)
+function sanitizePdfUrl(url) {
+  if (!url) return null;
+  if (typeof url !== 'string') return null;
+  if (!url.startsWith('http') || url.includes('[object') || url.includes('%5Bobject')) return null;
+  return url;
+}
+
 // GET /client/sales — client views their sales invoices
 router.get('/client/sales', clientAuth, clientOnly, async (req, res) => {
   const db = await getPool();
@@ -4260,7 +4270,8 @@ router.get('/client/sales', clientAuth, clientOnly, async (req, res) => {
         )
       ORDER BY sc.created_at DESC
     `, [req.user.id, clientName]);
-    res.json(rows);
+    const sanitized = rows.map(r => ({ ...r, pdf_url: sanitizePdfUrl(r.pdf_url) }));
+    res.json(sanitized);
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
