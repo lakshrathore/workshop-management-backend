@@ -438,6 +438,9 @@ async function initializeDatabase() {
   await safeAlter("ALTER TABLE sale_challan_items ADD COLUMN tax_rate DECIMAL(5,2) DEFAULT 0");
   // Extend users role ENUM to include client
   await safeAlter("ALTER TABLE users MODIFY COLUMN role ENUM('admin','worker','client') DEFAULT 'worker'");
+  // Link sale_challans back to a client purchase order (for fulfillment tracking)
+  await safeAlter("ALTER TABLE sale_challans ADD COLUMN cpo_id INT DEFAULT NULL");
+
 
   // Packing Boxes table — manual + auto box management
   await db.query(`CREATE TABLE IF NOT EXISTS packing_boxes (

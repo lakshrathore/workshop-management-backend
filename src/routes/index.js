@@ -3481,7 +3481,7 @@ router.post('/sale-challans', auth, adminOnly, auditLog('CREATE','SaleChallan'),
   try {
     const { client_name, client_phone, client_address, client_gstin, challan_type,
       project_id, challan_date, delivery_date, status, notes,
-      tax_percent, discount_amount, transport_name, vehicle_number, items, manual_number } = req.body;
+      tax_percent, discount_amount, transport_name, vehicle_number, items, manual_number, cpo_id } = req.body;
     if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
     if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
@@ -3504,13 +3504,13 @@ router.post('/sale-challans', auth, adminOnly, auditLog('CREATE','SaleChallan'),
     const [r] = await db.query(
       `INSERT INTO sale_challans (challan_number,client_name,client_phone,client_address,client_gstin,challan_type,
         project_id,challan_date,delivery_date,status,subtotal,tax_percent,tax_amount,discount_amount,
-        total_amount,transport_name,vehicle_number,notes,cgst,sgst,igst,created_by)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        total_amount,transport_name,vehicle_number,notes,cgst,sgst,igst,cpo_id,created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [challan_number, client_name.trim(), client_phone||'', client_address||'', client_gstin||'',
         challan_type||'delivery', project_id||null, challan_date, delivery_date||null, status||'draft',
         subtotal, taxPct, tax_amount, disc, total_amount,
         transport_name||'', vehicle_number||'', notes||'',
-        req.body.cgst||null, req.body.sgst||null, req.body.igst||null, req.user.id]
+        req.body.cgst||null, req.body.sgst||null, req.body.igst||null, cpo_id||null, req.user.id]
     );
     const challanId = r.insertId;
     for (let i = 0; i < items.length; i++) {
@@ -3532,7 +3532,7 @@ router.put('/sale-challans/:id', auth, adminOnly, auditLog('UPDATE','SaleChallan
   try {
     const { client_name, client_phone, client_address, client_gstin, challan_type,
       project_id, challan_date, delivery_date, status, notes,
-      tax_percent, discount_amount, transport_name, vehicle_number, items } = req.body;
+      tax_percent, discount_amount, transport_name, vehicle_number, items, cpo_id } = req.body;
     if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
     if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
@@ -3547,12 +3547,12 @@ router.put('/sale-challans/:id', auth, adminOnly, auditLog('UPDATE','SaleChallan
       `UPDATE sale_challans SET client_name=?,client_phone=?,client_address=?,client_gstin=?,challan_type=?,
         project_id=?,challan_date=?,delivery_date=?,status=?,subtotal=?,tax_percent=?,
         tax_amount=?,discount_amount=?,total_amount=?,transport_name=?,vehicle_number=?,notes=?,
-        cgst=?,sgst=?,igst=? WHERE id=?`,
+        cgst=?,sgst=?,igst=?,cpo_id=? WHERE id=?`,
       [client_name.trim(), client_phone||'', client_address||'', client_gstin||'', challan_type||'delivery',
         project_id||null, challan_date, delivery_date||null, status||'draft',
         subtotal, taxPct, tax_amount, disc, total_amount,
         transport_name||'', vehicle_number||'', notes||'',
-        req.body.cgst||null, req.body.sgst||null, req.body.igst||null, req.params.id]
+        req.body.cgst||null, req.body.sgst||null, req.body.igst||null, cpo_id||null, req.params.id]
     );
     await db.query('DELETE FROM sale_challan_items WHERE challan_id=?', [req.params.id]);
     for (let i = 0; i < items.length; i++) {
@@ -4059,6 +4059,47 @@ router.get('/admin/client-purchase-orders/:id', auth, adminOnly, async (req, res
       [req.params.id]
     );
     res.json({ ...po, payments });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /admin/client-purchase-orders/:id/fulfillment
+router.get('/admin/client-purchase-orders/:id/fulfillment', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[po]] = await db.query(
+      `SELECT cpo.*, u.name as client_name FROM client_purchase_orders cpo
+       JOIN users u ON u.id = cpo.client_id WHERE cpo.id = ?`,
+      [req.params.id]
+    );
+    if (!po) return res.status(404).json({ message: 'PO not found' });
+    const [challans] = await db.query(
+      `SELECT sc.id, sc.challan_number, sc.challan_date, sc.status,
+              sc.subtotal, sc.discount_amount, sc.total_amount, sc.cgst, sc.sgst, sc.igst
+       FROM sale_challans sc
+       WHERE sc.cpo_id = ? AND sc.challan_type = 'sale'
+       ORDER BY sc.created_at ASC`,
+      [req.params.id]
+    );
+    let totalBilled = 0;
+    const results = [];
+    for (const ch of challans) {
+      const [items] = await db.query(
+        'SELECT * FROM sale_challan_items WHERE challan_id = ? ORDER BY sort_order, id',
+        [ch.id]
+      );
+      totalBilled += parseFloat(ch.total_amount || 0);
+      results.push({ ...ch, items });
+    }
+    const poTotal = parseFloat(po.total_amount || 0);
+    res.json({
+      challans: results,
+      summary: {
+        po_total: poTotal,
+        billed_total: totalBilled,
+        balance: poTotal - totalBilled,
+        billed_pct: poTotal > 0 ? Math.min(Math.round(totalBilled / poTotal * 100), 100) : 0,
+      }
+    });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
