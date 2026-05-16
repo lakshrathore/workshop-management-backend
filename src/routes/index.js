@@ -4385,7 +4385,7 @@ router.get('/client/sales', clientAuth, clientOnly, async (req, res) => {
       ORDER BY sc.created_at DESC
     `, [req.user.id, clientName]);
     const sanitized = rows.map(r => ({ ...r, pdf_url: sanitizePdfUrl(r.pdf_url) }));
-router.get('/admin/clients-list', auth, adminOrPermission('clients','read'), async (req, res) => {
+    res.json(sanitized);
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -4409,7 +4409,7 @@ router.get('/client/sales/:id', clientAuth, clientOnly, async (req, res) => {
 });
 
 // GET /admin/clients-list — lightweight client list for dropdowns
-router.get('/admin/clients-list', auth, adminOnly, async (req, res) => {
+router.get('/admin/clients-list', auth, adminOrPermission('clients','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [clients] = await db.query(
@@ -4499,7 +4499,7 @@ router.post('/client/tickets/:id/messages', clientAuth, clientOnly, async (req, 
   try {
     const [[ticket]] = await db.query(
       'SELECT * FROM client_tickets WHERE id=? AND client_id=?',
-router.get('/admin/tickets', auth, adminOrPermission('client_support','read'), async (req, res) => {
+      [req.params.id, req.user.id]
     );
     if (!ticket) return res.status(404).json({ message: 'Not found' });
     const { message } = req.body;
@@ -4517,13 +4517,12 @@ router.get('/admin/tickets', auth, adminOrPermission('client_support','read'), a
       `Ticket: ${ticket.subject} — ${message.substring(0,80)}`,
       {}
     );
-router.get('/admin/tickets/:id', auth, adminOrPermission('client_support','read'), async (req, res) => {
     res.json({ message: 'Message sent' });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
 // ── ADMIN: all tickets ─────────────────────────────────────────────────────
-router.get('/admin/tickets', auth, adminOnly, async (req, res) => {
+router.get('/admin/tickets', auth, adminOrPermission('client_support','read'), async (req, res) => {
   const db = await getPool();
   try {
     const { status } = req.query;
@@ -4541,7 +4540,8 @@ router.get('/admin/tickets', auth, adminOnly, async (req, res) => {
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
-router.post('/admin/tickets/:id/messages', auth, adminOrPermission('client_support','write'), async (req, res) => {
+// ── ADMIN: get single ticket detail ──────────────────────────────────────────
+router.get('/admin/tickets/:id', auth, adminOrPermission('client_support','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [[ticket]] = await db.query(
@@ -4565,11 +4565,10 @@ router.post('/admin/tickets/:id/messages', auth, adminOrPermission('client_suppo
 });
 
 // POST /api/admin/tickets/:id/messages — admin replies
-router.post('/admin/tickets/:id/messages', auth, adminOnly, async (req, res) => {
+router.post('/admin/tickets/:id/messages', auth, adminOrPermission('client_support','write'), async (req, res) => {
   const db = await getPool();
   try {
     const { message } = req.body;
-router.patch('/admin/tickets/:id/status', auth, adminOrPermission('client_support','edit'), async (req, res) => {
 
     const [[ticket]] = await db.query('SELECT * FROM client_tickets WHERE id=?', [req.params.id]);
     if (!ticket) return res.status(404).json({ message: 'Not found' });
@@ -4593,7 +4592,7 @@ router.patch('/admin/tickets/:id/status', auth, adminOrPermission('client_suppor
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
-router.patch('/admin/tickets/:id/status', auth, adminOnly, async (req, res) => {
+router.patch('/admin/tickets/:id/status', auth, adminOrPermission('client_support','edit'), async (req, res) => {
   const db = await getPool();
   try {
     const { status } = req.body;
