@@ -55,6 +55,30 @@ function requirePermission(menuKey, level = 'read') {
   };
 }
 
+// adminOrPermission: admin gets through always; worker needs the specified permission level
+// usage: adminOrPermission('projects', 'read')
+function adminOrPermission(menuKey, level = 'read') {
+  return async (req, res, next) => {
+    if (req.user.role === 'admin') return next();
+    if (req.user.role !== 'worker') return res.status(403).json({ message: 'Access denied' });
+    try {
+      const db = await getPool();
+      const [[perm]] = await db.query(
+        'SELECT * FROM worker_permissions WHERE worker_id=? AND menu_key=?',
+        [req.user.id, menuKey]
+      );
+      if (!perm) return res.status(403).json({ message: 'Access denied: no permission for this menu' });
+      const levelMap = { read: 'can_read', write: 'can_write', edit: 'can_edit', delete: 'can_delete' };
+      const col = levelMap[level];
+      if (!perm[col]) return res.status(403).json({ message: `Access denied: ${level} permission required` });
+      req.userPermission = perm;
+      next();
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  };
+}
+
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
 const { imgUpload, galleryUpload, moReferenceUpload, clientPoUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 const auditLog = require('../middleware/auditLog');
@@ -281,13 +305,13 @@ router.get('/departments', auth, async (req, res) => {
     ${whereClause} GROUP BY d.id ORDER BY COALESCE(d.stage_order,999), d.name`);
   res.json(rows);
 });
-router.post('/departments', auth, adminOnly, auditLog('CREATE','Department'), async (req, res) => {
+router.post('/departments', auth, adminOrPermission('departments','write'), auditLog('CREATE','Department'), async (req, res) => {
   const db = await getPool();
   const { name, description, color } = req.body;
   const [r] = await db.query('INSERT INTO departments (name,description,color) VALUES (?,?,?)', [name, description, color || '#3B82F6']);
   res.json({ id: r.insertId, name, description, color });
 });
-router.put('/departments/:id', auth, adminOnly, auditLog('UPDATE','Department'), async (req, res) => {
+router.put('/departments/:id', auth, adminOrPermission('departments','edit'), auditLog('UPDATE','Department'), async (req, res) => {
   const db = await getPool();
   const { name, description, color, is_active } = req.body;
   await db.query('UPDATE departments SET name=?,description=?,color=?,is_active=? WHERE id=?', [name, description, color, is_active, req.params.id]);
@@ -320,7 +344,7 @@ router.get('/workers', auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
-router.post('/workers', auth, adminOnly, auditLog('CREATE','Worker'), async (req, res) => {
+router.post('/workers', auth, adminOrPermission('workers','write'), auditLog('CREATE','Worker'), async (req, res) => {
   const db = await getPool();
   const { name, username, password, phone, department_ids, hourly_rate } = req.body;
   const hashed = bcrypt.hashSync(password, 10);
@@ -331,7 +355,7 @@ router.post('/workers', auth, adminOnly, auditLog('CREATE','Worker'), async (req
   }
   res.json({ id: r.insertId, name });
 });
-router.put('/workers/:id', auth, adminOnly, auditLog('UPDATE','Worker'), async (req, res) => {
+router.put('/workers/:id', auth, adminOrPermission('workers','edit'), auditLog('UPDATE','Worker'), async (req, res) => {
   const db = await getPool();
   const { name, phone, is_active, department_ids, hourly_rate, password } = req.body;
   try {
@@ -353,7 +377,7 @@ router.put('/workers/:id', auth, adminOnly, auditLog('UPDATE','Worker'), async (
     res.status(500).json({ message: err.message });
   }
 });
-router.delete('/workers/:id', auth, adminOnly, auditLog('DELETE','Worker'), async (req, res) => {
+router.delete('/workers/:id', auth, adminOrPermission('workers','delete'), auditLog('DELETE','Worker'), async (req, res) => {
   const db = await getPool();
   try {
     // First check if worker exists
@@ -392,7 +416,7 @@ router.delete('/workers/:id', auth, adminOnly, auditLog('DELETE','Worker'), asyn
   }
 });
 
-router.patch('/workers/:id/rate', auth, adminOnly, async (req, res) => {
+router.patch('/workers/:id/rate', auth, adminOrPermission('workers','edit'), async (req, res) => {
   const db = await getPool();
   await db.query('UPDATE users SET hourly_rate=? WHERE id=?', [req.body.hourly_rate, req.params.id]);
   res.json({ message: 'Rate updated' });
@@ -467,7 +491,7 @@ router.get('/projects', auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
-router.post('/projects', auth, adminOnly, auditLog('CREATE','Project'), async (req, res) => {
+router.post('/projects', auth, adminOrPermission('projects','write'), auditLog('CREATE','Project'), async (req, res) => {
   const db = await getPool();
   const { project_id, name, client_name, client_phone, description, priority, order_date, deadline, total_amount, notes } = req.body;
   // Auto-generate project_id if not provided
@@ -506,7 +530,7 @@ router.post('/projects', auth, adminOnly, auditLog('CREATE','Project'), async (r
     res.status(500).json({ message: err.message });
   }
 });
-router.put('/projects/:id', auth, adminOnly, auditLog('UPDATE','Project'), async (req, res) => {
+router.put('/projects/:id', auth, adminOrPermission('projects','edit'), auditLog('UPDATE','Project'), async (req, res) => {
   const db = await getPool();
   const { name, client_name, client_phone, description, status, priority, order_date, deadline, total_amount, notes, is_ready } = req.body;
   const isReadyVal = is_ready !== undefined ? (is_ready ? 1 : 0) : undefined;
@@ -520,7 +544,7 @@ router.put('/projects/:id', auth, adminOnly, auditLog('UPDATE','Project'), async
   res.json({ message: 'Updated' });
 });
 
-router.post('/projects/:id/mo-references', auth, adminOnly, moReferenceUpload.array('images', 10), async (req, res) => {
+router.post('/projects/:id/mo-references', auth, adminOrPermission('projects','write'), moReferenceUpload.array('images', 10), async (req, res) => {
   const db = await getPool();
   const projectId = parseInt(req.params.id, 10);
   try {
@@ -694,7 +718,7 @@ router.get('/projects/:id/mo-references', auth, async (req, res) => {
   }
 });
 
-router.delete('/projects/:projectId/mo-references/:fileId', auth, adminOnly, async (req, res) => {
+router.delete('/projects/:projectId/mo-references/:fileId', auth, adminOrPermission('projects','delete'), async (req, res) => {
   const db = await getPool();
   const { projectId, fileId } = req.params;
   try {
@@ -720,7 +744,7 @@ router.delete('/projects/:projectId/mo-references/:fileId', auth, adminOnly, asy
   }
 });
 
-router.get('/reports/mo-references', auth, adminOnly, async (req, res) => {
+router.get('/reports/mo-references', auth, adminOrPermission('projects','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [rows] = await db.query(`
@@ -749,7 +773,7 @@ router.get('/reports/mo-references', auth, adminOnly, async (req, res) => {
   }
 });
 
-router.delete('/projects/:id', auth, adminOnly, auditLog('DELETE','Project'), async (req, res) => {
+router.delete('/projects/:id', auth, adminOrPermission('projects','delete'), auditLog('DELETE','Project'), async (req, res) => {
   const db = await getPool();
   try {
     const { force } = req.query; // force=true for hard delete
@@ -935,21 +959,21 @@ router.put('/auth/change-password', auth, async (req, res) => {
 });
 
 // ── PROJECT ITEMS ─────────────────────────────────────────────────────────────
-router.post('/projects/:id/items', auth, adminOnly, async (req, res) => {
+router.post('/projects/:id/items', auth, adminOrPermission('projects','write'), async (req, res) => {
   const db = await getPool();
   const { item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes } = req.body;
   const [r] = await db.query('INSERT INTO project_items (project_id,item_name,proto_code,description,quantity,unit,material,dimensions,unit_price,notes) VALUES (?,?,?,?,?,?,?,?,?,?)',
     [req.params.id, item_name, proto_code, description, quantity || 1, unit || 'pcs', material, dimensions, unit_price || 0, notes]);
   res.json({ id: r.insertId });
 });
-router.put('/projects/:projectId/items/:id', auth, adminOnly, async (req, res) => {
+router.put('/projects/:projectId/items/:id', auth, adminOrPermission('projects','edit'), async (req, res) => {
   const db = await getPool();
   const { item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes } = req.body;
   await db.query('UPDATE project_items SET item_name=?,proto_code=?,description=?,quantity=?,unit=?,material=?,dimensions=?,unit_price=?,notes=? WHERE id=? AND project_id=?',
     [item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes, req.params.id, req.params.projectId]);
   res.json({ message: 'Updated' });
 });
-router.delete('/projects/:projectId/items/:id', auth, adminOnly, async (req, res) => {
+router.delete('/projects/:projectId/items/:id', auth, adminOrPermission('projects','delete'), async (req, res) => {
   const db = await getPool();
   try {
     const [activeTasks] = await db.query(
@@ -969,7 +993,7 @@ router.delete('/projects/:projectId/items/:id', auth, adminOnly, async (req, res
 // ── PROJECT ITEM REFERENCE IMAGES ─────────────────────────────────────────────
 
 // Upload reference images for a project item
-router.post('/projects/:projectId/items/:itemId/images', auth, adminOnly, imgUpload.array('images', 10), async (req, res) => {
+router.post('/projects/:projectId/items/:itemId/images', auth, adminOrPermission('projects','write'), imgUpload.array('images', 10), async (req, res) => {
   const db = await getPool();
   try {
     const files = req.files || [];
@@ -1042,7 +1066,7 @@ router.get('/projects/:projectId/items/:itemId/images', auth, async (req, res) =
 });
 
 // Delete a reference image
-router.delete('/projects/:projectId/items/:itemId/images/:imageId', auth, adminOnly, async (req, res) => {
+router.delete('/projects/:projectId/items/:itemId/images/:imageId', auth, adminOrPermission('projects','delete'), async (req, res) => {
   const db = await getPool();
   try {
     const [[img]] = await db.query('SELECT * FROM project_item_images WHERE id=? AND project_item_id=?', [req.params.imageId, req.params.itemId]);
@@ -1055,7 +1079,7 @@ router.delete('/projects/:projectId/items/:itemId/images/:imageId', auth, adminO
 
 // ── PRODUCTION CHAIN ──────────────────────────────────────────────────────────
 // Set/replace chain for a project (or project item)
-router.post('/projects/:id/chain', auth, adminOnly, async (req, res) => {
+router.post('/projects/:id/chain', auth, adminOrPermission('projects','edit'), async (req, res) => {
   try {
     const db = await getPool();
     const { project_item_id, stages } = req.body;
@@ -1152,7 +1176,7 @@ async function autoAdvanceChain(db, task_id) {
 // Only status activation is needed via checkAndActivateNextStage
 
 // ── TASKS ─────────────────────────────────────────────────────────────────────
-router.get('/tasks/all', auth, adminOnly, async (req, res) => {
+router.get('/tasks/all', auth, adminOrPermission('tasks','read'), async (req, res) => {
   const db = await getPool();
   const { status, department_id, worker_id } = req.query;
   let where = 'WHERE 1=1';
@@ -1241,7 +1265,7 @@ router.get('/tasks/:id', auth, async (req, res) => {
   res.json({ ...task, transfers });
 });
 
-router.post('/tasks', auth, adminOnly, auditLog('CREATE','Task'), async (req, res) => {
+router.post('/tasks', auth, adminOrPermission('tasks','write'), auditLog('CREATE','Task'), async (req, res) => {
   const db = await getPool();
   const { project_id, project_item_id, assign_type, worker_id, department_id, stage_order,
     task_title, task_description, quantity_assigned, priority, start_date, due_date, admin_notes } = req.body;
@@ -1256,7 +1280,7 @@ router.post('/tasks', auth, adminOnly, auditLog('CREATE','Task'), async (req, re
   res.json({ id: r.insertId });
 });
 
-router.put('/tasks/:id', auth, adminOnly, auditLog('UPDATE','Task'), async (req, res) => {
+router.put('/tasks/:id', auth, adminOrPermission('tasks','edit'), auditLog('UPDATE','Task'), async (req, res) => {
   const db = await getPool();
   const [[old]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
   const { assign_type, worker_id, department_id, stage_order, task_title, task_description,
@@ -1274,7 +1298,7 @@ router.put('/tasks/:id', auth, adminOnly, auditLog('UPDATE','Task'), async (req,
   res.json({ message: 'Updated' });
 });
 
-router.delete('/tasks/:id', auth, adminOnly, auditLog('DELETE','Task'), async (req, res) => {
+router.delete('/tasks/:id', auth, adminOrPermission('tasks','delete'), auditLog('DELETE','Task'), async (req, res) => {
   const db = await getPool();
   try {
     const [task] = await db.query('SELECT status FROM task_assignments WHERE id=?', [req.params.id]);
@@ -1490,7 +1514,7 @@ router.patch('/tasks/:id/progress', auth, auditLog('UPDATE','Task'), async (req,
 });
 
 // Task transfer (ADMIN ONLY)
-router.post('/tasks/:id/transfer', auth, adminOnly, async (req, res) => {
+router.post('/tasks/:id/transfer', auth, adminOrPermission('tasks','edit'), async (req, res) => {
   const db = await getPool();
   const { to_worker_id, reason } = req.body;
   const [[task]] = await db.query('SELECT * FROM task_assignments WHERE id=?', [req.params.id]);
@@ -1754,7 +1778,7 @@ router.get('/departments/:id/gallery', auth, async (req, res) => {
 });
 
 // Delete file from department gallery
-router.delete('/departments/:id/gallery/:fileId', auth, adminOnly, async (req, res) => {
+router.delete('/departments/:id/gallery/:fileId', auth, adminOrPermission('departments','delete'), async (req, res) => {
   const db = await getPool();
   const [[file]] = await db.query(`SELECT * FROM department_gallery WHERE id=? AND department_id=?`, 
     [req.params.fileId, req.params.id]);
@@ -2061,7 +2085,7 @@ router.get('/reports/product-tracking', auth, async (req, res) => {
   res.json({ items: result });
 });
 
-router.get('/reports/workers', auth, adminOnly, async (req, res) => {
+router.get('/reports/workers', auth, adminOrPermission('reports','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [rows] = await db.query(`
@@ -2085,7 +2109,7 @@ router.get('/reports/workers', auth, adminOnly, async (req, res) => {
   }
 });
 
-router.get('/reports/departments', auth, adminOnly, async (req, res) => {
+router.get('/reports/departments', auth, adminOrPermission('reports','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [rows] = await db.query(`
@@ -2108,7 +2132,7 @@ router.get('/reports/departments', auth, adminOnly, async (req, res) => {
   }
 });
 
-router.get('/reports/transfers', auth, adminOnly, async (req, res) => {
+router.get('/reports/transfers', auth, adminOrPermission('reports','read'), async (req, res) => {
   const db = await getPool();
   const [rows] = await db.query(`
     SELECT tt.*,ta.task_title,ta.status as task_status,
@@ -2125,7 +2149,7 @@ router.get('/reports/transfers', auth, adminOnly, async (req, res) => {
   res.json(rows);
 });
 
-router.get('/reports/material-requests', auth, adminOnly, async (req, res) => {
+router.get('/reports/material-requests', auth, adminOrPermission('reports','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [summary] = await db.query(`
@@ -2149,7 +2173,7 @@ router.get('/reports/material-requests', auth, adminOnly, async (req, res) => {
 });
 
 // Time report
-router.get('/reports/time', auth, adminOnly, async (req, res) => {
+router.get('/reports/time', auth, adminOrPermission('reports','read'), async (req, res) => {
   const db = await getPool();
   const { worker_id, from_date, to_date } = req.query;
   const conds = ['1=1']; const params = [];
@@ -2253,7 +2277,7 @@ router.get('/tasks/:id/daily-progress', auth, async (req, res) => {
 });
 
 // Admin: get daily progress report for a project (all items + all departments + all dates)
-router.get('/reports/daily-progress', auth, adminOnly, async (req, res) => {
+router.get('/reports/daily-progress', auth, adminOrPermission('daily_progress','read'), async (req, res) => {
   const db = await getPool();
   const { project_id, date_from, date_to } = req.query;
   try {
@@ -2348,7 +2372,7 @@ router.put('/materials/:id', auth, auditLog('UPDATE','Material'), async (req, re
   }
 });
 
-router.delete('/materials/:id', auth, adminOnly, auditLog('DELETE','Material'), async (req, res) => {
+router.delete('/materials/:id', auth, adminOrPermission('materials','delete'), auditLog('DELETE','Material'), async (req, res) => {
   const db = await getPool();
   try {
     await db.query('DELETE FROM material_consumption WHERE id=?', [req.params.id]);
@@ -2397,7 +2421,7 @@ router.post('/production-output', auth, async (req, res) => {
   } catch(err) { res.status(500).json({ message: err.message }); }
 });
 
-router.delete('/production-output/:id', auth, adminOnly, async (req, res) => {
+router.delete('/production-output/:id', auth, adminOrPermission('materials','delete'), async (req, res) => {
   const db = await getPool();
   try {
     await db.query('DELETE FROM material_production WHERE id=?', [req.params.id]);
@@ -2405,7 +2429,7 @@ router.delete('/production-output/:id', auth, adminOnly, async (req, res) => {
   } catch(err) { res.status(500).json({ message: err.message }); }
 });
 
-router.get('/reports/materials', auth, adminOnly, async (req, res) => {
+router.get('/reports/materials', auth, adminOrPermission('materials','read'), async (req, res) => {
   const db = await getPool();
   const { project_id } = req.query;
   try {
@@ -2589,7 +2613,7 @@ router.post('/queries', auth, auditLog('CREATE','Query'), async (req, res) => {
 });
 
 // Admin responds to query
-router.patch('/queries/:id/respond', auth, adminOnly, auditLog('UPDATE','Query'), async (req, res) => {
+router.patch('/queries/:id/respond', auth, adminOrPermission('queries','edit'), auditLog('UPDATE','Query'), async (req, res) => {
   const db = await getPool();
   const { admin_response, status } = req.body;
   try {
@@ -2603,7 +2627,7 @@ router.patch('/queries/:id/respond', auth, adminOnly, auditLog('UPDATE','Query')
   }
 });
 
-router.patch('/queries/:id/status', auth, adminOnly, auditLog('UPDATE','Query'), async (req, res) => {
+router.patch('/queries/:id/status', auth, adminOrPermission('queries','edit'), auditLog('UPDATE','Query'), async (req, res) => {
   const db = await getPool();
   await db.query('UPDATE worker_queries SET status=?, updated_at=NOW() WHERE id=?',
     [req.body.status, req.params.id]);
@@ -2625,7 +2649,7 @@ router.get('/settings', async (req, res) => {
   } catch(err) { res.status(500).json({ message: err.message }); }
 });
 
-router.put('/settings', auth, adminOnly, auditLog('UPDATE','Settings'), async (req, res) => {
+router.put('/settings', auth, adminOrPermission('settings','edit'), auditLog('UPDATE','Settings'), async (req, res) => {
   const db = await getPool();
   try {
     for (const [key, value] of Object.entries(req.body)) {
@@ -2706,7 +2730,7 @@ router.put('/user-rights/:workerId', auth, adminOnly, async (req, res) => {
 });
 
 // ── DEPARTMENT DELETE ────────────────────────────────────────────
-router.delete('/departments/:id', auth, adminOnly, auditLog('DELETE','Department'), async (req, res) => {
+router.delete('/departments/:id', auth, adminOrPermission('departments','delete'), auditLog('DELETE','Department'), async (req, res) => {
   const db = await getPool();
   try {
     // Check if dept has active tasks
@@ -2724,7 +2748,7 @@ router.delete('/departments/:id', auth, adminOnly, auditLog('DELETE','Department
 });
 
 // ── DEPARTMENT HARD DELETE (force) ──────────────────────────────
-router.delete('/departments/:id/force', auth, adminOnly, async (req, res) => {
+router.delete('/departments/:id/force', auth, adminOrPermission('departments','delete'), async (req, res) => {
   const db = await getPool();
   try {
     await db.query('DELETE FROM worker_departments WHERE department_id=?', [req.params.id]);
@@ -2734,7 +2758,7 @@ router.delete('/departments/:id/force', auth, adminOnly, async (req, res) => {
 });
 
 // ── DEPARTMENT REORDER ───────────────────────────────────────────
-router.post('/departments/reorder', auth, adminOnly, async (req, res) => {
+router.post('/departments/reorder', auth, adminOrPermission('departments','edit'), async (req, res) => {
   const db = await getPool();
   try {
     const { order } = req.body; // [{id, stage_order}]
@@ -2747,7 +2771,7 @@ router.post('/departments/reorder', auth, adminOnly, async (req, res) => {
 
 
 // ── BULK DEPARTMENT ASSIGNMENT ───────────────────────────────────────────────
-router.post('/workers/bulk-departments', auth, adminOnly, async (req, res) => {
+router.post('/workers/bulk-departments', auth, adminOrPermission('workers','edit'), async (req, res) => {
   const db = await getPool();
   const { worker_ids, department_ids, action } = req.body;
   // action: 'add' | 'replace'
@@ -3146,7 +3170,7 @@ router.get('/packing-parts/:project_item_id', auth, async (req, res) => {
 });
 
 // Create packing parts for a project item (admin)
-router.post('/packing-parts', auth, adminOnly, async (req, res) => {
+router.post('/packing-parts', auth, adminOrPermission('packing','write'), async (req, res) => {
   const db = await getPool();
   try {
     const { project_item_id, project_id, parts } = req.body;
@@ -3165,7 +3189,7 @@ router.post('/packing-parts', auth, adminOnly, async (req, res) => {
 });
 
 // Delete a single packing part (admin)
-router.delete('/packing-parts/:id', auth, adminOnly, async (req, res) => {
+router.delete('/packing-parts/:id', auth, adminOrPermission('packing','delete'), async (req, res) => {
   const db = await getPool();
   await db.query('DELETE FROM packing_parts WHERE id=?', [req.params.id]);
   res.json({ message: 'Deleted' });
@@ -3526,7 +3550,7 @@ router.delete('/purchase-orders/:id', auth, adminOnly, auditLog('DELETE','Purcha
 // getNextChallanNumber is now type-aware (uses getNextAutoNumber)
 
 // GET all challans
-router.get('/sale-challans', auth, adminOnly, async (req, res) => {
+router.get('/sale-challans', auth, adminOrPermission('sale_challans','read'), async (req, res) => {
   const db = await getPool();
   try {
     const { project_id, status, search } = req.query;
@@ -3549,7 +3573,7 @@ router.get('/sale-challans', auth, adminOnly, async (req, res) => {
 });
 
 // GET single challan with items
-router.get('/sale-challans/:id', auth, adminOnly, async (req, res) => {
+router.get('/sale-challans/:id', auth, adminOrPermission('sale_challans','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [[challan]] = await db.query(`
@@ -3566,7 +3590,7 @@ router.get('/sale-challans/:id', auth, adminOnly, async (req, res) => {
 });
 
 // POST create challan
-router.post('/sale-challans', auth, adminOnly, auditLog('CREATE','SaleChallan'), async (req, res) => {
+router.post('/sale-challans', auth, adminOrPermission('sale_challans','write'), auditLog('CREATE','SaleChallan'), async (req, res) => {
   const db = await getPool();
   try {
     const { client_name, client_phone, client_address, client_gstin, challan_type,
@@ -3617,7 +3641,7 @@ router.post('/sale-challans', auth, adminOnly, auditLog('CREATE','SaleChallan'),
 });
 
 // PUT update challan
-router.put('/sale-challans/:id', auth, adminOnly, auditLog('UPDATE','SaleChallan'), async (req, res) => {
+router.put('/sale-challans/:id', auth, adminOrPermission('sale_challans','edit'), auditLog('UPDATE','SaleChallan'), async (req, res) => {
   const db = await getPool();
   try {
     const { client_name, client_phone, client_address, client_gstin, challan_type,
@@ -3659,7 +3683,7 @@ router.put('/sale-challans/:id', auth, adminOnly, auditLog('UPDATE','SaleChallan
 });
 
 // PATCH status only
-router.patch('/sale-challans/:id/status', auth, adminOnly, auditLog('UPDATE','SaleChallan'), async (req, res) => {
+router.patch('/sale-challans/:id/status', auth, adminOrPermission('sale_challans','edit'), auditLog('UPDATE','SaleChallan'), async (req, res) => {
   const db = await getPool();
   try {
     const { status } = req.body;
@@ -3669,7 +3693,7 @@ router.patch('/sale-challans/:id/status', auth, adminOnly, auditLog('UPDATE','Sa
 });
 
 // DELETE challan
-router.delete('/sale-challans/:id', auth, adminOnly, auditLog('DELETE','SaleChallan'), async (req, res) => {
+router.delete('/sale-challans/:id', auth, adminOrPermission('sale_challans','delete'), auditLog('DELETE','SaleChallan'), async (req, res) => {
   const db = await getPool();
   try {
     await db.query('DELETE FROM sale_challans WHERE id=?', [req.params.id]);
@@ -3849,7 +3873,7 @@ router.get('/numbering-info', auth, async (req, res) => {
 
 
 // POST /settings/test-email — Send test email
-router.post('/settings/test-email', auth, adminOnly, async (req, res) => {
+router.post('/settings/test-email', auth, adminOrPermission('settings','edit'), async (req, res) => {
   try {
     const db = await getPool();
     const emails = await getAdminEmails(db);
@@ -4115,7 +4139,7 @@ router.delete('/client/purchase-orders/:id', clientAuth, clientOnly, async (req,
 });
 
 // ── ADMIN: view all client POs ─────────────────────────────────────────────
-router.get('/admin/client-purchase-orders', auth, adminOnly, async (req, res) => {
+router.get('/admin/client-purchase-orders', auth, adminOrPermission('client_pos','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [pos] = await db.query(
@@ -4129,7 +4153,7 @@ router.get('/admin/client-purchase-orders', auth, adminOnly, async (req, res) =>
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
-router.get('/admin/client-purchase-orders/:id', auth, adminOnly, async (req, res) => {
+router.get('/admin/client-purchase-orders/:id', auth, adminOrPermission('client_pos','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [[po]] = await db.query(
@@ -4153,7 +4177,7 @@ router.get('/admin/client-purchase-orders/:id', auth, adminOnly, async (req, res
 });
 
 // GET /admin/client-purchase-orders/:id/fulfillment
-router.get('/admin/client-purchase-orders/:id/fulfillment', auth, adminOnly, async (req, res) => {
+router.get('/admin/client-purchase-orders/:id/fulfillment', auth, adminOrPermission('client_pos','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [[po]] = await db.query(
@@ -4193,7 +4217,7 @@ router.get('/admin/client-purchase-orders/:id/fulfillment', auth, adminOnly, asy
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
-router.patch('/admin/client-purchase-orders/:id/status', auth, adminOnly, async (req, res) => {
+router.patch('/admin/client-purchase-orders/:id/status', auth, adminOrPermission('client_pos','edit'), async (req, res) => {
   const db = await getPool();
   try {
     const { status } = req.body;
@@ -4203,7 +4227,7 @@ router.patch('/admin/client-purchase-orders/:id/status', auth, adminOnly, async 
 });
 
 // PATCH /admin/client-purchase-orders/:id/project-name — admin edits project name from PO
-router.patch('/admin/client-purchase-orders/:id/project-name', auth, adminOnly, async (req, res) => {
+router.patch('/admin/client-purchase-orders/:id/project-name', auth, adminOrPermission('client_pos','edit'), async (req, res) => {
   const db = await getPool();
   try {
     const { project_name } = req.body;
@@ -4213,7 +4237,7 @@ router.patch('/admin/client-purchase-orders/:id/project-name', auth, adminOnly, 
 });
 
 // POST /admin/client-purchase-orders/:id/create-project — admin creates a project from this PO
-router.post('/admin/client-purchase-orders/:id/create-project', auth, adminOnly, async (req, res) => {
+router.post('/admin/client-purchase-orders/:id/create-project', auth, adminOrPermission('client_pos','write'), async (req, res) => {
   const db = await getPool();
   try {
     const [[po]] = await db.query(
@@ -4268,7 +4292,7 @@ router.post('/admin/client-purchase-orders/:id/create-project', auth, adminOnly,
 });
 
 // POST /admin/client-purchase-orders/:id/create-items — admin creates project items from PO line items
-router.post('/admin/client-purchase-orders/:id/create-items', auth, adminOnly, async (req, res) => {
+router.post('/admin/client-purchase-orders/:id/create-items', auth, adminOrPermission('client_pos','write'), async (req, res) => {
   const db = await getPool();
   try {
     const { project_id, items } = req.body;
@@ -4289,7 +4313,7 @@ router.post('/admin/client-purchase-orders/:id/create-items', auth, adminOnly, a
 });
 
 // ── SALE CHALLAN: Upload PDF (for admin to attach uploaded PDF before sending) ─
-router.post('/sale-challans/:id/upload-pdf', auth, adminOnly, clientPoUpload.single('pdf'), async (req, res) => {
+router.post('/sale-challans/:id/upload-pdf', auth, adminOrPermission('sale_challans','edit'), clientPoUpload.single('pdf'), async (req, res) => {
   const db = await getPool();
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
@@ -4303,7 +4327,7 @@ router.post('/sale-challans/:id/upload-pdf', auth, adminOnly, clientPoUpload.sin
 
 // ── SALE CHALLAN: Send to Client Portal ─────────────────────────────────────
 // PATCH /sale-challans/:id/send-to-client
-router.patch('/sale-challans/:id/send-to-client', auth, adminOnly, async (req, res) => {
+router.patch('/sale-challans/:id/send-to-client', auth, adminOrPermission('sale_challans','edit'), async (req, res) => {
   const db = await getPool();
   try {
     const { client_id, send_type, pdf_url } = req.body;
@@ -4361,7 +4385,7 @@ router.get('/client/sales', clientAuth, clientOnly, async (req, res) => {
       ORDER BY sc.created_at DESC
     `, [req.user.id, clientName]);
     const sanitized = rows.map(r => ({ ...r, pdf_url: sanitizePdfUrl(r.pdf_url) }));
-    res.json(sanitized);
+router.get('/admin/clients-list', auth, adminOrPermission('clients','read'), async (req, res) => {
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -4475,7 +4499,7 @@ router.post('/client/tickets/:id/messages', clientAuth, clientOnly, async (req, 
   try {
     const [[ticket]] = await db.query(
       'SELECT * FROM client_tickets WHERE id=? AND client_id=?',
-      [req.params.id, req.user.id]
+router.get('/admin/tickets', auth, adminOrPermission('client_support','read'), async (req, res) => {
     );
     if (!ticket) return res.status(404).json({ message: 'Not found' });
     const { message } = req.body;
@@ -4493,7 +4517,7 @@ router.post('/client/tickets/:id/messages', clientAuth, clientOnly, async (req, 
       `Ticket: ${ticket.subject} — ${message.substring(0,80)}`,
       {}
     );
-
+router.get('/admin/tickets/:id', auth, adminOrPermission('client_support','read'), async (req, res) => {
     res.json({ message: 'Message sent' });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
@@ -4517,7 +4541,7 @@ router.get('/admin/tickets', auth, adminOnly, async (req, res) => {
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
-router.get('/admin/tickets/:id', auth, adminOnly, async (req, res) => {
+router.post('/admin/tickets/:id/messages', auth, adminOrPermission('client_support','write'), async (req, res) => {
   const db = await getPool();
   try {
     const [[ticket]] = await db.query(
@@ -4545,7 +4569,7 @@ router.post('/admin/tickets/:id/messages', auth, adminOnly, async (req, res) => 
   const db = await getPool();
   try {
     const { message } = req.body;
-    if (!message?.trim()) return res.status(400).json({ message: 'Message required' });
+router.patch('/admin/tickets/:id/status', auth, adminOrPermission('client_support','edit'), async (req, res) => {
 
     const [[ticket]] = await db.query('SELECT * FROM client_tickets WHERE id=?', [req.params.id]);
     if (!ticket) return res.status(404).json({ message: 'Not found' });
