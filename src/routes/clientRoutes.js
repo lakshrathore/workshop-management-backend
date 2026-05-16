@@ -61,6 +61,27 @@ function adminOnly(req, res, next) {
   next();
 }
 
+// Admin OR worker with 'clients' permission
+async function adminOrClientsPermission(level, req, res, next) {
+  if (req.user.role === 'admin') return next();
+  if (req.user.role !== 'worker') return res.status(403).json({ message: 'Access denied' });
+  try {
+    const db = await getPool();
+    const [[perm]] = await db.query(
+      'SELECT * FROM worker_permissions WHERE worker_id=? AND menu_key=?',
+      [req.user.id, 'clients']
+    );
+    if (!perm) return res.status(403).json({ message: 'Access denied: no clients permission' });
+    const levelMap = { read: 'can_read', write: 'can_write', edit: 'can_edit', delete: 'can_delete' };
+    if (!perm[levelMap[level]]) return res.status(403).json({ message: `Access denied: ${level} permission required` });
+    next();
+  } catch (e) { res.status(500).json({ message: e.message }); }
+}
+const clientsRead   = (req, res, next) => adminOrClientsPermission('read',   req, res, next);
+const clientsWrite  = (req, res, next) => adminOrClientsPermission('write',  req, res, next);
+const clientsEdit   = (req, res, next) => adminOrClientsPermission('edit',   req, res, next);
+const clientsDelete = (req, res, next) => adminOrClientsPermission('delete', req, res, next);
+
 // ── DATABASE SETUP ────────────────────────────────────────────────────────────
 // Ye function database.js ke initializeDatabase ke baad call hoga
 async function initClientTables() {
@@ -99,7 +120,7 @@ async function initClientTables() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /api/clients — Sabhi clients ki list
-router.get('/clients', clientAuth, adminOnly, async (req, res) => {
+router.get('/clients', clientAuth, clientsRead, async (req, res) => {
   const db = await getPool();
   try {
     const [clients] = await db.query(`
@@ -120,7 +141,7 @@ router.get('/clients', clientAuth, adminOnly, async (req, res) => {
 });
 
 // POST /api/clients — Naya client banao
-router.post('/clients', clientAuth, adminOnly, async (req, res) => {
+router.post('/clients', clientAuth, clientsWrite, async (req, res) => {
   const db = await getPool();
   try {
     const { name, username, password, phone } = req.body;
@@ -148,7 +169,7 @@ router.post('/clients', clientAuth, adminOnly, async (req, res) => {
 });
 
 // PUT /api/clients/:id — Client update karo
-router.put('/clients/:id', clientAuth, adminOnly, async (req, res) => {
+router.put('/clients/:id', clientAuth, clientsEdit, async (req, res) => {
   const db = await getPool();
   try {
     const { name, phone, is_active, password } = req.body;
@@ -179,7 +200,7 @@ router.put('/clients/:id', clientAuth, adminOnly, async (req, res) => {
 });
 
 // DELETE /api/clients/:id — Client delete karo
-router.delete('/clients/:id', clientAuth, adminOnly, async (req, res) => {
+router.delete('/clients/:id', clientAuth, clientsDelete, async (req, res) => {
   const db = await getPool();
   try {
     const clientId = req.params.id;
@@ -196,7 +217,7 @@ router.delete('/clients/:id', clientAuth, adminOnly, async (req, res) => {
 });
 
 // GET /api/clients/:id/projects — Client ke assigned projects
-router.get('/clients/:id/projects', clientAuth, adminOnly, async (req, res) => {
+router.get('/clients/:id/projects', clientAuth, clientsRead, async (req, res) => {
   const db = await getPool();
   try {
     const [projects] = await db.query(`
@@ -215,7 +236,7 @@ router.get('/clients/:id/projects', clientAuth, adminOnly, async (req, res) => {
 });
 
 // POST /api/clients/:id/projects — Client ko project access do
-router.post('/clients/:id/projects', clientAuth, adminOnly, async (req, res) => {
+router.post('/clients/:id/projects', clientAuth, clientsWrite, async (req, res) => {
   const db = await getPool();
   try {
     const { project_id } = req.body;
@@ -244,7 +265,7 @@ router.post('/clients/:id/projects', clientAuth, adminOnly, async (req, res) => 
 });
 
 // DELETE /api/clients/:id/projects/:projectId — Project access hatao
-router.delete('/clients/:id/projects/:projectId', clientAuth, adminOnly, async (req, res) => {
+router.delete('/clients/:id/projects/:projectId', clientAuth, clientsDelete, async (req, res) => {
   const db = await getPool();
   try {
     await db.query(
