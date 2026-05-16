@@ -32,6 +32,29 @@ function adminOnly(req, res, next) {
   next();
 }
 
+// Permission check middleware factory
+// usage: requirePermission('packing', 'read')
+function requirePermission(menuKey, level = 'read') {
+  return async (req, res, next) => {
+    if (req.user.role === 'admin') return next(); // admin always has full access
+    try {
+      const db = await getPool();
+      const [[perm]] = await db.query(
+        'SELECT * FROM worker_permissions WHERE worker_id=? AND menu_key=?',
+        [req.user.id, menuKey]
+      );
+      if (!perm) return res.status(403).json({ message: 'Access denied: no permission for this menu' });
+      const levelMap = { read: 'can_read', write: 'can_write', edit: 'can_edit', delete: 'can_delete' };
+      const col = levelMap[level];
+      if (!perm[col]) return res.status(403).json({ message: `Access denied: ${level} permission required` });
+      req.userPermission = perm; // attach for downstream use
+      next();
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  };
+}
+
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
 const { imgUpload, galleryUpload, moReferenceUpload, clientPoUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 const auditLog = require('../middleware/auditLog');
@@ -2613,6 +2636,73 @@ router.put('/settings', auth, adminOnly, auditLog('UPDATE','Settings'), async (r
     }
     res.json({ message: 'Settings saved' });
   } catch(err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── USER RIGHTS / PERMISSIONS ─────────────────────────────────────────────────
+
+// GET all workers' permissions (admin) or own permissions (worker)
+router.get('/user-rights', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    if (req.user.role === 'admin') {
+      // Admin gets all workers with their permissions
+      const [workers] = await db.query(
+        "SELECT id, name, username, is_active FROM users WHERE role='worker' ORDER BY name"
+      );
+      const [perms] = await db.query('SELECT * FROM worker_permissions');
+      const permMap = {};
+      perms.forEach(p => {
+        if (!permMap[p.worker_id]) permMap[p.worker_id] = {};
+        permMap[p.worker_id][p.menu_key] = p;
+      });
+      res.json({ workers, permissions: permMap });
+    } else {
+      // Worker gets own permissions
+      const [perms] = await db.query(
+        'SELECT menu_key, can_read, can_write, can_edit, can_delete FROM worker_permissions WHERE worker_id=?',
+        [req.user.id]
+      );
+      const permMap = {};
+      perms.forEach(p => { permMap[p.menu_key] = p; });
+      res.json(permMap);
+    }
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// PUT save permissions for a specific worker (admin only)
+router.put('/user-rights/:workerId', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    const { workerId } = req.params;
+    const { permissions } = req.body; // { packing: { can_read:1, can_write:1, ... }, dispatch: {...}, ... }
+
+    // Verify worker exists
+    const [[worker]] = await db.query("SELECT id FROM users WHERE id=? AND role='worker'", [workerId]);
+    if (!worker) return res.status(404).json({ message: 'Worker not found' });
+
+    // Delete old permissions and re-insert
+    await db.query('DELETE FROM worker_permissions WHERE worker_id=?', [workerId]);
+
+    if (permissions && Object.keys(permissions).length > 0) {
+      for (const [menuKey, perm] of Object.entries(permissions)) {
+        // If delete is granted, auto-grant read+write+edit
+        const canDelete = perm.can_delete ? 1 : 0;
+        const canEdit = (perm.can_edit || canDelete) ? 1 : 0;
+        const canWrite = (perm.can_write || canDelete) ? 1 : 0;
+        const canRead = (perm.can_read || canWrite || canEdit || canDelete) ? 1 : 0;
+
+        if (canRead || canWrite || canEdit || canDelete) {
+          await db.query(
+            `INSERT INTO worker_permissions (worker_id, menu_key, can_read, can_write, can_edit, can_delete)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [workerId, menuKey, canRead, canWrite, canEdit, canDelete]
+          );
+        }
+      }
+    }
+
+    res.json({ message: 'Permissions saved successfully' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // ── DEPARTMENT DELETE ────────────────────────────────────────────

@@ -669,6 +669,21 @@ async function initializeDatabase() {
     FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
 
+  // ── User Rights / Permissions ─────────────────────────────────────────────
+  await db.query(`CREATE TABLE IF NOT EXISTS worker_permissions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    worker_id INT NOT NULL,
+    menu_key VARCHAR(100) NOT NULL,
+    can_read TINYINT(1) DEFAULT 0,
+    can_write TINYINT(1) DEFAULT 0,
+    can_edit TINYINT(1) DEFAULT 0,
+    can_delete TINYINT(1) DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_worker_menu (worker_id, menu_key),
+    FOREIGN KEY (worker_id) REFERENCES users(id) ON DELETE CASCADE
+  )`);
+
   console.log('✅ Workshop App Database initialized');
   return db;
 }
