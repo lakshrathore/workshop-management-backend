@@ -2729,6 +2729,166 @@ router.put('/user-rights/:workerId', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── CLIENT PO REPORT ─────────────────────────────────────────────────────────
+// GET /admin/reports/client-po — PO vs Sale Invoice vs Payment summary
+router.get('/admin/reports/client-po', auth, adminOnly, async (req, res) => {
+  const db = await getPool();
+  try {
+    // All Client POs with payment totals
+    const [pos] = await db.query(`
+      SELECT
+        cpo.id,
+        cpo.po_number,
+        cpo.order_date,
+        cpo.due_date,
+        cpo.status,
+        cpo.total_amount                                                          AS po_amount,
+        cpo.quantity                                                              AS po_qty,
+        cpo.item_name,
+        cpo.project_name,
+        cpo.linked_project_id,
+        u.name                                                                    AS client_name,
+        u.id                                                                      AS client_id,
+        COALESCE(SUM(cpp.amount), 0)                                              AS paid_amount,
+        COALESCE(SUM(CASE WHEN cpp.is_advance=1 THEN cpp.amount ELSE 0 END), 0)  AS advance_amount
+      FROM client_purchase_orders cpo
+      JOIN users u ON u.id = cpo.client_id
+      LEFT JOIN client_po_payments cpp ON cpp.po_id = cpo.id
+      GROUP BY cpo.id
+      ORDER BY cpo.created_at DESC
+    `);
+
+    const poIds = pos.map(p => p.id);
+    let saleMap = {};   // cpo_id → { sale_amount, sale_qty, sale_count, sales[] }
+
+    if (poIds.length > 0) {
+      const placeholders = poIds.map(() => '?').join(',');
+
+      // All Sales (challan_type='sale') linked to a CPO — header info
+      const [sales] = await db.query(`
+        SELECT
+          sc.id,
+          sc.cpo_id,
+          sc.challan_number    AS invoice_number,
+          sc.challan_date      AS sale_date,
+          sc.client_name,
+          sc.total_amount,
+          sc.status,
+          sc.project_id
+        FROM sale_challans sc
+        WHERE sc.cpo_id IN (${placeholders})
+          AND sc.challan_type = 'sale'
+        ORDER BY sc.challan_date DESC
+      `, poIds);
+
+      // All line items for those sales (for qty tracking)
+      const saleIds = sales.map(s => s.id);
+      let itemRows = [];
+      if (saleIds.length > 0) {
+        const [rows] = await db.query(`
+          SELECT
+            sci.challan_id,
+            sci.item_name,
+            sci.quantity,
+            sci.unit,
+            sci.rate,
+            sci.total
+          FROM sale_challan_items sci
+          WHERE sci.challan_id IN (${saleIds.map(() => '?').join(',')})
+          ORDER BY sci.sort_order, sci.id
+        `, saleIds);
+        itemRows = rows;
+      }
+
+      // Group items by challan_id
+      const itemsByChallan = {};
+      itemRows.forEach(item => {
+        if (!itemsByChallan[item.challan_id]) itemsByChallan[item.challan_id] = [];
+        itemsByChallan[item.challan_id].push(item);
+      });
+
+      // Build saleMap grouped by cpo_id
+      sales.forEach(sale => {
+        if (!saleMap[sale.cpo_id]) {
+          saleMap[sale.cpo_id] = { sale_amount: 0, sale_qty: 0, sale_count: 0, sales: [] };
+        }
+        const items = itemsByChallan[sale.id] || [];
+        const saleQty = items.reduce((s, i) => s + parseFloat(i.quantity || 0), 0);
+        saleMap[sale.cpo_id].sale_amount += parseFloat(sale.total_amount || 0);
+        saleMap[sale.cpo_id].sale_qty    += saleQty;
+        saleMap[sale.cpo_id].sale_count  += 1;
+        saleMap[sale.cpo_id].sales.push({
+          id:             sale.id,
+          invoice_number: sale.invoice_number,
+          sale_date:      sale.sale_date,
+          client_name:    sale.client_name,
+          total_amount:   parseFloat(sale.total_amount || 0),
+          status:         sale.status,
+          qty:            saleQty,
+          items,
+        });
+      });
+    }
+
+    // Also fetch unlinked sales (cpo_id IS NULL) for reference
+    const [unlinkedSales] = await db.query(`
+      SELECT
+        sc.id,
+        sc.challan_number AS invoice_number,
+        sc.challan_date   AS sale_date,
+        sc.client_name,
+        sc.total_amount,
+        sc.status,
+        sc.project_id
+      FROM sale_challans sc
+      WHERE (sc.cpo_id IS NULL OR sc.cpo_id = 0)
+        AND sc.challan_type = 'sale'
+      ORDER BY sc.challan_date DESC
+    `);
+
+    // Build result
+    const result = pos.map(po => {
+      const sm    = saleMap[po.id] || { sale_amount: 0, sale_qty: 0, sale_count: 0, sales: [] };
+      const poAmt = parseFloat(po.po_amount  || 0);
+      const poQty = parseFloat(po.po_qty     || 0);
+      const paidAmt  = parseFloat(po.paid_amount    || 0);
+      const advAmt   = parseFloat(po.advance_amount || 0);
+
+      return {
+        id:               po.id,
+        po_number:        po.po_number,
+        order_date:       po.order_date,
+        due_date:         po.due_date,
+        status:           po.status,
+        client_name:      po.client_name,
+        client_id:        po.client_id,
+        item_name:        po.item_name,
+        project_name:     po.project_name,
+        linked_project_id: po.linked_project_id,
+        // Qty
+        po_qty:           poQty,
+        sold_qty:         sm.sale_qty,
+        remaining_qty:    poQty > 0 ? Math.max(0, poQty - sm.sale_qty) : null,
+        // Sale billing
+        po_amount:        poAmt,
+        sale_amount:      sm.sale_amount,
+        remaining_amount: poAmt - sm.sale_amount,
+        sale_pct:         poAmt > 0 ? Math.min(Math.round(sm.sale_amount / poAmt * 100), 100) : 0,
+        sale_count:       sm.sale_count,
+        sales:            sm.sales,
+        // Payment
+        paid_amount:      paidAmt,
+        advance_amount:   advAmt,
+        payment_balance:  paidAmt >= poAmt ? 0 : poAmt - paidAmt,
+        excess_payment:   paidAmt > poAmt ? paidAmt - poAmt : 0,
+        paid_pct:         poAmt > 0 ? Math.min(Math.round(paidAmt / poAmt * 100), 100) : 0,
+      };
+    });
+
+    res.json({ pos: result, unlinked_sales: unlinkedSales });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
 // ── DEPARTMENT DELETE ────────────────────────────────────────────
 router.delete('/departments/:id', auth, adminOrPermission('departments','delete'), auditLog('DELETE','Department'), async (req, res) => {
   const db = await getPool();
