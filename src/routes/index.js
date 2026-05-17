@@ -4304,12 +4304,55 @@ router.get('/admin/client-purchase-orders', auth, adminOrPermission('client_pos'
   try {
     const [pos] = await db.query(
       `SELECT cpo.*, u.name as client_name,
-        COALESCE((SELECT SUM(amount) FROM client_po_payments WHERE po_id=cpo.id),0) as paid_amount
+        COALESCE((SELECT SUM(amount) FROM client_po_payments WHERE po_id=cpo.id),0) as paid_amount,
+        COALESCE((
+          SELECT SUM(sci.quantity)
+          FROM sale_challan_items sci
+          JOIN sale_challans sc ON sc.id = sci.challan_id
+          WHERE sc.cpo_id = cpo.id AND sc.challan_type = 'sale'
+        ),0) as sold_qty
        FROM client_purchase_orders cpo
        JOIN users u ON u.id=cpo.client_id
        ORDER BY cpo.created_at DESC`
     );
-    res.json(pos);
+    // Add remaining_qty
+    const result = pos.map(p => ({
+      ...p,
+      sold_qty: parseFloat(p.sold_qty || 0),
+      remaining_qty: p.quantity > 0
+        ? Math.max(0, parseFloat(p.quantity) - parseFloat(p.sold_qty || 0))
+        : null,
+    }));
+    res.json(result);
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// GET /admin/client-purchase-orders/:id/qty-status — remaining qty for sale form
+router.get('/admin/client-purchase-orders/:id/qty-status', auth, adminOrPermission('client_pos','read'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[po]] = await db.query(
+      'SELECT id, po_number, quantity, item_name FROM client_purchase_orders WHERE id=?',
+      [req.params.id]
+    );
+    if (!po) return res.status(404).json({ message: 'PO not found' });
+    const [[sold]] = await db.query(
+      `SELECT COALESCE(SUM(sci.quantity),0) as sold_qty
+       FROM sale_challan_items sci
+       JOIN sale_challans sc ON sc.id = sci.challan_id
+       WHERE sc.cpo_id = ? AND sc.challan_type = 'sale'`,
+      [req.params.id]
+    );
+    const soldQty = parseFloat(sold.sold_qty || 0);
+    const poQty   = parseFloat(po.quantity   || 0);
+    res.json({
+      po_id:         po.id,
+      po_number:     po.po_number,
+      item_name:     po.item_name,
+      po_qty:        poQty,
+      sold_qty:      soldQty,
+      remaining_qty: poQty > 0 ? Math.max(0, poQty - soldQty) : null,
+    });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
