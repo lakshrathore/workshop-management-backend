@@ -4804,4 +4804,218 @@ router.patch('/admin/tickets/:id/status', auth, adminOrPermission('client_suppor
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
+router.get('/outsource-jobs', auth, async (req, res) => {
+  const db = await getPool();
+  const { project_id, vendor_name, department, status, overdue } = req.query;
+  try {
+    let where = 'WHERE 1=1';
+    const params = [];
+    if (project_id)   { where += ' AND oj.project_id=?';              params.push(project_id); }
+    if (vendor_name)  { where += ' AND oj.vendor_name LIKE ?';         params.push(`%${vendor_name}%`); }
+    if (department)   { where += ' AND oj.department=?';               params.push(department); }
+    if (status)       { where += ' AND oj.status=?';                   params.push(status); }
+    if (overdue === '1') {
+      where += ' AND oj.expected_date < CURDATE() AND oj.status NOT IN ("Received","Cancelled")';
+    }
+
+    const [rows] = await db.query(`
+      SELECT oj.*,
+        p.name as project_name, p.project_id as proj_code,
+        pi.item_name
+      FROM outsource_jobs oj
+      LEFT JOIN projects p ON p.id = oj.project_id
+      LEFT JOIN project_items pi ON pi.id = oj.project_item_id
+      ${where}
+      ORDER BY
+        CASE WHEN oj.status IN ('Received','Cancelled') THEN 1 ELSE 0 END,
+        CASE WHEN oj.expected_date < CURDATE() AND oj.status NOT IN ('Received','Cancelled') THEN 0 ELSE 1 END,
+        oj.expected_date ASC,
+        oj.created_at DESC
+    `, params);
+
+    res.json(rows);
+  } catch(err) {
+    console.error('outsource-jobs GET error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET single outsource job
+router.get('/outsource-jobs/:id', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[job]] = await db.query(`
+      SELECT oj.*,
+        p.name as project_name, p.project_id as proj_code,
+        pi.item_name
+      FROM outsource_jobs oj
+      LEFT JOIN projects p ON p.id = oj.project_id
+      LEFT JOIN project_items pi ON pi.id = oj.project_item_id
+      WHERE oj.id=?`, [req.params.id]);
+    if (!job) return res.status(404).json({ message: 'Job not found' });
+    res.json(job);
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST create new outsource job
+router.post('/outsource-jobs', auth, async (req, res) => {
+  const db = await getPool();
+  const {
+    project_id, project_item_id, department,
+    vendor_name, vendor_phone,
+    qty_sent, sent_date, expected_date, notes
+  } = req.body;
+
+  if (!project_id || !vendor_name || !qty_sent || !sent_date || !expected_date) {
+    return res.status(400).json({ message: 'Project, vendor, qty, sent date aur expected date zaroori hain' });
+  }
+
+  try {
+    const [r] = await db.query(`
+      INSERT INTO outsource_jobs
+        (project_id, project_item_id, department, vendor_name, vendor_phone,
+         qty_sent, qty_received, sent_date, expected_date, status, notes, created_by)
+      VALUES (?,?,?,?,?,?,0,?,?,'Sent',?,?)`,
+      [project_id, project_item_id||null, department||null,
+       vendor_name.trim(), vendor_phone||null,
+       qty_sent, sent_date, expected_date, notes||'', req.user.id]
+    );
+    res.json({ id: r.insertId, message: 'Outsource job create ho gaya' });
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PUT update outsource job
+router.put('/outsource-jobs/:id', auth, async (req, res) => {
+  const db = await getPool();
+  const {
+    project_id, project_item_id, department,
+    vendor_name, vendor_phone,
+    qty_sent, qty_received, sent_date, expected_date,
+    received_date, status, notes
+  } = req.body;
+
+  try {
+    const [[existing]] = await db.query('SELECT * FROM outsource_jobs WHERE id=?', [req.params.id]);
+    if (!existing) return res.status(404).json({ message: 'Job not found' });
+
+    // Auto status based on qty
+    let finalStatus = status || existing.status;
+    const sent = parseInt(qty_sent) || existing.qty_sent;
+    const received = parseInt(qty_received) ?? existing.qty_received;
+
+    if (received >= sent && received > 0 && finalStatus !== 'Cancelled') {
+      finalStatus = 'Received';
+    } else if (received > 0 && received < sent && finalStatus !== 'Cancelled') {
+      finalStatus = 'Partial';
+    } else if (received === 0 && finalStatus !== 'Cancelled') {
+      finalStatus = 'Sent';
+    }
+
+    await db.query(`
+      UPDATE outsource_jobs SET
+        project_id=?, project_item_id=?, department=?,
+        vendor_name=?, vendor_phone=?,
+        qty_sent=?, qty_received=?,
+        sent_date=?, expected_date=?,
+        received_date=?, status=?, notes=?,
+        updated_at=NOW()
+      WHERE id=?`,
+      [project_id, project_item_id||null, department||null,
+       vendor_name.trim(), vendor_phone||null,
+       qty_sent, received,
+       sent_date, expected_date,
+       received_date||null, finalStatus, notes||'',
+       req.params.id]
+    );
+
+    res.json({ message: 'Updated', status: finalStatus });
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PATCH quick update (qty received / status)
+router.patch('/outsource-jobs/:id/receive', auth, async (req, res) => {
+  const db = await getPool();
+  const { qty_received, notes } = req.body;
+  try {
+    const [[job]] = await db.query('SELECT * FROM outsource_jobs WHERE id=?', [req.params.id]);
+    if (!job) return res.status(404).json({ message: 'Job not found' });
+
+    const received = parseInt(qty_received) || 0;
+    let status = 'Sent';
+    let received_date = null;
+
+    if (received >= job.qty_sent && received > 0) {
+      status = 'Received';
+      received_date = new Date().toISOString().split('T')[0];
+    } else if (received > 0) {
+      status = 'Partial';
+    }
+
+    await db.query(
+      'UPDATE outsource_jobs SET qty_received=?, status=?, received_date=?, notes=COALESCE(?,notes), updated_at=NOW() WHERE id=?',
+      [received, status, received_date, notes||null, req.params.id]
+    );
+
+    res.json({ message: 'Updated', status, qty_received: received });
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// DELETE outsource job
+router.delete('/outsource-jobs/:id', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    await db.query('DELETE FROM outsource_jobs WHERE id=?', [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET vendor suggestions (autocomplete — distinct vendor names)
+router.get('/outsource-jobs/vendors/suggestions', auth, async (req, res) => {
+  const db = await getPool();
+  const { q } = req.query;
+  try {
+    const [rows] = await db.query(`
+      SELECT DISTINCT vendor_name, vendor_phone,
+        COUNT(*) as job_count
+      FROM outsource_jobs
+      WHERE vendor_name LIKE ?
+      GROUP BY vendor_name, vendor_phone
+      ORDER BY job_count DESC, vendor_name ASC
+      LIMIT 10
+    `, [`%${q||''}%`]);
+    res.json(rows);
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET dashboard summary (for admin dashboard widget)
+router.get('/outsource-jobs/summary/dashboard', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[stats]] = await db.query(`
+      SELECT
+        COUNT(*) as total,
+        SUM(status NOT IN ('Received','Cancelled')) as pending_count,
+        SUM(expected_date < CURDATE() AND status NOT IN ('Received','Cancelled')) as overdue_count,
+        SUM(status = 'Partial') as partial_count
+      FROM outsource_jobs
+    `);
+    res.json(stats);
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+
 module.exports = router;
