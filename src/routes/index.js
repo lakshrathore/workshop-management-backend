@@ -4804,7 +4804,7 @@ router.patch('/admin/tickets/:id/status', auth, adminOrPermission('client_suppor
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
-router.get('/outsource-jobs', auth, async (req, res) => {
+router.get('/outsource-jobs', auth, adminOrPermission('outsource','read'), async (req, res) => {
   const db = await getPool();
   const { project_id, vendor_name, department, status, overdue } = req.query;
   try {
@@ -4841,7 +4841,7 @@ router.get('/outsource-jobs', auth, async (req, res) => {
 });
 
 // GET single outsource job
-router.get('/outsource-jobs/:id', auth, async (req, res) => {
+router.get('/outsource-jobs/:id', auth, adminOrPermission('outsource','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [[job]] = await db.query(`
@@ -4860,7 +4860,7 @@ router.get('/outsource-jobs/:id', auth, async (req, res) => {
 });
 
 // POST create new outsource job
-router.post('/outsource-jobs', auth, async (req, res) => {
+router.post('/outsource-jobs', auth, adminOrPermission('outsource','write'), async (req, res) => {
   const db = await getPool();
   const {
     project_id, project_item_id, department,
@@ -4869,7 +4869,7 @@ router.post('/outsource-jobs', auth, async (req, res) => {
   } = req.body;
 
   if (!project_id || !vendor_name || !qty_sent || !sent_date || !expected_date) {
-    return res.status(400).json({ message: 'Project, vendor, qty, sent date aur expected date zaroori hain' });
+    return res.status(400).json({ message: 'Project, vendor, quantity, sent date and expected date are required' });
   }
 
   try {
@@ -4882,14 +4882,14 @@ router.post('/outsource-jobs', auth, async (req, res) => {
        vendor_name.trim(), vendor_phone||null,
        qty_sent, sent_date, expected_date, notes||'', req.user.id]
     );
-    res.json({ id: r.insertId, message: 'Outsource job create ho gaya' });
+    res.json({ id: r.insertId, message: 'Outsource job created' });
   } catch(err) {
     res.status(500).json({ message: err.message });
   }
 });
 
 // PUT update outsource job
-router.put('/outsource-jobs/:id', auth, async (req, res) => {
+router.put('/outsource-jobs/:id', auth, adminOrPermission('outsource','edit'), async (req, res) => {
   const db = await getPool();
   const {
     project_id, project_item_id, department,
@@ -4905,7 +4905,9 @@ router.put('/outsource-jobs/:id', auth, async (req, res) => {
     // Auto status based on qty
     let finalStatus = status || existing.status;
     const sent = parseInt(qty_sent) || existing.qty_sent;
-    const received = parseInt(qty_received) ?? existing.qty_received;
+    // NOTE: parseInt(undefined) is NaN, and `NaN ?? x` keeps NaN — so guard explicitly.
+    const parsedReceived = parseInt(qty_received);
+    const received = Number.isFinite(parsedReceived) ? parsedReceived : existing.qty_received;
 
     if (received >= sent && received > 0 && finalStatus !== 'Cancelled') {
       finalStatus = 'Received';
@@ -4913,6 +4915,12 @@ router.put('/outsource-jobs/:id', auth, async (req, res) => {
       finalStatus = 'Partial';
     } else if (received === 0 && finalStatus !== 'Cancelled') {
       finalStatus = 'Sent';
+    }
+
+    // When a job becomes Received but no date was supplied, default to today.
+    let finalReceivedDate = received_date || null;
+    if (finalStatus === 'Received' && !finalReceivedDate) {
+      finalReceivedDate = existing.received_date || new Date().toISOString().split('T')[0];
     }
 
     await db.query(`
@@ -4928,7 +4936,7 @@ router.put('/outsource-jobs/:id', auth, async (req, res) => {
        vendor_name.trim(), vendor_phone||null,
        qty_sent, received,
        sent_date, expected_date,
-       received_date||null, finalStatus, notes||'',
+       finalReceivedDate, finalStatus, notes||'',
        req.params.id]
     );
 
@@ -4939,7 +4947,7 @@ router.put('/outsource-jobs/:id', auth, async (req, res) => {
 });
 
 // PATCH quick update (qty received / status)
-router.patch('/outsource-jobs/:id/receive', auth, async (req, res) => {
+router.patch('/outsource-jobs/:id/receive', auth, adminOrPermission('outsource','edit'), async (req, res) => {
   const db = await getPool();
   const { qty_received, notes } = req.body;
   try {
@@ -4969,7 +4977,7 @@ router.patch('/outsource-jobs/:id/receive', auth, async (req, res) => {
 });
 
 // DELETE outsource job
-router.delete('/outsource-jobs/:id', auth, async (req, res) => {
+router.delete('/outsource-jobs/:id', auth, adminOrPermission('outsource','delete'), async (req, res) => {
   const db = await getPool();
   try {
     await db.query('DELETE FROM outsource_jobs WHERE id=?', [req.params.id]);
@@ -4980,7 +4988,7 @@ router.delete('/outsource-jobs/:id', auth, async (req, res) => {
 });
 
 // GET vendor suggestions (autocomplete — distinct vendor names)
-router.get('/outsource-jobs/vendors/suggestions', auth, async (req, res) => {
+router.get('/outsource-jobs/vendors/suggestions', auth, adminOrPermission('outsource','read'), async (req, res) => {
   const db = await getPool();
   const { q } = req.query;
   try {
@@ -5000,7 +5008,7 @@ router.get('/outsource-jobs/vendors/suggestions', auth, async (req, res) => {
 });
 
 // GET dashboard summary (for admin dashboard widget)
-router.get('/outsource-jobs/summary/dashboard', auth, async (req, res) => {
+router.get('/outsource-jobs/summary/dashboard', auth, adminOrPermission('outsource','read'), async (req, res) => {
   const db = await getPool();
   try {
     const [[stats]] = await db.query(`
