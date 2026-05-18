@@ -102,6 +102,10 @@ const apiRoutes = require('./routes');
 // const backupRoutes = require('./routes/backupRoutes');  // BACKUP SYSTEM DISABLED
 app.use('/api', apiRoutes);
 
+// ── APPROVAL SYSTEM ROUTES ────────────────────────────────────────────────────
+const approvalRoutes = require('./routes/approvalRoutes');
+app.use('/api', approvalRoutes);
+
 // ── CLIENT PORTAL ROUTES ──────────────────────────────────────────────────────
 const clientRoutes = require('./routes/clientRoutes');
 app.use('/api', clientRoutes);

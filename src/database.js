@@ -684,6 +684,69 @@ async function initializeDatabase() {
     FOREIGN KEY (worker_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
 
+  // ── APPROVAL SYSTEM ─────────────────────────────────────────────────────────
+  // Main approval requests table
+  await db.query(`CREATE TABLE IF NOT EXISTS approvals (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    type ENUM('PROJECT','ITEM','CHALLAN','PO_STATUS','SALE') NOT NULL,
+    related_id INT DEFAULT NULL,
+    user_id INT NOT NULL,
+    requested_data LONGTEXT NOT NULL COMMENT 'JSON with complete request body',
+    status ENUM('PENDING','APPROVED','REJECTED','CANCELLED') DEFAULT 'PENDING',
+    admin_notes TEXT,
+    approved_by INT DEFAULT NULL,
+    approved_at DATETIME DEFAULT NULL,
+    rejected_reason TEXT,
+    rejected_at DATETIME DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (approved_by) REFERENCES users(id) ON DELETE SET NULL,
+    INDEX idx_status (status),
+    INDEX idx_type (type),
+    INDEX idx_user_id (user_id),
+    INDEX idx_created_at (created_at),
+    INDEX idx_pending (status, type)
+  )`);
+
+  // Approval queue for counting pending approvals per user+action
+  await db.query(`CREATE TABLE IF NOT EXISTS approval_queue (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    action_type VARCHAR(100) NOT NULL,
+    pending_count INT DEFAULT 0,
+    last_request_at DATETIME DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE KEY unique_user_action (user_id, action_type),
+    INDEX idx_pending_count (pending_count),
+    INDEX idx_user_id (user_id)
+  )`);
+
+  // Approval system settings (feature flags)
+  await db.query(`CREATE TABLE IF NOT EXISTS approval_settings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    setting_key VARCHAR(100) UNIQUE NOT NULL,
+    setting_value VARCHAR(255) NOT NULL,
+    description TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_setting_key (setting_key)
+  )`);
+
+  // Seed default approval settings (disabled by default for safety)
+  const approvalSettings = [
+    ['approval_system_enabled', '0', 'Master switch: 0=disabled, 1=enabled'],
+    ['require_approval_for_PROJECT', '1', 'Require approval for Project creation'],
+    ['require_approval_for_ITEM', '1', 'Require approval for Item addition'],
+    ['require_approval_for_CHALLAN', '1', 'Require approval for Sale Challan'],
+    ['require_approval_for_PO_STATUS', '1', 'Require approval for PO status changes'],
+    ['require_approval_for_SALE', '1', 'Require approval for Sales/Invoices']
+  ];
+  for (const [k, v, d] of approvalSettings) {
+    await db.query('INSERT IGNORE INTO approval_settings (setting_key, setting_value, description) VALUES (?,?,?)', [k, v, d]);
+  }
+
   console.log('✅ Workshop App Database initialized');
   return db;
 }
