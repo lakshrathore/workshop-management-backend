@@ -3,7 +3,6 @@ const router = express.Router();
 const { getPool } = require('../database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { isApprovalRequired, createApprovalRequest } = require('../services/approvalService');
 const path = require('path');
 require('dotenv').config();
 
@@ -494,26 +493,6 @@ router.get('/projects', auth, async (req, res) => {
 });
 router.post('/projects', auth, adminOrPermission('projects','write'), auditLog('CREATE','Project'), async (req, res) => {
   const db = await getPool();
-
-  // ── Approval Check ──────────────────────────────────────────────────────
-  // Admin always bypasses approval
-  if (req.user.role !== 'admin') {
-    const needsApproval = await isApprovalRequired('PROJECT');
-    if (needsApproval) {
-      const result = await createApprovalRequest({
-        type: 'PROJECT',
-        userId: req.user.id,
-        requestData: req.body,
-      });
-      return res.status(202).json({
-        approval_status: 'PENDING',
-        approval_id: result.approval_id,
-        message: 'Project creation request submitted for admin approval',
-      });
-    }
-  }
-  // ────────────────────────────────────────────────────────────────────────
-
   const { project_id, name, client_name, client_phone, description, priority, order_date, deadline, total_amount, notes } = req.body;
   // Auto-generate project_id if not provided
   let finalProjectId = project_id;
@@ -994,6 +973,123 @@ router.put('/projects/:projectId/items/:id', auth, adminOrPermission('projects',
     [item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes, req.params.id, req.params.projectId]);
   res.json({ message: 'Updated' });
 });
+
+// ── Qty Amendment: Check impact before changing qty on a chained item ────────
+router.get('/projects/:projectId/items/:id/qty-impact', auth, adminOrPermission('projects','edit'), async (req, res) => {
+  const db = await getPool();
+  const { new_qty } = req.query;
+  const itemId = req.params.id;
+  const projectId = req.params.projectId;
+
+  // Get current item
+  const [[item]] = await db.query('SELECT * FROM project_items WHERE id=? AND project_id=?', [itemId, projectId]);
+  if (!item) return res.status(404).json({ message: 'Item not found' });
+
+  // Get all chain tasks for this item
+  const [tasks] = await db.query(
+    `SELECT ta.id, ta.stage_order, ta.status, ta.quantity_assigned, ta.quantity_completed,
+            ta.task_title, d.name as department_name
+     FROM task_assignments ta
+     LEFT JOIN departments d ON d.id = ta.department_id
+     WHERE ta.project_item_id = ?
+     ORDER BY ta.stage_order ASC`,
+    [itemId]
+  );
+
+  const currentQty = parseInt(item.quantity, 10);
+  const newQty = parseInt(new_qty, 10);
+  const diff = newQty - currentQty;
+
+  // Total already done across all stages
+  const totalDone = tasks.reduce((sum, t) => sum + (parseInt(t.quantity_completed, 10) || 0), 0);
+  const maxDone = tasks.reduce((max, t) => Math.max(max, parseInt(t.quantity_completed, 10) || 0), 0);
+
+  // Can we safely reduce?
+  const canReduce = newQty >= maxDone;
+
+  const stageImpact = tasks.map(t => ({
+    stage: t.stage_order,
+    title: t.task_title,
+    department: t.department_name,
+    status: t.status,
+    assigned: parseInt(t.quantity_assigned, 10),
+    completed: parseInt(t.quantity_completed, 10) || 0,
+    new_assigned: Math.max(parseInt(t.quantity_completed, 10) || 0, newQty),
+    change: Math.max(parseInt(t.quantity_completed, 10) || 0, newQty) - parseInt(t.quantity_assigned, 10),
+  }));
+
+  res.json({
+    current_qty: currentQty,
+    new_qty: newQty,
+    diff,
+    total_done: totalDone,
+    max_done_in_any_stage: maxDone,
+    can_proceed: canReduce,
+    has_chain: tasks.length > 0,
+    stage_impact: stageImpact,
+    block_reason: !canReduce
+      ? `Cannot reduce below ${maxDone} — some stages have already processed ${maxDone} units`
+      : null,
+  });
+});
+
+// ── Qty Amendment: Apply the qty change + update chain tasks ─────────────────
+router.post('/projects/:projectId/items/:id/amend-qty', auth, adminOrPermission('projects','edit'), async (req, res) => {
+  const db = await getPool();
+  const { new_qty, reason } = req.body;
+  const itemId = req.params.id;
+  const projectId = req.params.projectId;
+
+  if (!reason || !reason.trim()) return res.status(400).json({ message: 'Reason is required for qty amendment' });
+  if (!new_qty || parseInt(new_qty, 10) < 1) return res.status(400).json({ message: 'Invalid quantity' });
+
+  const [[item]] = await db.query('SELECT * FROM project_items WHERE id=? AND project_id=?', [itemId, projectId]);
+  if (!item) return res.status(404).json({ message: 'Item not found' });
+
+  const newQty = parseInt(new_qty, 10);
+  const oldQty = parseInt(item.quantity, 10);
+
+  // Get all chain tasks
+  const [tasks] = await db.query(
+    'SELECT * FROM task_assignments WHERE project_item_id=? ORDER BY stage_order ASC',
+    [itemId]
+  );
+
+  // Safety check — cannot go below max completed in any stage
+  const maxDone = tasks.reduce((max, t) => Math.max(max, parseInt(t.quantity_completed, 10) || 0), 0);
+  if (newQty < maxDone) {
+    return res.status(400).json({
+      message: `Cannot reduce qty to ${newQty}. Stage(s) have already completed ${maxDone} units.`
+    });
+  }
+
+  // Update item qty
+  await db.query('UPDATE project_items SET quantity=?, notes=CONCAT(IFNULL(notes,""), ?) WHERE id=?', [
+    newQty,
+    `\n[Qty amended ${oldQty}→${newQty} by user #${req.user.id}: ${reason}]`,
+    itemId
+  ]);
+
+  // Update all non-completed chain task quantities
+  for (const task of tasks) {
+    const done = parseInt(task.quantity_completed, 10) || 0;
+    // Only update if task is not completed — keep completed qty, update assigned
+    if (task.status !== 'completed') {
+      const newAssigned = Math.max(done, newQty);
+      await db.query(
+        'UPDATE task_assignments SET quantity_assigned=? WHERE id=?',
+        [newAssigned, task.id]
+      );
+    }
+  }
+
+  res.json({
+    message: `Qty updated from ${oldQty} to ${newQty}. ${tasks.filter(t => t.status !== 'completed').length} chain stage(s) updated.`,
+    old_qty: oldQty,
+    new_qty: newQty,
+  });
+});
+// ─────────────────────────────────────────────────────────────────────────────
 router.delete('/projects/:projectId/items/:id', auth, adminOrPermission('projects','delete'), async (req, res) => {
   const db = await getPool();
   try {
