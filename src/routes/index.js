@@ -3,6 +3,7 @@ const router = express.Router();
 const { getPool } = require('../database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { isApprovalRequired, createApprovalRequest } = require('../services/approvalService');
 const path = require('path');
 require('dotenv').config();
 
@@ -493,6 +494,26 @@ router.get('/projects', auth, async (req, res) => {
 });
 router.post('/projects', auth, adminOrPermission('projects','write'), auditLog('CREATE','Project'), async (req, res) => {
   const db = await getPool();
+
+  // ── Approval Check ──────────────────────────────────────────────────────
+  // Admin always bypasses approval
+  if (req.user.role !== 'admin') {
+    const needsApproval = await isApprovalRequired('PROJECT');
+    if (needsApproval) {
+      const result = await createApprovalRequest({
+        type: 'PROJECT',
+        userId: req.user.id,
+        requestData: req.body,
+      });
+      return res.status(202).json({
+        approval_status: 'PENDING',
+        approval_id: result.approval_id,
+        message: 'Project creation request submitted for admin approval',
+      });
+    }
+  }
+  // ────────────────────────────────────────────────────────────────────────
+
   const { project_id, name, client_name, client_phone, description, priority, order_date, deadline, total_amount, notes } = req.body;
   // Auto-generate project_id if not provided
   let finalProjectId = project_id;
