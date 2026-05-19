@@ -70,9 +70,19 @@ app.post('/api/auth/login', async (req, res) => {
   const db = await getPool();
   const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
   const ua = req.headers['user-agent'] || 'unknown';
+  const JWT_SECRET = process.env.JWT_SECRET || 'workshop_secret_2024';
+  
   try {
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username and password required' });
+    }
+    
     const [rows] = await db.query('SELECT * FROM users WHERE username=? AND is_active=1', [username]);
-    if (!rows.length) return res.status(401).json({ message: 'Invalid credentials' });
+    if (!rows || !rows.length) {
+      console.log(`❌ Login failed: User ${username} not found`);
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    
     if (!bcrypt.compareSync(password, rows[0].password)) {
       try {
         await db.query(
@@ -80,21 +90,50 @@ app.post('/api/auth/login', async (req, res) => {
           [rows[0].id, rows[0].role, rows[0].name, 'LOGIN_FAILED', ip, ua]
         );
       } catch(e) { console.error('Audit insert error:', e.message); }
+      console.log(`❌ Login failed: Wrong password for ${username}`);
       return res.status(401).json({ message: 'Invalid credentials' });
     }
+    
     try {
       await db.query(
         'INSERT INTO login_logs (user_id, user_role, user_name, action, ip_address, user_agent) VALUES (?,?,?,?,?,?)',
         [rows[0].id, rows[0].role, rows[0].name, 'LOGIN', ip, ua]
       );
-      console.log('Login logged for:', rows[0].name, rows[0].role);
+      console.log('✅ Login logged for:', rows[0].name, rows[0].role);
     } catch(e) { console.error('Audit insert error:', e.message); }
-    const token = jwt.sign({ id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, process.env.JWT_SECRET, { expiresIn: '30m' });
-    const [depts] = await db.query(`SELECT d.* FROM departments d LEFT JOIN worker_departments wd ON wd.department_id=d.id WHERE wd.worker_id=?`, [rows[0].id]).catch(() => [[]]);
-    res.json({ token, user: { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role, departments: depts || [] } });
+    
+    const token = jwt.sign(
+      { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, 
+      JWT_SECRET, 
+      { expiresIn: '30m' }
+    );
+    
+    let depts = [];
+    try {
+      const [deptsResult] = await db.query(
+        `SELECT d.* FROM departments d LEFT JOIN worker_departments wd ON wd.department_id=d.id WHERE wd.worker_id=?`, 
+        [rows[0].id]
+      );
+      depts = deptsResult || [];
+    } catch(e) { 
+      console.error('Department query error:', e.message);
+    }
+    
+    const responseData = { 
+      token, 
+      user: { 
+        id: rows[0].id, 
+        name: rows[0].name, 
+        username: rows[0].username, 
+        role: rows[0].role, 
+        departments: depts 
+      } 
+    };
+    console.log('📤 Sending login response:', JSON.stringify(responseData));
+    res.json(responseData);
   } catch(err) {
-    console.error('Login error:', err.message);
-    res.status(500).json({ message: 'Login failed' });
+    console.error('❌ Login error:', err.message, err.stack);
+    res.status(500).json({ message: 'Login failed: ' + err.message });
   }
 });
 
