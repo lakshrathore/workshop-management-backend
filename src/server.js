@@ -91,7 +91,7 @@ app.post('/api/auth/login', async (req, res) => {
     } catch(e) { console.error('Audit insert error:', e.message); }
     const token = jwt.sign({ id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, process.env.JWT_SECRET, { expiresIn: '30m' });
     const [depts] = await db.query(`SELECT d.* FROM departments d LEFT JOIN worker_departments wd ON wd.department_id=d.id WHERE wd.worker_id=?`, [rows[0].id]).catch(() => [[]]);
-    res.json({ token, user: { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role, departments: depts[0] || [] } });
+    res.json({ token, user: { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role, departments: depts || [] } });
   } catch(err) {
     console.error('Login error:', err.message);
     res.status(500).json({ message: 'Login failed' });
