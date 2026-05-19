@@ -5143,4 +5143,226 @@ router.get('/outsource-jobs/summary/dashboard', auth, adminOrPermission('outsour
 });
 
 
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FORGOT PASSWORD / USERNAME — Email OTP Based Recovery
+// Supports: Admin and Client roles only. Workers must contact Admin.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// In-memory OTP store (replace with Redis for multi-instance production)
+const otpStore = new Map(); // key: email → { otp, expires, userId, purpose }
+
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit OTP
+}
+
+// ── Step 1: Request OTP ───────────────────────────────────────────────────────
+// POST /api/auth/forgot-request
+// Body: { email, purpose: 'password' | 'username' }
+router.post('/auth/forgot-request', async (req, res) => {
+  const { email, purpose } = req.body;
+
+  if (!email || !email.trim()) {
+    return res.status(400).json({ message: 'Email address is required.' });
+  }
+  if (!['password', 'username'].includes(purpose)) {
+    return res.status(400).json({ message: 'Invalid purpose. Use "password" or "username".' });
+  }
+
+  try {
+    const db = await getPool();
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // Only admin or client — workers cannot use this flow
+    const [[user]] = await db.query(
+      `SELECT id, name, username, role, email FROM users
+       WHERE LOWER(email) = ? AND is_active = 1 AND role IN ('admin', 'client')`,
+      [normalizedEmail]
+    );
+
+    // Always respond generically to prevent email enumeration
+    if (!user) {
+      return res.json({
+        message: 'If this email is registered, you will receive an OTP shortly.',
+        sent: false
+      });
+    }
+
+    const otp = generateOTP();
+    const expires = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    otpStore.set(normalizedEmail, { otp, expires, userId: user.id, purpose });
+
+    const isPassword = purpose === 'password';
+    const subject = isPassword
+      ? 'Password Reset OTP — Workshop Manager'
+      : 'Username Recovery OTP — Workshop Manager';
+
+    const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:20px;background:#f3f4f6;font-family:Arial,sans-serif">
+  <div style="max-width:520px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
+    <div style="background:#c2410c;padding:24px;text-align:center">
+      <h1 style="color:#fff;margin:0;font-size:22px;font-weight:700">Workshop Manager</h1>
+      <p style="color:#fed7aa;margin:6px 0 0;font-size:13px">Wood &amp; Furniture Production System</p>
+    </div>
+    <div style="padding:32px 28px">
+      <h2 style="color:#1e293b;margin:0 0 8px;font-size:18px">${isPassword ? 'Reset Your Password' : 'Recover Your Username'}</h2>
+      <p style="color:#64748b;margin:0 0 24px;font-size:14px">Hi <strong>${user.name}</strong>, use the OTP below to ${isPassword ? 'reset your password' : 'recover your username'}.</p>
+      <div style="background:#fff7ed;border:2px dashed #fb923c;border-radius:10px;padding:20px;text-align:center;margin:0 0 24px">
+        <p style="color:#9a3412;font-size:12px;margin:0 0 8px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Your One-Time Password</p>
+        <p style="font-size:36px;font-weight:700;color:#c2410c;letter-spacing:8px;margin:0;font-family:monospace">${otp}</p>
+        <p style="color:#9a3412;font-size:12px;margin:8px 0 0">Valid for 10 minutes</p>
+      </div>
+      <p style="color:#94a3b8;font-size:12px;margin:0">If you did not request this, please ignore this email. Your account is safe.</p>
+    </div>
+    <div style="background:#f8fafc;padding:12px 28px;border-top:1px solid #e2e8f0;text-align:center">
+      <p style="color:#94a3b8;font-size:11px;margin:0">Workshop Management System — Automated Email. Do not reply.</p>
+    </div>
+  </div>
+</body></html>`;
+
+    await sendEmail(db, { to: normalizedEmail, subject, html });
+    res.json({ message: 'If this email is registered, you will receive an OTP shortly.', sent: true });
+  } catch (err) {
+    console.error('forgot-request error:', err.message);
+    res.status(500).json({ message: 'Failed to process request. Please try again.' });
+  }
+});
+
+// ── Step 2: Verify OTP ────────────────────────────────────────────────────────
+// POST /api/auth/verify-otp
+// Body: { email, otp }
+router.post('/auth/verify-otp', async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) {
+    return res.status(400).json({ message: 'Email and OTP are required.' });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const record = otpStore.get(normalizedEmail);
+
+  if (!record) {
+    return res.status(400).json({ message: 'OTP not found or expired. Please request a new one.' });
+  }
+  if (Date.now() > record.expires) {
+    otpStore.delete(normalizedEmail);
+    return res.status(400).json({ message: 'OTP has expired. Please request a new one.' });
+  }
+  if (record.otp !== otp.toString().trim()) {
+    return res.status(400).json({ message: 'Incorrect OTP. Please check and try again.' });
+  }
+
+  // Generate short-lived reset token
+  const resetToken = jwt.sign(
+    { userId: record.userId, email: normalizedEmail, purpose: record.purpose },
+    JWT_SECRET,
+    { expiresIn: '15m' }
+  );
+
+  otpStore.delete(normalizedEmail); // single use
+
+  res.json({
+    message: 'OTP verified successfully.',
+    reset_token: resetToken,
+    purpose: record.purpose
+  });
+});
+
+// ── Step 3a: Reset Password ───────────────────────────────────────────────────
+// POST /api/auth/reset-password
+// Body: { reset_token, new_password }
+router.post('/auth/reset-password', async (req, res) => {
+  const { reset_token, new_password } = req.body;
+  if (!reset_token || !new_password) {
+    return res.status(400).json({ message: 'Reset token and new password are required.' });
+  }
+  if (new_password.length < 4) {
+    return res.status(400).json({ message: 'Password must be at least 4 characters.' });
+  }
+  try {
+    const payload = jwt.verify(reset_token, JWT_SECRET);
+    if (payload.purpose !== 'password') {
+      return res.status(400).json({ message: 'Invalid reset token for this action.' });
+    }
+    const db = await getPool();
+    const hashed = await bcrypt.hash(new_password, 10);
+    await db.query('UPDATE users SET password = ? WHERE id = ?', [hashed, payload.userId]);
+    res.json({ message: 'Password has been reset successfully. You can now log in.' });
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(400).json({ message: 'Reset session expired. Please start again.' });
+    }
+    res.status(400).json({ message: 'Invalid or expired reset token.' });
+  }
+});
+
+// ── Step 3b: Recover Username ─────────────────────────────────────────────────
+// POST /api/auth/recover-username
+// Body: { reset_token }
+router.post('/auth/recover-username', async (req, res) => {
+  const { reset_token } = req.body;
+  if (!reset_token) {
+    return res.status(400).json({ message: 'Reset token is required.' });
+  }
+  try {
+    const payload = jwt.verify(reset_token, JWT_SECRET);
+    if (payload.purpose !== 'username') {
+      return res.status(400).json({ message: 'Invalid token for this action.' });
+    }
+    const db = await getPool();
+    const [[user]] = await db.query('SELECT username, name FROM users WHERE id = ?', [payload.userId]);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Username recovered successfully.', username: user.username, name: user.name });
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(400).json({ message: 'Session expired. Please start again.' });
+    }
+    res.status(400).json({ message: 'Invalid or expired token.' });
+  }
+});
+
+// ── Check email eligibility for forgot flow ───────────────────────────────────
+// POST /api/auth/check-email-status
+// Body: { username }
+router.post('/auth/check-email-status', async (req, res) => {
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ message: 'Username is required.' });
+  try {
+    const db = await getPool();
+    const [[user]] = await db.query(
+      'SELECT role, email FROM users WHERE username = ? AND is_active = 1',
+      [username.trim()]
+    );
+    if (!user) return res.json({ eligible: false, reason: 'user_not_found' });
+    if (user.role === 'worker') {
+      return res.json({ eligible: false, reason: 'worker', message: 'Workers cannot use self-service password recovery. Please contact your admin.' });
+    }
+    if (!user.email || !user.email.trim()) {
+      return res.json({ eligible: false, reason: 'no_email', message: 'No email address is associated with your account. Please contact your admin to add one.' });
+    }
+    return res.json({ eligible: true, role: user.role });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error.' });
+  }
+});
+
+// ── Update own email (Admin/Client from their profile/settings) ───────────────
+// PUT /api/auth/update-my-email
+// Body: { email }
+router.put('/auth/update-my-email', auth, async (req, res) => {
+  const { email } = req.body;
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ message: 'A valid email address is required.' });
+  }
+  try {
+    const db = await getPool();
+    await db.query('UPDATE users SET email = ? WHERE id = ?', [email.trim().toLowerCase(), req.user.id]);
+    res.json({ message: 'Email updated successfully.' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 module.exports = router;

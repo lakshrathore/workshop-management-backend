@@ -125,7 +125,7 @@ router.get('/clients', clientAuth, clientsRead, async (req, res) => {
   try {
     const [clients] = await db.query(`
       SELECT 
-        u.id, u.name, u.username, u.phone, u.is_active, u.created_at,
+        u.id, u.name, u.username, u.phone, u.email, u.is_active, u.created_at,
         COUNT(cpa.project_id) as project_count
       FROM users u
       LEFT JOIN client_project_access cpa ON cpa.client_id = u.id
@@ -144,9 +144,14 @@ router.get('/clients', clientAuth, clientsRead, async (req, res) => {
 router.post('/clients', clientAuth, clientsWrite, async (req, res) => {
   const db = await getPool();
   try {
-    const { name, username, password, phone } = req.body;
+    const { name, username, password, phone, email } = req.body;
     if (!name || !username || !password) {
       return res.status(400).json({ message: 'Name, username aur password zaroori hai' });
+    }
+
+    // Email format validate karo (agar diya hai)
+    if (email && email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ message: 'Valid email address daalo' });
     }
 
     // Username unique check
@@ -157,8 +162,8 @@ router.post('/clients', clientAuth, clientsWrite, async (req, res) => {
 
     const hashed = bcrypt.hashSync(password, 10);
     const [result] = await db.query(
-      'INSERT INTO users (name, username, password, role, phone, is_active) VALUES (?, ?, ?, ?, ?, 1)',
-      [name, username, hashed, 'client', phone || null]
+      'INSERT INTO users (name, username, password, role, phone, email, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)',
+      [name, username, hashed, 'client', phone || null, email ? email.trim().toLowerCase() : null]
     );
 
     res.json({ id: result.insertId, message: 'Client bana diya gaya' });
@@ -172,24 +177,45 @@ router.post('/clients', clientAuth, clientsWrite, async (req, res) => {
 router.put('/clients/:id', clientAuth, clientsEdit, async (req, res) => {
   const db = await getPool();
   try {
-    const { name, phone, is_active, password } = req.body;
+    const { name, phone, is_active, password, email } = req.body;
     const clientId = req.params.id;
+
+    // Email format validate karo (agar diya hai)
+    if (email && email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ message: 'Valid email address daalo' });
+    }
 
     // Verify it's actually a client
     const [[client]] = await db.query('SELECT id FROM users WHERE id = ? AND role = ?', [clientId, 'client']);
     if (!client) return res.status(404).json({ message: 'Client nahi mila' });
 
+    const emailVal = email !== undefined ? (email ? email.trim().toLowerCase() : null) : undefined;
+
     if (password) {
       const hashed = bcrypt.hashSync(password, 10);
-      await db.query(
-        'UPDATE users SET name=?, phone=?, is_active=?, password=? WHERE id=? AND role=?',
-        [name, phone || null, is_active ? 1 : 0, hashed, clientId, 'client']
-      );
+      if (emailVal !== undefined) {
+        await db.query(
+          'UPDATE users SET name=?, phone=?, is_active=?, password=?, email=? WHERE id=? AND role=?',
+          [name, phone || null, is_active ? 1 : 0, hashed, emailVal, clientId, 'client']
+        );
+      } else {
+        await db.query(
+          'UPDATE users SET name=?, phone=?, is_active=?, password=? WHERE id=? AND role=?',
+          [name, phone || null, is_active ? 1 : 0, hashed, clientId, 'client']
+        );
+      }
     } else {
-      await db.query(
-        'UPDATE users SET name=?, phone=?, is_active=? WHERE id=? AND role=?',
-        [name, phone || null, is_active ? 1 : 0, clientId, 'client']
-      );
+      if (emailVal !== undefined) {
+        await db.query(
+          'UPDATE users SET name=?, phone=?, is_active=?, email=? WHERE id=? AND role=?',
+          [name, phone || null, is_active ? 1 : 0, emailVal, clientId, 'client']
+        );
+      } else {
+        await db.query(
+          'UPDATE users SET name=?, phone=?, is_active=? WHERE id=? AND role=?',
+          [name, phone || null, is_active ? 1 : 0, clientId, 'client']
+        );
+      }
     }
 
     res.json({ message: 'Client update ho gaya' });
