@@ -1,5 +1,66 @@
 const nodemailer = require('nodemailer');
 
+// ── Fixed System Email (OTP / Forgot Password) ────────────────────────────────
+// Credentials are stored in app_settings (system_email, system_email_password).
+// Admin sets these from Settings → Email tab. No .env needed.
+const SYSTEM_FROM_NAME = 'MOJI INNOVATORS LLP';
+let _systemTransporter    = null;
+let _systemConfigStr      = null;
+
+async function getSystemConfig(db) {
+  const [rows] = await db.query(
+    "SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('system_email','system_email_password')"
+  );
+  const cfg = {};
+  rows.forEach(r => { cfg[r.setting_key] = r.setting_value; });
+  return cfg;
+}
+
+async function getSystemTransporter(db) {
+  try {
+    const cfg = await getSystemConfig(db);
+    if (!cfg.system_email || !cfg.system_email_password) {
+      console.error('❌ system_email / system_email_password not configured in Settings → Email tab.');
+      return null;
+    }
+    const cfgStr = JSON.stringify(cfg);
+    if (cfgStr !== _systemConfigStr) {
+      _systemConfigStr = cfgStr;
+      _systemTransporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: cfg.system_email, pass: cfg.system_email_password },
+      });
+    }
+    return { transporter: _systemTransporter, fromEmail: cfg.system_email };
+  } catch (err) {
+    console.error('System transporter error:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Send an email from the fixed system address configured in Settings.
+ * Used for OTP / forgot-password / username-recovery emails only.
+ * Reads system_email + system_email_password from app_settings — no .env needed.
+ */
+async function sendSystemEmail(db, { to, subject, html }) {
+  try {
+    if (!to || !subject) return;
+    const t = await getSystemTransporter(db);
+    if (!t) return;
+    await t.transporter.sendMail({
+      from: `"${SYSTEM_FROM_NAME}" <${t.fromEmail}>`,
+      to,
+      subject,
+      html,
+    });
+    console.log(`✅ System email sent → ${to} | ${subject}`);
+  } catch (err) {
+    console.error('❌ System email error:', err.message);
+  }
+}
+
+// ── Configurable SMTP (notifications, task updates, etc.) ────────────────────
 let _transporter = null;
 let _configStr = null;
 
@@ -27,7 +88,7 @@ async function getTransporter(db) {
     }
     return {
       transporter: _transporter,
-      from: `"${cfg.smtp_name || 'Workshop Manager'}" <${cfg.smtp_email}>`,
+      from: `"${cfg.smtp_name || 'MOJI INNOVATORS LLP'}" <${cfg.smtp_email}>`,
       replyTo: cfg.smtp_email,
     };
   } catch (err) {
@@ -161,6 +222,6 @@ function itemCompletedEmail({ projectName }) {
 }
 
 module.exports = {
-  sendEmail, emailAdmins, getAdminEmails, getWorkerEmail,
+  sendEmail, sendSystemEmail, emailAdmins, getAdminEmails, getWorkerEmail,
   taskAssignedEmail, taskProgressEmail, taskCompletedEmail, itemCompletedEmail
 };

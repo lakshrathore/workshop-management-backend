@@ -82,7 +82,7 @@ function adminOrPermission(menuKey, level = 'read') {
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
 const { imgUpload, galleryUpload, moReferenceUpload, clientPoUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 const auditLog = require('../middleware/auditLog');
-const { sendEmail, emailAdmins, getAdminEmails, getWorkerEmail, taskAssignedEmail, taskProgressEmail, taskCompletedEmail, itemCompletedEmail } = require('../services/emailService');
+const { sendEmail, sendSystemEmail, emailAdmins, getAdminEmails, getWorkerEmail, taskAssignedEmail, taskProgressEmail, taskCompletedEmail, itemCompletedEmail } = require('../services/emailService');
 
 // Helper: always return https Cloudinary URL from any image_path format
 function toHttpsImageUrl(imagePath, resourceType = 'image') {
@@ -4162,11 +4162,11 @@ router.post('/settings/test-email', auth, adminOrPermission('settings','edit'), 
     for (const email of emails) {
       await sendEmail(db, {
         to: email,
-        subject: '✅ Test Email — Workshop Manager',
+        subject: '✅ Test Email — MOJI INNOVATORS LLP',
         html: `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;padding:20px;background:#f3f4f6">
           <div style="max-width:500px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;border:1px solid #e5e7eb">
             <h2 style="color:#1e293b;margin:0 0 16px">✅ Email Setup Successful!</h2>
-            <p style="color:#374151">Your Workshop Manager email system is working correctly.</p>
+            <p style="color:#374151">Your MOJI INNOVATORS LLP email system is working correctly.</p>
             <p style="color:#6b7280;font-size:13px;margin-top:16px">This is a test email sent from your settings page.</p>
           </div>
         </body></html>`
@@ -5196,15 +5196,15 @@ router.post('/auth/forgot-request', async (req, res) => {
 
     const isPassword = purpose === 'password';
     const subject = isPassword
-      ? 'Password Reset OTP — Workshop Manager'
-      : 'Username Recovery OTP — Workshop Manager';
+      ? 'Password Reset OTP — MOJI INNOVATORS LLP'
+      : 'Username Recovery OTP — MOJI INNOVATORS LLP';
 
     const html = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:20px;background:#f3f4f6;font-family:Arial,sans-serif">
   <div style="max-width:520px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
     <div style="background:#c2410c;padding:24px;text-align:center">
-      <h1 style="color:#fff;margin:0;font-size:22px;font-weight:700">Workshop Manager</h1>
+      <h1 style="color:#fff;margin:0;font-size:22px;font-weight:700">MOJI INNOVATORS LLP</h1>
       <p style="color:#fed7aa;margin:6px 0 0;font-size:13px">Wood &amp; Furniture Production System</p>
     </div>
     <div style="padding:32px 28px">
@@ -5223,7 +5223,7 @@ router.post('/auth/forgot-request', async (req, res) => {
   </div>
 </body></html>`;
 
-    await sendEmail(db, { to: normalizedEmail, subject, html });
+    await sendSystemEmail(db, { to: normalizedEmail, subject, html });
     res.json({ message: 'If this email is registered, you will receive an OTP shortly.', sent: true });
   } catch (err) {
     console.error('forgot-request error:', err.message);
@@ -5345,6 +5345,22 @@ router.post('/auth/check-email-status', async (req, res) => {
     return res.json({ eligible: true, role: user.role });
   } catch (err) {
     res.status(500).json({ message: 'Server error.' });
+  }
+});
+
+// ── Get own profile (for settings page — shows current email) ─────────────────
+// GET /api/auth/my-profile
+router.get('/auth/my-profile', auth, async (req, res) => {
+  try {
+    const db = await getPool();
+    const [[user]] = await db.query(
+      'SELECT id, name, username, email, role FROM users WHERE id = ?',
+      [req.user.id]
+    );
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ id: user.id, name: user.name, username: user.username, email: user.email || '', role: user.role });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
 });
 

@@ -175,7 +175,7 @@ async function initializeDatabase() {
     ['currency_symbol', '₹'],
     ['currency_name', 'INR'],
     ['date_format', 'DD/MM/YYYY'],
-    ['company_name', 'Workshop Manager'],
+    ['company_name', 'MOJI INNOVATORS LLP'],
     ['timezone', 'Asia/Kolkata'],
   ];
   for (const [k, v] of defaultSettings) {
@@ -604,6 +604,11 @@ async function initializeDatabase() {
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_gstin', '')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_email', '')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('company_address', '')").catch(()=>{});
+
+  // ── System Email (OTP / Forgot Password sender) ───────────────────────────
+  // Admin sets these in Settings → Email tab. Gmail App Password required.
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('system_email', 'Mojiinnovators@gmail.com')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('system_email_password', '')").catch(()=>{});
 
 
   // ── CLIENT PURCHASE ORDERS (client-submitted with PDF) ────────────────────
