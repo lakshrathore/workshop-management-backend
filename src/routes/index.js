@@ -151,7 +151,7 @@ async function sendPushToAdmins(db, payload) {
 router.get('/uploads/*', (req, res) => {
   let path = req.params[0]; // Captures everything after /uploads/
   if (!path) {
-    return res.status(400).json({ message: 'No image path provided.' });
+    return res.status(400).json({ message: 'No image path provided' });
   }
   
   console.log(`🔗 Image request: /uploads/${path}`);
