@@ -608,7 +608,7 @@ async function initializeDatabase() {
   // ── System Email (OTP / Forgot Password sender) ───────────────────────────
   // Admin sets these in Settings → Email tab. Gmail App Password required.
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('system_email', 'Mojiinnovators@gmail.com')").catch(()=>{});
-  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('system_email_password', '')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('resend_api_key', '')").catch(()=>{});
 
 
   // ── CLIENT PURCHASE ORDERS (client-submitted with PDF) ────────────────────

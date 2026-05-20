@@ -1,60 +1,55 @@
 const nodemailer = require('nodemailer');
 
-// ── Fixed System Email (OTP / Forgot Password) ────────────────────────────────
-// Credentials are stored in app_settings (system_email, system_email_password).
-// Admin sets these from Settings → Email tab. No .env needed.
+// ── System Email via Resend API (OTP / Forgot Password) ───────────────────────
+// Uses Resend HTTP API (port 443) — works on Railway where SMTP ports are blocked.
+// Admin sets resend_api_key + system_email in Settings → Email tab.
 const SYSTEM_FROM_NAME = 'MOJI INNOVATORS LLP';
-let _systemTransporter    = null;
-let _systemConfigStr      = null;
 
 async function getSystemConfig(db) {
   const [rows] = await db.query(
-    "SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('system_email','system_email_password')"
+    "SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('system_email','resend_api_key')"
   );
   const cfg = {};
   rows.forEach(r => { cfg[r.setting_key] = r.setting_value; });
   return cfg;
 }
 
-async function getSystemTransporter(db) {
-  try {
-    const cfg = await getSystemConfig(db);
-    if (!cfg.system_email || !cfg.system_email_password) {
-      console.error('❌ system_email / system_email_password not configured in Settings → Email tab.');
-      return null;
-    }
-    const cfgStr = JSON.stringify(cfg);
-    if (cfgStr !== _systemConfigStr) {
-      _systemConfigStr = cfgStr;
-      _systemTransporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: { user: cfg.system_email, pass: cfg.system_email_password },
-      });
-    }
-    return { transporter: _systemTransporter, fromEmail: cfg.system_email };
-  } catch (err) {
-    console.error('System transporter error:', err.message);
-    return null;
-  }
-}
-
 /**
- * Send an email from the fixed system address configured in Settings.
- * Used for OTP / forgot-password / username-recovery emails only.
- * Reads system_email + system_email_password from app_settings — no .env needed.
+ * Send OTP / reset email via Resend HTTP API.
+ * Works on Railway — no SMTP port needed, uses HTTPS only.
  */
 async function sendSystemEmail(db, { to, subject, html }) {
   try {
     if (!to || !subject) return;
-    const t = await getSystemTransporter(db);
-    if (!t) return;
-    await t.transporter.sendMail({
-      from: `"${SYSTEM_FROM_NAME}" <${t.fromEmail}>`,
-      to,
-      subject,
-      html,
+    const cfg = await getSystemConfig(db);
+
+    if (!cfg.resend_api_key) {
+      console.error('❌ resend_api_key not set in Settings → Email tab. OTP emails will not send.');
+      return;
+    }
+
+    const fromEmail = cfg.system_email || 'Mojiinnovators@gmail.com';
+
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cfg.resend_api_key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: `${SYSTEM_FROM_NAME} <${fromEmail}>`,
+        to: [to],
+        subject,
+        html,
+      }),
     });
-    console.log(`✅ System email sent → ${to} | ${subject}`);
+
+    const result = await response.json();
+    if (!response.ok) {
+      console.error('❌ Resend API error:', JSON.stringify(result));
+    } else {
+      console.log(`✅ System email sent via Resend → ${to} | ${subject}`);
+    }
   } catch (err) {
     console.error('❌ System email error:', err.message);
   }
