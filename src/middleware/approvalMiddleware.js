@@ -12,7 +12,12 @@ const {
 function requireApprovalForAction(approvalType) {
   return async (req, res, next) => {
     if (!['POST', 'PATCH', 'PUT'].includes(req.method)) return next();
-    if (req.user?.role === 'admin') return next();
+
+    // ── SAFETY GUARD: req.user nahi hai to approval intercept mat karo ───────
+    // (Unauthenticated request — routes/index.js ka auth middleware 401 karega)
+    if (!req.user) return next();
+
+    if (req.user.role === 'admin') return next();
     if (req.isApprovedReplay) return next();
 
     let needsApproval = false;

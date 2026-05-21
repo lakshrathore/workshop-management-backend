@@ -140,6 +140,22 @@ app.post('/api/auth/login', async (req, res) => {
 const apiRoutes = require('./routes');
 // const backupRoutes = require('./routes/backupRoutes');  // BACKUP SYSTEM DISABLED
 
+// ── SOFT JWT DECODE — req.user set karta hai approval guard ke liye ──────────
+// Yeh middleware reject nahi karta (routes apna auth khud handle karte hain).
+// Sirf token valid ho tab req.user set hota hai — approval guard ko chahiye.
+{
+  const _jwt = require('jsonwebtoken');
+  const _JWT_SECRET = process.env.JWT_SECRET || 'workshop_secret_2024';
+  app.use((req, res, next) => {
+    if (req.user) return next(); // already set ho to skip
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+      try { req.user = _jwt.verify(token, _JWT_SECRET); } catch { /* invalid token — routes handle 401 */ }
+    }
+    next();
+  });
+}
+
 // ── APPROVAL GUARD (global mount — survives routes/index.js changes) ─────────
 const { mountApprovalGuard, selfCheckApprovalSystem } = require('./middleware/approvalGuard');
 mountApprovalGuard(app);
