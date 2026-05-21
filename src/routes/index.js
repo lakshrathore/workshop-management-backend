@@ -1,3 +1,32 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *  ⚠️  CRITICAL ARCHITECTURE NOTE — READ BEFORE REGENERATING THIS FILE  ⚠️
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ *  APPROVAL SYSTEM WIRING:
+ *  ─────────────────────────────────────────────────────────────────────────────
+ *  Approval middleware do jagah lagi hai (defense in depth):
+ *
+ *   1. GLOBAL (server.js)  ← primary source of truth
+ *      File: backend/src/middleware/approvalGuard.js
+ *      Yeh file regenerate karne pe affect nahi hoti.
+ *
+ *   2. INLINE (yahan)      ← belt + suspenders, mat hatao
+ *      Look for: `requireApprovalForAction('PROJECT')` aur `('ITEM')`
+ *
+ *  Agar iss file ko regenerate kar rahe ho:
+ *   ✓ Top wala `requireApprovalForAction` import preserve karo (line ~9)
+ *   ✓ POST /projects route me middleware preserve karo
+ *   ✓ POST /projects/:id/items route me middleware preserve karo
+ *   ✓ GET /admin/clients-list pe `adminOrPermission('clients','read')` NA lagao
+ *     — yeh dropdown ke liye workers ko bhi chahiye (sirf `auth` rakho)
+ *
+ *  Agar dono jagah se wiring miss bhi ho jaye, server.js ka mount aur
+ *  selfCheckApprovalSystem boot pe loud warning dega.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
 const express = require('express');
 const router = express.Router();
 const { getPool } = require('../database');
@@ -5,6 +34,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
 require('dotenv').config();
+
+const { requireApprovalForAction } = require('../middleware/approvalMiddleware');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'workshop_secret_2024';
 
@@ -491,7 +522,7 @@ router.get('/projects', auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
-router.post('/projects', auth, adminOrPermission('projects','write'), auditLog('CREATE','Project'), async (req, res) => {
+router.post('/projects', auth, adminOrPermission('projects','write'), requireApprovalForAction('PROJECT'), auditLog('CREATE','Project'), async (req, res) => {
   const db = await getPool();
   const { project_id, name, client_name, client_phone, description, priority, order_date, deadline, total_amount, notes } = req.body;
   // Auto-generate project_id if not provided
@@ -959,7 +990,7 @@ router.put('/auth/change-password', auth, async (req, res) => {
 });
 
 // ── PROJECT ITEMS ─────────────────────────────────────────────────────────────
-router.post('/projects/:id/items', auth, adminOrPermission('projects','write'), async (req, res) => {
+router.post('/projects/:id/items', auth, adminOrPermission('projects','write'), requireApprovalForAction('ITEM'), async (req, res) => {
   const db = await getPool();
   const { item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes } = req.body;
   const [r] = await db.query('INSERT INTO project_items (project_id,item_name,proto_code,description,quantity,unit,material,dimensions,unit_price,notes) VALUES (?,?,?,?,?,?,?,?,?,?)',
@@ -4729,7 +4760,13 @@ router.get('/client/sales/:id', clientAuth, clientOnly, async (req, res) => {
 });
 
 // GET /admin/clients-list — lightweight client list for dropdowns
-router.get('/admin/clients-list', auth, adminOrPermission('clients','read'), async (req, res) => {
+// Auth relaxed: any authenticated user (admin OR worker) can fetch — yeh sirf
+// dropdown ke liye client names hain, sensitive data nahi. Worker ko isliye
+// chahiye taki project/sale/PO create form me client select kar sake.
+router.get('/admin/clients-list', auth, async (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'worker') {
+    return res.status(403).json({ message: 'Access denied' });
+  }
   const db = await getPool();
   try {
     const [clients] = await db.query(

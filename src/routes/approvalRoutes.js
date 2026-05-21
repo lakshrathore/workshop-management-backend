@@ -311,4 +311,59 @@ router.patch('/approvals/:id/note', auth, adminOnly, async (req, res) => {
   }
 });
 
+// ── APPROVAL SETTINGS (Admin only) ───────────────────────────────────────────
+
+/**
+ * GET /api/approvals/settings — read all approval flags
+ */
+router.get('/approvals/settings', auth, adminOnly, async (req, res) => {
+  try {
+    const db = await getPool();
+    const [rows] = await db.query(
+      'SELECT setting_key, setting_value, description FROM approval_settings ORDER BY setting_key'
+    );
+    const settings = {};
+    rows.forEach(r => {
+      settings[r.setting_key] = {
+        value: r.setting_value === '1',
+        description: r.description
+      };
+    });
+    res.json(settings);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/**
+ * PUT /api/approvals/settings — bulk update
+ * Body: { approval_system_enabled: true, require_approval_for_PROJECT: false, ... }
+ */
+router.put('/approvals/settings', auth, adminOnly, async (req, res) => {
+  try {
+    const db = await getPool();
+    const updates = req.body || {};
+    const allowedKeys = [
+      'approval_system_enabled',
+      'require_approval_for_PROJECT',
+      'require_approval_for_ITEM',
+      'require_approval_for_CHALLAN',
+      'require_approval_for_PO_STATUS',
+      'require_approval_for_SALE'
+    ];
+
+    for (const key of Object.keys(updates)) {
+      if (!allowedKeys.includes(key)) continue;
+      const val = updates[key] ? '1' : '0';
+      await db.query(
+        'UPDATE approval_settings SET setting_value=? WHERE setting_key=?',
+        [val, key]
+      );
+    }
+    res.json({ message: 'Approval settings updated' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 module.exports = router;

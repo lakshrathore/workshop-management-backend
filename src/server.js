@@ -139,6 +139,11 @@ app.post('/api/auth/login', async (req, res) => {
 
 const apiRoutes = require('./routes');
 // const backupRoutes = require('./routes/backupRoutes');  // BACKUP SYSTEM DISABLED
+
+// ── APPROVAL GUARD (global mount — survives routes/index.js changes) ─────────
+const { mountApprovalGuard, selfCheckApprovalSystem } = require('./middleware/approvalGuard');
+mountApprovalGuard(app);
+
 app.use('/api', apiRoutes);
 
 // ── APPROVAL SYSTEM ROUTES ────────────────────────────────────────────────────
@@ -207,6 +212,10 @@ initializeDatabase().then(async () => {
   } else {
     console.warn('⚠️ initClientTables not found — skipping client table init');
   }
+
+  // ── Approval system self-check (loud warning if misconfigured) ────────────
+  await selfCheckApprovalSystem();
+
   const os = require('os');
   const interfaces = os.networkInterfaces();
   let localIP = 'localhost';

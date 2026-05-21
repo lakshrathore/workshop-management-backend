@@ -1,111 +1,67 @@
 /**
- * Approval Middleware
- * ─────────────────────────────────────────────────────────────────────────────
- * Intercepts CREATE/UPDATE operations and applies approval workflow
- * Usage: app.use('/api/projects', requireApprovalForAction('PROJECT', 'write'))
+ * Approval Middleware (v2 — BLOCKING design)
+ * Worker create operations ko block karta hai jab approval required hai.
  */
 
-const { isApprovalRequired, createApprovalRequest, sendApprovalNotification } = require('../services/approvalService');
+const {
+  isApprovalRequired,
+  createApprovalRequest,
+  sendApprovalNotification
+} = require('../services/approvalService');
 
-/**
- * Middleware: Check if approval is required, intercept if needed
- * @param {string} approvalType - 'PROJECT', 'ITEM', 'CHALLAN', 'PO_STATUS', 'SALE'
- * @param {string} permissionLevel - 'write', 'edit', 'delete'
- * @returns {Function} Express middleware
- */
-function requireApprovalForAction(approvalType, permissionLevel = 'write') {
+function requireApprovalForAction(approvalType) {
   return async (req, res, next) => {
-    // Only apply to POST (create) and PATCH (status update) methods
-    if (!['POST', 'PATCH', 'PUT'].includes(req.method)) {
-      return next();
-    }
-
-    // Admins always bypass approval
-    if (req.user?.role === 'admin') {
-      return next();
-    }
-
-    // Check if approval is enabled for this action
-    const needsApproval = await isApprovalRequired(approvalType);
-    
-    if (!needsApproval) {
-      return next(); // Approval disabled, proceed normally
-    }
-
-    console.log(`⏳ Approval required for ${approvalType} by user ${req.user?.id}`);
-
-    // Intercept the response to capture created data
-    const originalJson = res.json.bind(res);
-    res.json = function(body) {
-      // Only intercept successful responses
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        // Create approval request instead of proceeding
-        (async () => {
-          try {
-            const approvalResult = await createApprovalRequest({
-              type: approvalType,
-              userId: req.user.id,
-              requestData: {
-                method: req.method,
-                path: req.path,
-                body: req.body,
-                query: req.query,
-                params: req.params
-              },
-              relatedId: body?.id || null
-            });
-
-            // Send notification to admins
-            await sendApprovalNotification({
-              type: approvalType,
-              userId: req.user.id,
-              status: 'PENDING',
-              message: `New ${approvalType} approval request`
-            });
-
-            // Return approval message instead of original response
-            return originalJson({
-              ...body,
-              approval_status: 'PENDING',
-              approval_id: approvalResult.approval_id,
-              message: approvalResult.message,
-              warning: `This action requires admin approval. Please check "My Approvals" for status.`
-            });
-          } catch (err) {
-            console.error('Approval creation error:', err.message);
-            // Fail open - if approval creation fails, allow the original operation
-            return originalJson(body);
-          }
-        })();
-      } else {
-        return originalJson(body);
-      }
-    };
-
-    next();
-  };
-}
-
-/**
- * Simpler version: Just create approval, don't intercept response
- * For cases where we want to create approval in background
- */
-function maybeCreateApprovalRequest(approvalType) {
-  return async (req, res, next) => {
+    if (!['POST', 'PATCH', 'PUT'].includes(req.method)) return next();
     if (req.user?.role === 'admin') return next();
-    
-    const needsApproval = await isApprovalRequired(approvalType);
+    if (req.isApprovedReplay) return next();
+
+    let needsApproval = false;
+    try {
+      needsApproval = await isApprovalRequired(approvalType);
+    } catch (err) {
+      console.error(`[approval] isApprovalRequired error for ${approvalType}:`, err.message);
+      return next(); // fail-open on DB error
+    }
+
     if (!needsApproval) return next();
 
-    // Attach flag to request so route handler can decide
-    req.requiresApproval = true;
-    req.approvalType = approvalType;
-    
-    next();
+    console.log(`⏳ [approval] BLOCKED ${approvalType} by user ${req.user?.id}`);
+
+    try {
+      const approvalResult = await createApprovalRequest({
+        type: approvalType,
+        userId: req.user.id,
+        requestData: {
+          method: req.method,
+          path: req.originalUrl || req.path,
+          body: req.body,
+          query: req.query,
+          params: req.params
+        },
+        relatedId: req.params?.id ? Number(req.params.id) : null
+      });
+
+      sendApprovalNotification({
+        type: approvalType,
+        userId: req.user.id,
+        status: 'PENDING',
+        message: `New ${approvalType} approval request #${approvalResult.approval_id}`
+      }).catch(e => console.warn('[approval] notif error:', e.message));
+
+      return res.status(202).json({
+        approval_status: 'PENDING',
+        approval_id: approvalResult.approval_id,
+        message: approvalResult.message,
+        warning: 'Yeh action admin approval ke baad apply hoga. "My Approvals" me status check karo.'
+      });
+    } catch (err) {
+      console.error('[approval] createApprovalRequest fatal:', err.message);
+      return res.status(500).json({
+        message: 'Approval system error. Please contact admin.',
+        error: err.message
+      });
+    }
   };
 }
 
-module.exports = {
-  requireApprovalForAction,
-  maybeCreateApprovalRequest
-};
+module.exports = { requireApprovalForAction };

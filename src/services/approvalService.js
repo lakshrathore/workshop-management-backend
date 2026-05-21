@@ -224,6 +224,34 @@ async function approveRequest(approvalId, adminId, adminNotes = '') {
       [adminId, adminNotes, approvalId]
     );
 
+    // 2.5 ── EXECUTE the stored request (actual DB insert via resolver) ─────
+    let executedResource = null;
+    try {
+      const { executeApproval } = require('../middleware/approvalResolvers');
+      const approvalForExec = {
+        ...approval,
+        requested_data: typeof approval.requested_data === 'string'
+          ? JSON.parse(approval.requested_data)
+          : (approval.requested_data || {})
+      };
+      executedResource = await executeApproval(approvalForExec);
+
+      // Link created resource back to approval row
+      const newId = executedResource?.id || null;
+      if (newId) {
+        await db.query('UPDATE approvals SET related_id=? WHERE id=?', [newId, approvalId]);
+      }
+      console.log(`✅ Approval #${approvalId} executed:`, executedResource);
+    } catch (execErr) {
+      console.error(`❌ Approval #${approvalId} execution failed:`, execErr.message);
+      // Rollback approval status so admin can retry/reject
+      await db.query(
+        "UPDATE approvals SET status='PENDING', approved_by=NULL, approved_at=NULL, admin_notes=? WHERE id=?",
+        [`Auto-rolled back: ${execErr.message}`, approvalId]
+      );
+      throw new Error(`Approve nahi ho saka: ${execErr.message}`);
+    }
+
     // 3. Decrement pending count in approval_queue
     await db.query(
       `UPDATE approval_queue
