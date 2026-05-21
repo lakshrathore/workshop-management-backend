@@ -869,11 +869,18 @@ router.get('/projects/:id', auth, async (req, res) => {
       (SELECT pii.resource_type FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_type
     FROM project_items pi WHERE pi.project_id=? ORDER BY pi.id
   `, [req.params.id]);
-  // Apply toHttpsImageUrl on thumbnail_path so full URLs pass through correctly
-  const items = itemsRaw.map(item => ({
-    ...item,
-    thumbnail_path: item.thumbnail_path ? toHttpsImageUrl(item.thumbnail_path, item.thumbnail_type || 'image') : null
-  }));
+  // Apply toHttpsImageUrl on thumbnail_path so full URLs pass through correctly.
+  // Expose BOTH `thumbnail_path` (legacy — ProjectDetailPage) AND `thumbnail_url`
+  // (standard — ProductTrackingPage, ClientProjectDetailPage). Same URL value,
+  // dual keys for backward compatibility.
+  const items = itemsRaw.map(item => {
+    const url = item.thumbnail_path ? toHttpsImageUrl(item.thumbnail_path, item.thumbnail_type || 'image') : null;
+    return {
+      ...item,
+      thumbnail_path: url,   // legacy key — keep working
+      thumbnail_url:  url    // standard key — fixes Stage Tracker thumbnails
+    };
+  });
   const [tasks] = await db.query(`
     SELECT ta.*, 
       COALESCE(u.name, dept_workers.worker_names) as worker_name,

@@ -2,6 +2,15 @@
  * Approval Resolvers — Approve hone par stored payload ko actual DB me execute karte hain.
  *
  * approval = { id, user_id, type, related_id, requested_data: {method,path,body,query,params}, ... }
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * RECOVERY FIX (2025) — Path-parsing fallback
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Purane approvals jo guard ke bug se affected the (req.params empty hone ki
+ * wajah se project_id missing tha), unko bhi recover karne ke liye resolvers
+ * me `data.path` se ID parse karne ka fallback add kiya gaya. Iss tarah
+ * koi bhi stuck approval (e.g. #7) admin ke approve click karne par
+ * automatically pass ho jayega — DB me kuch manual touch nahi karna.
  */
 
 const { getPool } = require('../database');
@@ -40,6 +49,13 @@ async function getNextAutoChallanNumber(db, challanType) {
   const maxn = maxRow?.maxn || (startNum - 1);
   const next = Math.max(maxn + 1, startNum);
   return `${prefix}-${String(next).padStart(4, '0')}`;
+}
+
+// ── Helper: path se URL parameter extract karo (legacy approval recovery) ────
+function extractIdFromPath(path, pattern) {
+  if (!path) return null;
+  const m = String(path).match(pattern);
+  return m ? m[1] : null;
 }
 
 // ── PROJECT resolver ─────────────────────────────────────────────────────────
@@ -85,20 +101,36 @@ async function resolveProject(approval, db) {
 
 // ── ITEM resolver ────────────────────────────────────────────────────────────
 async function resolveItem(approval, db) {
-  const data      = approval.requested_data || {};
-  const body      = data.body || {};
-  
-  // Try multiple sources for project_id
+  const data = approval.requested_data || {};
+  const body = data.body || {};
+
+  // Try multiple sources for project_id (in priority order):
+  //   1. data.params.id    — populated by approvalGuard (post-fix)
+  //   2. body.project_id   — injected by approvalMiddleware (post-fix)
+  //   3. related_id        — fallback set by approval middleware
+  //   4. data.path parse   — legacy recovery for pre-fix approvals
   let projectId = data.params?.id || body.project_id || approval.related_id;
-  
-  console.log(`[resolveItem] Attempting to resolve - approval_id=${approval.id}, related_id=${approval.related_id}`);
-  console.log(`[resolveItem] data.params=`, data.params);
-  console.log(`[resolveItem] body keys=`, Object.keys(body));
-  console.log(`[resolveItem] projectId resolved to:`, projectId);
-  
+
+  if (!projectId) {
+    // Fallback: parse from stored request path
+    // e.g. "/api/projects/42/items" → 42
+    projectId = extractIdFromPath(data.path, /\/projects\/(\d+)\/items/);
+    if (projectId) {
+      console.log(`[resolveItem] Recovered project_id=${projectId} from data.path`);
+    }
+  }
+
+  console.log(`[resolveItem] approval_id=${approval.id}, related_id=${approval.related_id}, resolved projectId=${projectId}`);
+
   if (!projectId || String(projectId).trim() === '') {
-    console.error(`[resolveItem] Missing project ID - data=`, JSON.stringify(data, null, 2));
+    console.error(`[resolveItem] Missing project ID even after all fallbacks - data=`, JSON.stringify(data, null, 2));
     throw new Error('Project ID missing in approval payload - cannot create item without project');
+  }
+
+  // Sanity check: project actually exists
+  const [[projExists]] = await db.query('SELECT id FROM projects WHERE id=?', [projectId]);
+  if (!projExists) {
+    throw new Error(`Project #${projectId} not found — cannot create item (may have been deleted)`);
   }
 
   const [r] = await db.query(
@@ -196,8 +228,20 @@ async function resolveChallan(approval, db) {
 async function resolvePoStatus(approval, db) {
   const data   = approval.requested_data || {};
   const body   = data.body || {};
-  const poId   = approval.related_id || data.params?.id;
   const status = body.status;
+
+  // Try multiple sources for PO id (same defensive pattern as resolveItem):
+  //   1. related_id    — set by middleware from req.params.id
+  //   2. data.params.id — populated by approvalGuard (post-fix)
+  //   3. data.path parse — legacy recovery
+  let poId = approval.related_id || data.params?.id;
+
+  if (!poId) {
+    poId = extractIdFromPath(data.path, /\/purchase-orders\/(\d+)\/status/);
+    if (poId) {
+      console.log(`[resolvePoStatus] Recovered po_id=${poId} from data.path`);
+    }
+  }
 
   if (!poId) throw new Error('PO id missing in approval payload');
   if (!status || !String(status).trim()) {
