@@ -45,20 +45,19 @@ const APPROVAL_ROUTES = [
     description: 'Worker project create karna'
   },
   // Sale Challan — /api/sale-challans (POST)
-  // NOTE: Resolver implement karne ke baad uncomment karo
-  // {
-  //   method: 'POST',
-  //   pattern: /^\/api\/sale-challans\/?$/,
-  //   type: 'CHALLAN',
-  //   description: 'Sale challan create'
-  // },
+  {
+    method: 'POST',
+    pattern: /^\/api\/sale-challans\/?$/,
+    type: 'CHALLAN',
+    description: 'Sale challan create'
+  },
   // PO Status — /api/purchase-orders/:id/status (PATCH)
-  // {
-  //   method: 'PATCH',
-  //   pattern: /^\/api\/purchase-orders\/\d+\/status\/?$/,
-  //   type: 'PO_STATUS',
-  //   description: 'PO status change'
-  // },
+  {
+    method: 'PATCH',
+    pattern: /^\/api\/purchase-orders\/\d+\/status\/?$/,
+    type: 'PO_STATUS',
+    description: 'PO status change'
+  },
 ];
 
 /**
