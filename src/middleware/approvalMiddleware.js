@@ -31,15 +31,24 @@ function requireApprovalForAction(approvalType) {
     if (!needsApproval) return next();
 
     console.log(`⏳ [approval] BLOCKED ${approvalType} by user ${req.user?.id}`);
+    console.log(`[approval] req.params:`, req.params);
 
     try {
+      // For route-based approvals, explicitly store context ids in body
+      const bodyWithContext = {
+        ...req.body,
+        ...(approvalType === 'ITEM' && req.params?.id ? { project_id: req.params.id } : {}),
+        ...(approvalType === 'CHALLAN' && req.params?.id ? { project_id: req.params.id } : {}),
+        ...(approvalType === 'PROJECT' && req.params?.id ? { project_id: req.params.id } : {})
+      };
+
       const approvalResult = await createApprovalRequest({
         type: approvalType,
         userId: req.user.id,
         requestData: {
           method: req.method,
           path: req.originalUrl || req.path,
-          body: req.body,
+          body: bodyWithContext,
           query: req.query,
           params: req.params
         },

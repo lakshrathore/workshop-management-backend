@@ -87,10 +87,20 @@ async function resolveProject(approval, db) {
 async function resolveItem(approval, db) {
   const data      = approval.requested_data || {};
   const body      = data.body || {};
-  const projectId = data.params?.id || approval.related_id;
+  
+  // Try multiple sources for project_id
+  let projectId = data.params?.id || body.project_id || approval.related_id;
+  
+  console.log(`[resolveItem] Attempting to resolve - approval_id=${approval.id}, related_id=${approval.related_id}`);
+  console.log(`[resolveItem] data.params=`, data.params);
+  console.log(`[resolveItem] body keys=`, Object.keys(body));
+  console.log(`[resolveItem] projectId resolved to:`, projectId);
+  
   if (!projectId || String(projectId).trim() === '') {
+    console.error(`[resolveItem] Missing project ID - data=`, JSON.stringify(data, null, 2));
     throw new Error('Project ID missing in approval payload - cannot create item without project');
   }
+
   const [r] = await db.query(
     `INSERT INTO project_items
       (project_id,item_name,proto_code,description,quantity,unit,material,
