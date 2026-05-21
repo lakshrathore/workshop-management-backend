@@ -88,7 +88,9 @@ async function resolveItem(approval, db) {
   const data      = approval.requested_data || {};
   const body      = data.body || {};
   const projectId = data.params?.id || approval.related_id;
-
+  if (!projectId || String(projectId).trim() === '') {
+    throw new Error('Project ID missing in approval payload - cannot create item without project');
+  }
   const [r] = await db.query(
     `INSERT INTO project_items
       (project_id,item_name,proto_code,description,quantity,unit,material,
@@ -118,6 +120,9 @@ async function resolveChallan(approval, db) {
 
   if (!client_name || !client_name.trim()) {
     throw new Error('Client name missing in approval payload');
+  }
+  if (!project_id || String(project_id).trim() === '') {
+    throw new Error('Project ID missing in approval payload - cannot create challan without project');
   }
   if (!Array.isArray(items) || items.length === 0) {
     throw new Error('No items in approval payload');
@@ -154,7 +159,7 @@ async function resolveChallan(approval, db) {
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       challan_number, client_name.trim(), client_phone || '', client_address || '', client_gstin || '',
-      cType, project_id || null, challan_date, delivery_date || null, status || 'draft',
+      cType, project_id, challan_date, delivery_date || null, status || 'draft',
       subtotal, taxPct, tax_amount, disc, total_amount,
       transport_name || '', vehicle_number || '', notes || '',
       cgst || null, sgst || null, igst || null, cpo_id || null, userId
