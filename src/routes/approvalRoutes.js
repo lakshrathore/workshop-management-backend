@@ -213,20 +213,17 @@ router.post('/approvals/bulk-approve', auth, adminOnly, async (req, res) => {
 
 /**
  * DELETE /api/approvals/:id
- * Cancel/delete an approval request (Admin only or requester)
+ * Cancel an approval request (Admin ONLY — workers cannot cancel their own).
+ * Locked at admin level so workers cannot bypass the approval workflow by
+ * deleting their pending request and resubmitting a tweaked version.
  */
-router.delete('/approvals/:id', auth, async (req, res) => {
+router.delete('/approvals/:id', auth, adminOnly, async (req, res) => {
   try {
     const db = await getPool();
     const [[approval]] = await db.query('SELECT * FROM approvals WHERE id=?', [req.params.id]);
 
     if (!approval) {
       return res.status(404).json({ message: 'Approval not found' });
-    }
-
-    // Only admin or the requester can cancel
-    if (req.user.role !== 'admin' && req.user.id !== approval.user_id) {
-      return res.status(403).json({ message: 'Permission denied' });
     }
 
     // Only PENDING approvals can be cancelled

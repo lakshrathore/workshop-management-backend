@@ -739,9 +739,13 @@ async function initializeDatabase() {
     INDEX idx_setting_key (setting_key)
   )`);
 
-  // Seed default approval settings (disabled by default for safety)
+  // Seed default approval settings.
+  // NOTE: Master switch defaults to '1' (ENABLED) so fresh/new deployments
+  // get the approval workflow turned on automatically. Existing rows are
+  // protected by INSERT IGNORE — once a DB has this row, the value is never
+  // overwritten by code. Admin can still toggle via UI (PUT /api/approvals/settings).
   const approvalSettings = [
-    ['approval_system_enabled', '0', 'Master switch: 0=disabled, 1=enabled'],
+    ['approval_system_enabled', '1', 'Master switch: 0=disabled, 1=enabled'],
     ['require_approval_for_PROJECT', '1', 'Require approval for Project creation'],
     ['require_approval_for_ITEM', '1', 'Require approval for Item addition'],
     ['require_approval_for_CHALLAN', '1', 'Require approval for Sale Challan'],

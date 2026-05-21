@@ -1,20 +1,13 @@
 /**
  * Approval Resolvers — Approve hone par stored payload ko actual DB me execute karte hain.
  *
- * Each resolver receives:
- *   approval = { id, user_id, type, related_id, requested_data: {method,path,body,query,params}, ... }
- *   db       = mysql pool/connection
- *
- * New type add karne ke liye: resolver function likho + RESOLVERS map me register karo.
+ * approval = { id, user_id, type, related_id, requested_data: {method,path,body,query,params}, ... }
  */
 
 const { getPool } = require('../database');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers (self-contained — routes/index.js ke helpers se decoupled).
-// Sale challan numbering routes/index.js ke `getNumberingMode` + `getNextAutoNumber`
-// ka same logic hai, yahan duplicate isliye rakha hai taki resolver kabhi
-// route file ke refactor se na toote.
+// Internal helpers (self-contained — routes/index.js ke helpers se decoupled)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getNumberingMode(db, docType) {
@@ -111,8 +104,6 @@ async function resolveItem(approval, db) {
 }
 
 // ── CHALLAN resolver ─────────────────────────────────────────────────────────
-// Mirrors POST /api/sale-challans handler so approved requests produce the
-// exact same row as direct admin creation would.
 async function resolveChallan(approval, db) {
   const data   = approval.requested_data || {};
   const body   = data.body || {};
@@ -125,8 +116,6 @@ async function resolveChallan(approval, db) {
     manual_number, cpo_id, cgst, sgst, igst
   } = body;
 
-  // Validation (same shape errors as direct route, but throw — approvalRoutes
-  // catches and surfaces to admin)
   if (!client_name || !client_name.trim()) {
     throw new Error('Client name missing in approval payload');
   }
@@ -134,10 +123,9 @@ async function resolveChallan(approval, db) {
     throw new Error('No items in approval payload');
   }
 
-  // Numbering — re-resolve at approval time (not at request time) so
-  // numbers stay strictly sequential even if request sat in queue.
-  const cType        = challan_type || 'delivery';
-  const challanMode  = await getNumberingMode(db, cType);
+  // Numbering — re-resolve at approval time so sequence stays gap-free
+  const cType       = challan_type || 'delivery';
+  const challanMode = await getNumberingMode(db, cType);
   let challan_number;
   if (challanMode === 'manual') {
     if (!manual_number || !manual_number.trim()) {
@@ -190,7 +178,6 @@ async function resolveChallan(approval, db) {
 }
 
 // ── PO_STATUS resolver ───────────────────────────────────────────────────────
-// Mirrors PATCH /api/purchase-orders/:id/status — just updates status.
 async function resolvePoStatus(approval, db) {
   const data   = approval.requested_data || {};
   const body   = data.body || {};
@@ -214,17 +201,17 @@ async function resolvePoStatus(approval, db) {
   return { id: Number(poId), status };
 }
 
-// ── SALE resolver — stub (not wired to a route yet) ──────────────────────────
+// ── SALE resolver — stub ─────────────────────────────────────────────────────
 async function resolveSale(approval, db) {
   throw new Error('SALE resolver not implemented yet');
 }
 
 const RESOLVERS = {
-  PROJECT:    resolveProject,
-  ITEM:       resolveItem,
-  CHALLAN:    resolveChallan,
-  PO_STATUS:  resolvePoStatus,
-  SALE:       resolveSale,
+  PROJECT:   resolveProject,
+  ITEM:      resolveItem,
+  CHALLAN:   resolveChallan,
+  PO_STATUS: resolvePoStatus,
+  SALE:      resolveSale,
 };
 
 async function executeApproval(approval) {
