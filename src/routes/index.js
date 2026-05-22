@@ -2180,6 +2180,83 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       departments: deptMap[item.id] || []
     }));
 
+    // ── Department Daily Qty Flow ─────────────────────────────────────────────
+    // IN  = qty assigned to dept in tasks created today
+    // OUT = qty workers logged as done today (daily_progress)
+    // REMAINING = total backlog (assigned - completed) across all non-done tasks
+    const [deptDailyFlow] = await db.query(`
+      SELECT
+        d.id, d.name, d.color,
+        COALESCE((
+          SELECT SUM(ta2.quantity_assigned)
+          FROM task_assignments ta2
+          WHERE ta2.department_id = d.id AND DATE(ta2.created_at) = CURDATE()
+        ), 0) AS qty_in_today,
+        COALESCE((
+          SELECT SUM(dp.qty_done)
+          FROM daily_progress dp
+          WHERE dp.department_id = d.id AND DATE(dp.work_date) = CURDATE()
+        ), 0) AS qty_out_today,
+        COALESCE((
+          SELECT SUM(ta3.quantity_assigned - COALESCE(ta3.quantity_completed, 0))
+          FROM task_assignments ta3
+          WHERE ta3.department_id = d.id
+            AND ta3.status NOT IN ('completed','cancelled')
+        ), 0) AS qty_remaining
+      FROM departments d
+      WHERE d.is_active = 1
+      ORDER BY d.name`);
+
+    // ── Project Overview ──────────────────────────────────────────────────────
+    // Top 10 active/in-progress projects: progress, current stage, deadline
+    const [projectOverview] = await db.query(`
+      SELECT
+        p.id, p.project_id, p.name, p.client_name, p.status, p.deadline,
+        DATEDIFF(p.deadline, CURDATE()) AS days_left,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id = p.id) AS total_tasks,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id = p.id AND status = 'completed') AS done_tasks,
+        (SELECT d.name
+          FROM task_assignments ta
+          JOIN departments d ON d.id = ta.department_id
+          WHERE ta.project_id = p.id AND ta.status = 'in_progress'
+          ORDER BY COALESCE(ta.stage_order, d.stage_order, 99) ASC
+          LIMIT 1
+        ) AS current_stage
+      FROM projects p
+      WHERE p.status NOT IN ('deleted','cancelled','completed')
+      ORDER BY
+        CASE p.status WHEN 'active' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
+        p.deadline ASC
+      LIMIT 10`);
+
+    // ── Items Waiting > 24 Hours ──────────────────────────────────────────────
+    // in_progress tasks with no daily_progress logged today, stalled > 24h
+    const [itemsWaiting24h] = await db.query(`
+      SELECT
+        ta.id, ta.task_title,
+        pi.proto_code AS item_code, pi.item_name,
+        p.name AS project_name, p.id AS project_db_id,
+        d.name AS current_stage,
+        u.name AS worker_name,
+        ta.updated_at AS pending_since,
+        TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
+      FROM task_assignments ta
+      JOIN project_items pi ON pi.id = ta.project_item_id
+      JOIN projects p ON p.id = ta.project_id
+      LEFT JOIN departments d ON d.id = ta.department_id
+      LEFT JOIN users u ON u.id = ta.worker_id
+      WHERE ta.status = 'in_progress'
+        AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        AND (ta.project_item_id IS NULL OR ta.project_item_id NOT IN (
+          SELECT DISTINCT dp.project_item_id
+          FROM daily_progress dp
+          WHERE DATE(dp.work_date) = CURDATE()
+            AND dp.project_item_id IS NOT NULL
+            AND dp.department_id = ta.department_id
+        ))
+      ORDER BY ta.updated_at ASC
+      LIMIT 10`);
+
     res.json({
       tasks: taskStats,
       projects: projStats,
@@ -2188,7 +2265,10 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       delayedTasks,
       pipeline,
       workerPerformance,
-      deptLoad
+      deptLoad,
+      deptDailyFlow,
+      projectOverview,
+      itemsWaiting24h,
     });
   } catch(err) {
     console.error('dashboard error:', err.message);
