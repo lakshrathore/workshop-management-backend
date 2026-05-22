@@ -96,7 +96,29 @@ async function resolveProject(approval, db) {
       body.total_amount || 0, body.notes, userId, isReady
     ]
   );
-  return { id: r.insertId, project_id: finalProjectId };
+  const projectDbId = r.insertId;
+
+  // Attach pre-uploaded temp images (stored in approval body as image_urls array)
+  if (Array.isArray(body.image_urls) && body.image_urls.length > 0) {
+    for (const imgObj of body.image_urls) {
+      let imgPath = imgObj.url || imgObj;
+      if (typeof imgPath === 'string' && imgPath.startsWith('http://')) {
+        imgPath = imgPath.replace('http://', 'https://');
+      }
+      const resType = imgObj.resource_type || 'image';
+      try {
+        await db.query(
+          'INSERT INTO project_mo_references (project_id, uploaded_by, image_path, resource_type) VALUES (?,?,?,?)',
+          [projectDbId, userId, imgPath, resType]
+        );
+      } catch (e) {
+        console.warn('[resolveProject] image attach failed:', e.message);
+      }
+    }
+    console.log(`[resolveProject] Attached ${body.image_urls.length} image(s) to project #${projectDbId}`);
+  }
+
+  return { id: projectDbId, project_id: finalProjectId };
 }
 
 // ── ITEM resolver ────────────────────────────────────────────────────────────
@@ -144,7 +166,29 @@ async function resolveItem(approval, db) {
       body.dimensions, body.unit_price || 0, body.notes
     ]
   );
-  return { id: r.insertId, project_id: projectId };
+  const itemId = r.insertId;
+
+  // Attach pre-uploaded temp images (stored in approval body as image_urls array)
+  if (Array.isArray(body.image_urls) && body.image_urls.length > 0) {
+    for (const imgObj of body.image_urls) {
+      let imgPath = imgObj.url || imgObj;
+      if (typeof imgPath === 'string' && imgPath.startsWith('http://')) {
+        imgPath = imgPath.replace('http://', 'https://');
+      }
+      const resType = imgObj.resource_type || 'image';
+      try {
+        await db.query(
+          'INSERT INTO project_item_images (project_item_id, project_id, image_path, resource_type, uploaded_by) VALUES (?,?,?,?,?)',
+          [itemId, projectId, imgPath, resType, approval.user_id]
+        );
+      } catch (e) {
+        console.warn('[resolveItem] image attach failed:', e.message);
+      }
+    }
+    console.log(`[resolveItem] Attached ${body.image_urls.length} image(s) to item #${itemId}`);
+  }
+
+  return { id: itemId, project_id: projectId };
 }
 
 // ── CHALLAN resolver ─────────────────────────────────────────────────────────
@@ -163,9 +207,8 @@ async function resolveChallan(approval, db) {
   if (!client_name || !client_name.trim()) {
     throw new Error('Client name missing in approval payload');
   }
-  if (!project_id || String(project_id).trim() === '') {
-    throw new Error('Project ID missing in approval payload - cannot create challan without project');
-  }
+  // project_id is optional — dispatch challans don't always have one
+  const resolvedProjectId = (project_id && String(project_id).trim() !== '') ? project_id : null;
   if (!Array.isArray(items) || items.length === 0) {
     throw new Error('No items in approval payload');
   }
@@ -201,7 +244,7 @@ async function resolveChallan(approval, db) {
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       challan_number, client_name.trim(), client_phone || '', client_address || '', client_gstin || '',
-      cType, project_id, challan_date, delivery_date || null, status || 'draft',
+      cType, resolvedProjectId, challan_date, delivery_date || null, status || 'draft',
       subtotal, taxPct, tax_amount, disc, total_amount,
       transport_name || '', vehicle_number || '', notes || '',
       cgst || null, sgst || null, igst || null, cpo_id || null, userId
@@ -260,9 +303,21 @@ async function resolvePoStatus(approval, db) {
   return { id: Number(poId), status };
 }
 
-// ── SALE resolver — stub ─────────────────────────────────────────────────────
+// ── SALE resolver — sale invoice (challan_type = 'sale') ─────────────────────
 async function resolveSale(approval, db) {
-  throw new Error('SALE resolver not implemented yet');
+  // Sale invoice uses same table as challan, just with challan_type='sale'
+  // Reuse resolveChallan with type forced to 'sale'
+  const data = approval.requested_data || {};
+  const body = data.body || {};
+  // Ensure challan_type is 'sale'
+  const patchedApproval = {
+    ...approval,
+    requested_data: {
+      ...data,
+      body: { ...body, challan_type: body.challan_type || 'sale' }
+    }
+  };
+  return resolveChallan(patchedApproval, db);
 }
 
 const RESOLVERS = {

@@ -111,7 +111,7 @@ function adminOrPermission(menuKey, level = 'read') {
 }
 
 // ── Image Upload Setup (Cloudinary) ──────────────────────────────────────────
-const { imgUpload, galleryUpload, moReferenceUpload, clientPoUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
+const { imgUpload, galleryUpload, moReferenceUpload, clientPoUpload, tempUpload, getFileUrl, deleteFile } = require('../services/cloudinaryStorage');
 const auditLog = require('../middleware/auditLog');
 const { sendEmail, sendSystemEmail, emailAdmins, getAdminEmails, getWorkerEmail, taskAssignedEmail, taskProgressEmail, taskCompletedEmail, itemCompletedEmail } = require('../services/emailService');
 
@@ -179,6 +179,32 @@ async function sendPushToAdmins(db, payload) {
 // Handles both formats:
 // 1. Full Cloudinary URL already stored: https://res.cloudinary.com/...
 // 2. Public ID only: workshop/task-images/abc123
+// ── TEMP UPLOAD — Pre-approval image upload (before project/item exists) ─────
+// Worker images upload karta hai, cloudinary URLs wapas milte hain, jo approval body mein store hote hain
+router.post('/temp-upload/images', auth, tempUpload.array('images', 10), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ message: 'No files uploaded' });
+    }
+    const urls = req.files.map(f => {
+      // multer-storage-cloudinary: f.path = full secure URL, f.filename = public_id
+      let url = f.path || f.secure_url || f.location || f.url || '';
+      // Always ensure HTTPS
+      if (url.startsWith('http://')) url = url.replace('http://', 'https://');
+      return {
+        url,
+        public_id: f.filename || f.public_id || '',
+        resource_type: /\.pdf$/i.test(f.originalname) ? 'raw' : 'image',
+        original_name: f.originalname,
+      };
+    });
+    res.json({ success: true, images: urls });
+  } catch (err) {
+    console.error('[temp-upload] Error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.get('/uploads/*', (req, res) => {
   let path = req.params[0]; // Captures everything after /uploads/
   if (!path) {
@@ -3905,7 +3931,13 @@ router.get('/sale-challans/:id', auth, adminOrPermission('sale_challans','read')
 });
 
 // POST create challan
-router.post('/sale-challans', auth, adminOrPermission('sale_challans','write'), auditLog('CREATE','SaleChallan'), async (req, res) => {
+// Dynamic approval middleware: challan_type='sale' → SALE approval, baaki → CHALLAN approval
+function saleChallanApprovalMiddleware(req, res, next) {
+  const challanType = req.body?.challan_type || 'delivery';
+  const approvalType = challanType === 'sale' ? 'SALE' : 'CHALLAN';
+  return requireApprovalForAction(approvalType)(req, res, next);
+}
+router.post('/sale-challans', auth, adminOrPermission('sale_challans','write'), saleChallanApprovalMiddleware, auditLog('CREATE','SaleChallan'), async (req, res) => {
   const db = await getPool();
   try {
     const { client_name, client_phone, client_address, client_gstin, challan_type,
@@ -4066,7 +4098,10 @@ router.get('/dispatch/challans/:id', auth, async (req, res) => {
 });
 
 // POST create challan — dispatch worker can create delivery challan
-router.post('/dispatch/challans', auth, auditLog('CREATE','Dispatch'), async (req, res) => {
+router.post('/dispatch/challans', auth,
+  // challan_type inject karo taaki approval body mein visible rahe
+  (req, res, next) => { req.body.challan_type = 'delivery'; next(); },
+  requireApprovalForAction('CHALLAN'), auditLog('CREATE','Dispatch'), async (req, res) => {
   const db = await getPool();
   try {
     const { client_name, client_phone, client_address, client_gstin,
