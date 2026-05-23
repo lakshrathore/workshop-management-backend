@@ -154,10 +154,33 @@ async function getPendingApprovals(filters = {}) {
     const [rows] = await db.query(query, params);
     
     // Parse JSON data
-    return rows.map(row => ({
+    const parsed = rows.map(row => ({
       ...row,
       requested_data: row.requested_data ? JSON.parse(row.requested_data) : {}
     }));
+
+    // Enrich ITEM approvals with project_name (replace raw project_id)
+    const projectIds = [...new Set(
+      parsed
+        .filter(r => r.requested_data?.project_id && !isNaN(r.requested_data.project_id))
+        .map(r => Number(r.requested_data.project_id))
+    )];
+    let projectNameMap = {};
+    if (projectIds.length > 0) {
+      const [projRows] = await db.query(
+        `SELECT id, name, project_id AS proj_code FROM projects WHERE id IN (${projectIds.join(',')})` 
+      );
+      projRows.forEach(p => { projectNameMap[p.id] = { name: p.name, proj_code: p.proj_code }; });
+    }
+
+    return parsed.map(row => {
+      const rd = { ...row.requested_data };
+      if (rd.project_id && projectNameMap[Number(rd.project_id)]) {
+        const proj = projectNameMap[Number(rd.project_id)];
+        rd.project_name = `${proj.name} (${proj.proj_code})`;
+      }
+      return { ...row, requested_data: rd };
+    });
   } catch (err) {
     console.error('getPendingApprovals error:', err.message);
     return [];

@@ -2275,26 +2275,36 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       ORDER BY d.stage_order, d.name`,
       [from, to]);
 
-    // Outsource Preview — wrapped in try-catch (outsource_jobs may not exist yet)
+    // Outsource Preview — overdue first, then next-24h upcoming, then date range
     let outsourcePreview = [];
     try {
       [outsourcePreview] = await db.query(`
         SELECT oj.id, oj.vendor_name, oj.expected_date, oj.status, oj.qty_ordered,
           p.name AS project_name,
-          pi.item_name, pi.proto_code
+          pi.item_name, pi.proto_code,
+          CASE
+            WHEN oj.expected_date < CURDATE() THEN 'overdue'
+            WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 'next_24h'
+            ELSE 'on_time'
+          END AS urgency
         FROM outsource_jobs oj
         LEFT JOIN projects p ON p.id = oj.project_id
         LEFT JOIN project_items pi ON pi.id = oj.project_item_id
         WHERE oj.status NOT IN ('Received','Cancelled')
           AND (
-            DATE(oj.expected_date) BETWEEN ? AND ?
+            oj.expected_date < CURDATE()
+            OR (oj.expected_date IS NOT NULL AND oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR))
+            OR DATE(oj.expected_date) BETWEEN ? AND ?
             OR DATE(oj.created_at) BETWEEN ? AND ?
-            OR oj.expected_date < CURDATE()
           )
         ORDER BY
-          CASE WHEN oj.expected_date < CURDATE() THEN 0 ELSE 1 END,
+          CASE
+            WHEN oj.expected_date < CURDATE() THEN 0
+            WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 1
+            ELSE 2
+          END,
           oj.expected_date ASC
-        LIMIT 5`,
+        LIMIT 8`,
         [from, to, from, to]);
     } catch(e) {
       console.warn('outsourcePreview skipped:', e.message);
