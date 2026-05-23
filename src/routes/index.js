@@ -2183,7 +2183,10 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       FROM projects p
       WHERE p.status NOT IN ('deleted','cancelled')`);
 
-    // Items Waiting > 24 Hours — all in_progress tasks stalled >24h with no progress today
+    // Items Waiting > 24 Hours
+    // Rules: 1) Each item appears ONCE (only its current/lowest active stage)
+    //        2) Dispatch department excluded
+    //        3) Must have had no daily_progress update today in that dept
     const [itemsWaiting24h] = await db.query(`
       SELECT
         ta.id, ta.task_title,
@@ -2201,6 +2204,17 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       WHERE ta.status = 'in_progress'
         AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
         AND p.status NOT IN ('deleted','cancelled','completed')
+        AND LOWER(COALESCE(d.name,'')) NOT LIKE '%dispatch%'
+        AND ta.id = (
+          SELECT ta2.id
+          FROM task_assignments ta2
+          JOIN departments d2 ON d2.id = ta2.department_id
+          WHERE ta2.project_item_id = ta.project_item_id
+            AND ta2.status = 'in_progress'
+            AND LOWER(d2.name) NOT LIKE '%dispatch%'
+          ORDER BY COALESCE(ta2.stage_order, d2.stage_order, 99) ASC
+          LIMIT 1
+        )
         AND (
           ta.project_item_id IS NULL
           OR ta.project_item_id NOT IN (
@@ -2212,7 +2226,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           )
         )
       ORDER BY ta.updated_at ASC
-      LIMIT 10`);
+      LIMIT 15`);
 
     // Department Workload — running/pending/delayed show CURRENT state (no date filter)
     // completed is date-filtered to show how many finished in selected range
@@ -2258,54 +2272,72 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       ORDER BY ta.updated_at ASC
       LIMIT 10`);
 
-    // Stage Flow Summary — current state per department (no date filter on status)
-    // completed = tasks finished in selected date range, others = current totals
+    // Stage Flow Summary — per dept:
+    //   total_working  = tasks currently in_progress or pending (opening balance)
+    //   today_in       = tasks assigned to this dept today (new work received)
+    //   today_out      = qty workers logged done in this dept today (daily_progress)
+    //   pending_count  = tasks with status=pending (chain set, work not started yet)
+    //   in_progress_count = tasks currently being worked
     const [stageFlowSummary] = await db.query(`
       SELECT d.id, d.name, d.color, d.stage_order,
-        COUNT(DISTINCT ta.project_item_id) AS total_items,
-        COALESCE(SUM(CASE WHEN ta.status='completed' THEN 1 ELSE 0 END), 0) AS completed,
-        COALESCE(SUM(CASE WHEN ta.status='pending'   THEN 1 ELSE 0 END), 0) AS pending,
-        COALESCE(SUM(CASE WHEN ta.status='in_progress' THEN 1 ELSE 0 END), 0) AS in_progress,
-        COALESCE(SUM(CASE WHEN ta.status='completed'
-          AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS completed_in_range
+        COALESCE(SUM(CASE WHEN ta.status IN ('in_progress','pending') THEN 1 ELSE 0 END), 0) AS total_working,
+        COALESCE((
+          SELECT SUM(ta2.quantity_assigned)
+          FROM task_assignments ta2
+          WHERE ta2.department_id = d.id
+            AND DATE(ta2.created_at) = CURDATE()
+            AND ta2.status != 'cancelled'
+        ), 0) AS today_in,
+        COALESCE((
+          SELECT SUM(dp.qty_done)
+          FROM daily_progress dp
+          WHERE dp.department_id = d.id
+            AND DATE(dp.work_date) = CURDATE()
+        ), 0) AS today_out,
+        COALESCE(SUM(CASE WHEN ta.status = 'pending'     THEN 1 ELSE 0 END), 0) AS pending_count,
+        COALESCE(SUM(CASE WHEN ta.status = 'in_progress' THEN 1 ELSE 0 END), 0) AS in_progress_count,
+        COALESCE(SUM(CASE WHEN ta.status = 'completed'   THEN 1 ELSE 0 END), 0) AS completed_count
       FROM departments d
       LEFT JOIN task_assignments ta ON ta.department_id = d.id
       WHERE d.is_active = 1
       GROUP BY d.id
-      ORDER BY d.stage_order, d.name`,
-      [from, to]);
+      ORDER BY d.stage_order, d.name`);
 
-    // Outsource Preview — overdue first, then next-24h upcoming, then date range
+    // Outsource Preview — ALL pending/active jobs sorted by urgency
+    // Columns: vendor_name, created_at (order placed), expected_date, proto_code,
+    //          project_name, days_until_due
     let outsourcePreview = [];
     try {
       [outsourcePreview] = await db.query(`
-        SELECT oj.id, oj.vendor_name, oj.expected_date, oj.status, oj.qty_ordered,
-          p.name AS project_name,
-          pi.item_name, pi.proto_code,
+        SELECT
+          oj.id,
+          oj.vendor_name,
+          oj.created_at  AS order_placed_date,
+          oj.expected_date,
+          oj.status,
+          oj.qty_ordered,
+          p.name         AS project_name,
+          pi.proto_code,
+          pi.item_name,
+          DATEDIFF(oj.expected_date, CURDATE()) AS days_until_due,
           CASE
-            WHEN oj.expected_date < CURDATE() THEN 'overdue'
-            WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 'next_24h'
+            WHEN oj.expected_date < CURDATE()                             THEN 'overdue'
+            WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR)   THEN 'next_24h'
             ELSE 'on_time'
           END AS urgency
         FROM outsource_jobs oj
-        LEFT JOIN projects p ON p.id = oj.project_id
+        LEFT JOIN projects p  ON p.id  = oj.project_id
         LEFT JOIN project_items pi ON pi.id = oj.project_item_id
         WHERE oj.status NOT IN ('Received','Cancelled')
-          AND (
-            oj.expected_date < CURDATE()
-            OR (oj.expected_date IS NOT NULL AND oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR))
-            OR DATE(oj.expected_date) BETWEEN ? AND ?
-            OR DATE(oj.created_at) BETWEEN ? AND ?
-          )
         ORDER BY
           CASE
-            WHEN oj.expected_date < CURDATE() THEN 0
+            WHEN oj.expected_date IS NULL        THEN 3
+            WHEN oj.expected_date < CURDATE()    THEN 0
             WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 1
             ELSE 2
           END,
           oj.expected_date ASC
-        LIMIT 8`,
-        [from, to, from, to]);
+        LIMIT 20`);
     } catch(e) {
       console.warn('outsourcePreview skipped:', e.message);
     }
