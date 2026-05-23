@@ -2083,43 +2083,48 @@ router.get('/reports/dashboard', auth, async (req, res) => {
 
     const [[projStats]] = await db.query(`
       SELECT COUNT(*) as total,
-        SUM(status='active') as active,
-        SUM(status='completed') as completed,
-        SUM(status='pending') as pending,
-        SUM(status='in_progress') as in_progress,
-        SUM(status NOT IN ('deleted','cancelled','completed') AND deadline IS NOT NULL AND deadline < CURDATE()) as overdue
+        SUM(status='active')             as active,
+        SUM(status='completed')          as completed,
+        SUM(status='on_hold')            as on_hold,
+        SUM(status='inactive')           as inactive,
+        SUM(status NOT IN ('deleted','cancelled','completed')
+            AND deadline IS NOT NULL AND deadline < CURDATE()) as overdue
       FROM projects`);
+    projStats.in_progress = 0; /* projects table has no in_progress status */
 
     const [[workerStats]] = await db.query(
       `SELECT COUNT(*) as total FROM users WHERE role='worker' AND is_active=1`);
 
-    // Extra stat card counts (all-time / today)
-    const [[extraStats]] = await db.query(`
-      SELECT
-        (SELECT COUNT(*)
-          FROM project_items pi
-          JOIN projects p ON p.id = pi.project_id
-          WHERE p.status NOT IN ('deleted','cancelled','completed')
-            AND pi.status != 'completed'
-        ) AS items_running,
-
-        (SELECT COUNT(*) FROM approvals WHERE status = 'PENDING') AS pending_approvals,
-
-        /* Worker qty done in Dispatch dept today (daily_progress) */
-        (SELECT COALESCE(SUM(dp.qty_done), 0)
-          FROM daily_progress dp
-          JOIN departments d ON d.id = dp.department_id
-          WHERE LOWER(d.name) LIKE '%dispatch%'
-            AND dp.work_date = CURDATE()
-        ) AS dispatch_worker_qty,
-
-        /* Qty on sale challans created today */
-        (SELECT COALESCE(SUM(sci.quantity), 0)
-          FROM sale_challan_items sci
-          JOIN sale_challans sc ON sc.id = sci.challan_id
-          WHERE DATE(sc.created_at) = CURDATE()
-            AND sc.status != 'cancelled'
-        ) AS dispatch_challan_qty`);
+    // Extra stat card counts — each wrapped individually to survive missing tables
+    let extraStats = { items_running: 0, pending_approvals: 0, dispatch_worker_qty: 0, dispatch_challan_qty: 0 };
+    try {
+      const [[es]] = await db.query(`
+        SELECT
+          (SELECT COUNT(*)
+            FROM project_items pi
+            JOIN projects p ON p.id = pi.project_id
+            WHERE p.status NOT IN ('deleted','cancelled','completed')
+              AND pi.status != 'completed'
+          ) AS items_running,
+          (SELECT COUNT(*) FROM approvals WHERE status = 'PENDING') AS pending_approvals,
+          /* Worker qty done in Dispatch dept today */
+          (SELECT COALESCE(SUM(dp.qty_done), 0)
+            FROM daily_progress dp
+            JOIN departments d ON d.id = dp.department_id
+            WHERE LOWER(d.name) LIKE '%dispatch%'
+              AND dp.work_date = CURDATE()
+          ) AS dispatch_worker_qty,
+          /* Qty on sale challans dated today */
+          (SELECT COALESCE(SUM(sci.quantity), 0)
+            FROM sale_challan_items sci
+            JOIN sale_challans sc ON sc.id = sci.challan_id
+            WHERE sc.challan_date = CURDATE()
+              AND sc.status != 'cancelled'
+          ) AS dispatch_challan_qty`);
+      extraStats = es;
+    } catch(e) {
+      console.warn('extraStats partial error:', e.message);
+    }
 
     // ── DATE-FILTERED QUERIES ─────────────────────────────────────────────────
 
@@ -2178,7 +2183,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       FROM projects p
       WHERE p.status NOT IN ('deleted','cancelled')`);
 
-    // Items Waiting > 24 Hours — date filtered by when task became in_progress
+    // Items Waiting > 24 Hours — all in_progress tasks stalled >24h with no progress today
     const [itemsWaiting24h] = await db.query(`
       SELECT
         ta.id, ta.task_title,
@@ -2189,41 +2194,39 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         ta.updated_at AS pending_since,
         TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
       FROM task_assignments ta
-      JOIN project_items pi ON pi.id = ta.project_item_id
+      LEFT JOIN project_items pi ON pi.id = ta.project_item_id
       JOIN projects p ON p.id = ta.project_id
       LEFT JOIN departments d ON d.id = ta.department_id
       LEFT JOIN users u ON u.id = ta.worker_id
       WHERE ta.status = 'in_progress'
         AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-        AND DATE(ta.updated_at) >= ?
-        AND (ta.project_item_id NOT IN (
-          SELECT DISTINCT dp.project_item_id
-          FROM daily_progress dp
-          WHERE DATE(dp.work_date) BETWEEN ? AND ?
-            AND dp.project_item_id IS NOT NULL
-            AND dp.department_id = ta.department_id
-        ))
+        AND p.status NOT IN ('deleted','cancelled','completed')
+        AND (
+          ta.project_item_id IS NULL
+          OR ta.project_item_id NOT IN (
+            SELECT DISTINCT dp.project_item_id
+            FROM daily_progress dp
+            WHERE DATE(dp.work_date) = CURDATE()
+              AND dp.project_item_id IS NOT NULL
+              AND dp.department_id = ta.department_id
+          )
+        )
       ORDER BY ta.updated_at ASC
-      LIMIT 10`,
-      [from, from, to]);
+      LIMIT 10`);
 
-    // Department Workload — with delayed_24h, filtered by task activity in range
+    // Department Workload — running/pending/delayed show CURRENT state (no date filter)
+    // completed is date-filtered to show how many finished in selected range
     const [deptWorkload] = await db.query(`
       SELECT d.id, d.name, d.color, d.stage_order,
         COUNT(DISTINCT wd.worker_id) AS worker_count,
-        COALESCE(SUM(CASE WHEN ta.status='in_progress'
-          AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS running,
-        COALESCE(SUM(CASE WHEN ta.status='pending'
-          AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS pending,
+        COALESCE(SUM(CASE WHEN ta.status='in_progress' THEN 1 ELSE 0 END), 0) AS running,
+        COALESCE(SUM(CASE WHEN ta.status='pending'     THEN 1 ELSE 0 END), 0) AS pending,
         COALESCE(SUM(CASE WHEN ta.status='completed'
           AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS completed,
         COALESCE(SUM(CASE WHEN ta.status='in_progress'
-          AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-          AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS delayed_24h,
-        COALESCE(SUM(CASE WHEN DATE(ta.updated_at) BETWEEN ? AND ?
-          THEN ta.quantity_assigned ELSE 0 END), 0) AS qty_assigned,
-        COALESCE(SUM(CASE WHEN DATE(ta.updated_at) BETWEEN ? AND ?
-          THEN ta.quantity_completed ELSE 0 END), 0) AS qty_done
+          AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR) THEN 1 ELSE 0 END), 0) AS delayed_24h,
+        COALESCE(SUM(ta.quantity_assigned),  0) AS qty_assigned,
+        COALESCE(SUM(ta.quantity_completed), 0) AS qty_done
       FROM departments d
       LEFT JOIN worker_departments wd ON wd.department_id = d.id
       LEFT JOIN task_assignments ta ON ta.department_id = d.id
@@ -2231,9 +2234,9 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       GROUP BY d.id
       ORDER BY d.stage_order, d.name
       LIMIT 10`,
-      [from,to, from,to, from,to, from,to, from,to, from,to]);
+      [from, to]);
 
-    // Live Item Tracking — in_progress tasks updated in date range
+    // Live Item Tracking — ALL currently in_progress tasks (no date filter on status)
     const [liveItemTracking] = await db.query(`
       SELECT
         ta.id, ta.task_title,
@@ -2246,54 +2249,56 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         ta.updated_at AS pending_since,
         TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
       FROM task_assignments ta
-      JOIN project_items pi ON pi.id = ta.project_item_id
+      LEFT JOIN project_items pi ON pi.id = ta.project_item_id
       JOIN projects p ON p.id = ta.project_id
       LEFT JOIN departments d ON d.id = ta.department_id
       LEFT JOIN users u ON u.id = ta.worker_id
       WHERE ta.status = 'in_progress'
-        AND DATE(ta.updated_at) BETWEEN ? AND ?
-        AND p.status NOT IN ('deleted','cancelled')
+        AND p.status NOT IN ('deleted','cancelled','completed')
       ORDER BY ta.updated_at ASC
-      LIMIT 10`,
-      [from, to]);
+      LIMIT 10`);
 
-    // Stage Flow Summary — per department, completed/pending in date range
+    // Stage Flow Summary — current state per department (no date filter on status)
+    // completed = tasks finished in selected date range, others = current totals
     const [stageFlowSummary] = await db.query(`
       SELECT d.id, d.name, d.color, d.stage_order,
-        COUNT(DISTINCT CASE WHEN DATE(ta.updated_at) BETWEEN ? AND ?
-          THEN ta.project_item_id ELSE NULL END) AS total_items,
+        COUNT(DISTINCT ta.project_item_id) AS total_items,
+        COALESCE(SUM(CASE WHEN ta.status='completed' THEN 1 ELSE 0 END), 0) AS completed,
+        COALESCE(SUM(CASE WHEN ta.status='pending'   THEN 1 ELSE 0 END), 0) AS pending,
+        COALESCE(SUM(CASE WHEN ta.status='in_progress' THEN 1 ELSE 0 END), 0) AS in_progress,
         COALESCE(SUM(CASE WHEN ta.status='completed'
-          AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS completed,
-        COALESCE(SUM(CASE WHEN ta.status='pending'
-          AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS pending,
-        COALESCE(SUM(CASE WHEN ta.status='in_progress'
-          AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS in_progress
+          AND DATE(ta.updated_at) BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS completed_in_range
       FROM departments d
       LEFT JOIN task_assignments ta ON ta.department_id = d.id
       WHERE d.is_active = 1
       GROUP BY d.id
       ORDER BY d.stage_order, d.name`,
-      [from,to, from,to, from,to, from,to]);
+      [from, to]);
 
-    // Outsource Preview — jobs with expected_date in range or pending
-    const [outsourcePreview] = await db.query(`
-      SELECT oj.id, oj.vendor_name, oj.expected_date, oj.status, oj.qty_ordered,
-        p.name AS project_name,
-        pi.item_name, pi.proto_code
-      FROM outsource_jobs oj
-      LEFT JOIN projects p ON p.id = oj.project_id
-      LEFT JOIN project_items pi ON pi.id = oj.project_item_id
-      WHERE oj.status NOT IN ('Received','Cancelled')
-        AND (
-          DATE(oj.expected_date) BETWEEN ? AND ?
-          OR DATE(oj.created_at) BETWEEN ? AND ?
-          OR oj.expected_date < CURDATE()
-        )
-      ORDER BY
-        CASE WHEN oj.expected_date < CURDATE() THEN 0 ELSE 1 END,
-        oj.expected_date ASC
-      LIMIT 5`,
-      [from, to, from, to]);
+    // Outsource Preview — wrapped in try-catch (outsource_jobs may not exist yet)
+    let outsourcePreview = [];
+    try {
+      [outsourcePreview] = await db.query(`
+        SELECT oj.id, oj.vendor_name, oj.expected_date, oj.status, oj.qty_ordered,
+          p.name AS project_name,
+          pi.item_name, pi.proto_code
+        FROM outsource_jobs oj
+        LEFT JOIN projects p ON p.id = oj.project_id
+        LEFT JOIN project_items pi ON pi.id = oj.project_item_id
+        WHERE oj.status NOT IN ('Received','Cancelled')
+          AND (
+            DATE(oj.expected_date) BETWEEN ? AND ?
+            OR DATE(oj.created_at) BETWEEN ? AND ?
+            OR oj.expected_date < CURDATE()
+          )
+        ORDER BY
+          CASE WHEN oj.expected_date < CURDATE() THEN 0 ELSE 1 END,
+          oj.expected_date ASC
+        LIMIT 5`,
+        [from, to, from, to]);
+    } catch(e) {
+      console.warn('outsourcePreview skipped:', e.message);
+    }
 
     // ── LEGACY fields kept for backward compat ────────────────────────────────
     const [recentProjects] = await db.query(`
