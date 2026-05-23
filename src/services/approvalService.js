@@ -159,25 +159,38 @@ async function getPendingApprovals(filters = {}) {
       requested_data: row.requested_data ? JSON.parse(row.requested_data) : {}
     }));
 
-    // Enrich ITEM approvals with project_name (replace raw project_id)
+    // Enrich approvals with project_name
+    // requested_data can be { project_id } OR { body: { project_id } } — check both
+    const getProjectId = (rd) => {
+      if (!rd) return null;
+      const id = rd.project_id ?? rd.body?.project_id ?? null;
+      return id && !isNaN(id) ? Number(id) : null;
+    };
+
     const projectIds = [...new Set(
-      parsed
-        .filter(r => r.requested_data?.project_id && !isNaN(r.requested_data.project_id))
-        .map(r => Number(r.requested_data.project_id))
+      parsed.map(r => getProjectId(r.requested_data)).filter(Boolean)
     )];
+
     let projectNameMap = {};
     if (projectIds.length > 0) {
       const [projRows] = await db.query(
-        `SELECT id, name, project_id AS proj_code FROM projects WHERE id IN (${projectIds.join(',')})` 
+        `SELECT id, name, project_id AS proj_code FROM projects WHERE id IN (${projectIds.join(',')})`
       );
       projRows.forEach(p => { projectNameMap[p.id] = { name: p.name, proj_code: p.proj_code }; });
     }
 
     return parsed.map(row => {
-      const rd = { ...row.requested_data };
-      if (rd.project_id && projectNameMap[Number(rd.project_id)]) {
-        const proj = projectNameMap[Number(rd.project_id)];
-        rd.project_name = `${proj.name} (${proj.proj_code})`;
+      const rd  = { ...row.requested_data };
+      const pid = getProjectId(rd);
+      if (pid && projectNameMap[pid]) {
+        const proj = projectNameMap[pid];
+        const label = `${proj.name} (${proj.proj_code})`;
+        // Inject at both levels so the renderer always finds it
+        if (rd.body && typeof rd.body === 'object') {
+          rd.body = { ...rd.body, project_name: label };
+        } else {
+          rd.project_name = label;
+        }
       }
       return { ...row, requested_data: rd };
     });
