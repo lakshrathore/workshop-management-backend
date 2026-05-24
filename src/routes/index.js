@@ -2342,91 +2342,88 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       console.warn('outsourcePreview skipped:', e.message);
     }
 
-    // ── Worker Daily Report (Page 7) ─────────────────────────────────────────
-    // Per worker per department:
-    //   opening_qty = tasks in_progress assigned before today (qty_assigned)
-    //   today_in    = tasks newly created/assigned today
-    //   today_out   = qty done logged today (daily_progress)
-    //   closing     = opening + today_in - today_out
-    //   efficiency  = today_out / (opening + today_in) * 100
-    const [workerDailyReport] = await db.query(`
-      SELECT
-        u.id                                          AS worker_id,
-        u.name                                        AS worker_name,
-        d.id                                          AS dept_id,
-        d.name                                        AS dept_name,
-        d.color                                       AS dept_color,
-        d.stage_order,
-        COALESCE(SUM(CASE
-          WHEN ta.status = 'in_progress'
-            AND DATE(ta.created_at) < CURDATE()
-          THEN ta.quantity_assigned ELSE 0 END), 0)   AS opening_qty,
-        COALESCE(SUM(CASE
-          WHEN DATE(ta.created_at) = CURDATE()
-            AND ta.status != 'cancelled'
-          THEN ta.quantity_assigned ELSE 0 END), 0)   AS today_in,
-        COALESCE((
-          SELECT SUM(dp2.qty_done)
-          FROM daily_progress dp2
-          WHERE dp2.worker_id = u.id
-            AND dp2.department_id = d.id
-            AND DATE(dp2.work_date) = CURDATE()
-        ), 0)                                         AS today_out,
-        COALESCE(SUM(CASE WHEN ta.status = 'pending'
-          THEN ta.quantity_assigned ELSE 0 END), 0)   AS pending_qty,
-        COALESCE(SUM(CASE WHEN ta.status = 'in_progress'
-          THEN 1 ELSE 0 END), 0)                      AS active_tasks,
-        COALESCE(SUM(CASE WHEN ta.status = 'completed'
-          THEN 1 ELSE 0 END), 0)                      AS completed_tasks,
-        COUNT(ta.id)                                  AS total_tasks,
-        COALESCE(SUM(ta.quantity_assigned),  0)       AS total_qty_assigned,
-        COALESCE(SUM(ta.quantity_completed), 0)       AS total_qty_done
-      FROM users u
-      JOIN worker_departments wd ON wd.worker_id = u.id
-      JOIN departments d ON d.id = wd.department_id
-      LEFT JOIN task_assignments ta
-        ON ta.department_id = d.id
-        AND (ta.worker_id = u.id OR ta.worker_id IS NULL)
-        AND ta.status NOT IN ('cancelled')
-      WHERE u.role = 'worker' AND u.is_active = 1
-      GROUP BY u.id, d.id
-      HAVING (opening_qty + today_in + active_tasks + pending_qty) > 0
-      ORDER BY d.stage_order, u.name`);
+    // ── Worker Daily Report ───────────────────────────────────────────────────
+    let workerDailyReport = [];
+    try {
+      [workerDailyReport] = await db.query(`
+        SELECT
+          u.id                                                  AS worker_id,
+          u.name                                                AS worker_name,
+          d.id                                                  AS dept_id,
+          d.name                                                AS dept_name,
+          d.color                                               AS dept_color,
+          d.stage_order,
+          COALESCE(SUM(CASE
+            WHEN ta.status = 'in_progress' AND DATE(ta.created_at) < CURDATE()
+            THEN ta.quantity_assigned ELSE 0 END), 0)           AS opening_qty,
+          COALESCE(SUM(CASE
+            WHEN DATE(ta.created_at) = CURDATE() AND ta.status != 'cancelled'
+            THEN ta.quantity_assigned ELSE 0 END), 0)           AS today_in,
+          COALESCE((
+            SELECT SUM(dp2.qty_done)
+            FROM daily_progress dp2
+            WHERE dp2.worker_id = u.id
+              AND dp2.department_id = d.id
+              AND DATE(dp2.work_date) = CURDATE()
+          ), 0)                                                 AS today_out,
+          COALESCE(SUM(CASE WHEN ta.status = 'pending'
+            THEN ta.quantity_assigned ELSE 0 END), 0)           AS pending_qty,
+          COALESCE(SUM(CASE WHEN ta.status = 'in_progress'
+            THEN 1 ELSE 0 END), 0)                              AS active_tasks,
+          COALESCE(SUM(CASE WHEN ta.status = 'completed'
+            THEN 1 ELSE 0 END), 0)                              AS completed_tasks,
+          COUNT(ta.id)                                          AS total_tasks,
+          COALESCE(SUM(ta.quantity_assigned),  0)               AS total_qty_assigned,
+          COALESCE(SUM(ta.quantity_completed), 0)               AS total_qty_done
+        FROM users u
+        JOIN worker_departments wd ON wd.worker_id = u.id
+        JOIN departments d ON d.id = wd.department_id
+        LEFT JOIN task_assignments ta
+          ON ta.department_id = d.id
+          AND ta.worker_id = u.id
+          AND ta.status NOT IN ('cancelled')
+        WHERE u.role = 'worker' AND u.is_active = 1
+        GROUP BY u.id, d.id
+        ORDER BY d.stage_order, u.name`);
+    } catch(e) {
+      console.warn('workerDailyReport skipped:', e.message);
+    }
 
-    // ── Dispatch Daily Report (Page 8) ────────────────────────────────────────
-    // Project-wise: opening = packing done before today, in = packing done today,
-    //               out = dispatched today via daily_progress (dispatch dept)
-    const [dispatchDailyReport] = await db.query(`
-      SELECT
-        p.id                          AS project_id,
-        p.name                        AS project_name,
-        p.project_id                  AS proj_code,
-        COALESCE(SUM(CASE
-          WHEN ta.status = 'completed'
-            AND DATE(ta.updated_at) < CURDATE()
-          THEN ta.quantity_completed ELSE 0 END), 0)  AS opening_qty,
-        COALESCE(SUM(CASE
-          WHEN ta.status = 'completed'
-            AND DATE(ta.updated_at) = CURDATE()
-          THEN ta.quantity_completed ELSE 0 END), 0)  AS today_in,
-        COALESCE((
-          SELECT SUM(dp.qty_done)
-          FROM daily_progress dp
-          JOIN departments dd ON dd.id = dp.department_id
-          WHERE dp.project_id = p.id
-            AND LOWER(dd.name) LIKE '%dispatch%'
-            AND DATE(dp.work_date) = CURDATE()
-        ), 0)                                         AS today_out
-      FROM projects p
-      JOIN task_assignments ta ON ta.project_id = p.id
-      JOIN departments d_pack
-        ON d_pack.id = ta.department_id
-        AND LOWER(d_pack.name) LIKE '%pack%'
-      WHERE p.status NOT IN ('deleted','cancelled')
-      GROUP BY p.id
-      HAVING (opening_qty + today_in) > 0
-      ORDER BY today_in DESC, opening_qty DESC
-      LIMIT 30`);
+    // ── Dispatch Daily Report ─────────────────────────────────────────────────
+    let dispatchDailyReport = [];
+    try {
+      [dispatchDailyReport] = await db.query(`
+        SELECT
+          p.id                          AS project_id,
+          p.name                        AS project_name,
+          p.project_id                  AS proj_code,
+          COALESCE(SUM(CASE
+            WHEN ta.status = 'completed' AND DATE(ta.updated_at) < CURDATE()
+            THEN ta.quantity_completed ELSE 0 END), 0)  AS opening_qty,
+          COALESCE(SUM(CASE
+            WHEN ta.status = 'completed' AND DATE(ta.updated_at) = CURDATE()
+            THEN ta.quantity_completed ELSE 0 END), 0)  AS today_in,
+          COALESCE((
+            SELECT SUM(dp.qty_done)
+            FROM daily_progress dp
+            JOIN departments dd ON dd.id = dp.department_id
+            WHERE dp.project_id = p.id
+              AND LOWER(dd.name) LIKE '%dispatch%'
+              AND DATE(dp.work_date) = CURDATE()
+          ), 0)                                         AS today_out
+        FROM projects p
+        JOIN task_assignments ta ON ta.project_id = p.id
+        JOIN departments d_pack
+          ON d_pack.id = ta.department_id
+          AND LOWER(d_pack.name) LIKE '%pack%'
+        WHERE p.status NOT IN ('deleted','cancelled')
+        GROUP BY p.id
+        HAVING opening_qty > 0 OR today_in > 0
+        ORDER BY today_in DESC, opening_qty DESC
+        LIMIT 30`);
+    } catch(e) {
+      console.warn('dispatchDailyReport skipped:', e.message);
+    }
 
     // ── LEGACY fields kept for backward compat ────────────────────────────────
     const [recentProjects] = await db.query(`
