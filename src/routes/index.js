@@ -2272,31 +2272,46 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       ORDER BY ta.updated_at ASC
       LIMIT 10`);
 
-    // Stage Flow Summary — per dept:
-    //   total_working  = tasks currently in_progress or pending (opening balance)
-    //   today_in       = tasks assigned to this dept today (new work received)
-    //   today_out      = qty workers logged done in this dept today (daily_progress)
-    //   pending_count  = tasks with status=pending (chain set, work not started yet)
-    //   in_progress_count = tasks currently being worked
+    // Stage Flow Summary — always TODAY's data, date filter does NOT apply here
+    // Opening (total_working) = yesterday's closing = qty arrived before today - qty done before today
+    // Today In  = tasks assigned TODAY
+    // Today Out = daily_progress done TODAY
     const [stageFlowSummary] = await db.query(`
       SELECT d.id, d.name, d.color, d.stage_order,
-        COALESCE(SUM(CASE WHEN ta.status IN ('in_progress','pending') THEN 1 ELSE 0 END), 0) AS total_working,
+
+        /* Opening = yesterday closing = qty assigned before today - qty done before today */
+        GREATEST(0,
+          COALESCE(SUM(
+            CASE WHEN DATE(ta.created_at) < CURDATE()
+            THEN ta.quantity_assigned ELSE 0 END
+          ), 0)
+          - COALESCE((
+              SELECT SUM(dp0.qty_done)
+              FROM daily_progress dp0
+              WHERE dp0.department_id = d.id AND dp0.work_date < CURDATE()
+            ), 0)
+        )                                                             AS total_working,
+
         COALESCE((
           SELECT SUM(ta2.quantity_assigned)
           FROM task_assignments ta2
           WHERE ta2.department_id = d.id
             AND DATE(ta2.created_at) = CURDATE()
             AND ta2.status != 'cancelled'
-        ), 0) AS today_in,
+        ), 0)                                                         AS today_in,
+
         COALESCE((
           SELECT SUM(dp.qty_done)
           FROM daily_progress dp
-          WHERE dp.department_id = d.id
-            AND DATE(dp.work_date) = CURDATE()
-        ), 0) AS today_out,
-        COALESCE(SUM(CASE WHEN ta.status = 'pending'     THEN 1 ELSE 0 END), 0) AS pending_count,
-        COALESCE(SUM(CASE WHEN ta.status = 'in_progress' THEN 1 ELSE 0 END), 0) AS in_progress_count,
-        COALESCE(SUM(CASE WHEN ta.status = 'completed'   THEN 1 ELSE 0 END), 0) AS completed_count
+          WHERE dp.department_id = d.id AND dp.work_date = CURDATE()
+        ), 0)                                                         AS today_out,
+
+        COALESCE(SUM(CASE WHEN ta.status = 'pending'
+          THEN 1 ELSE 0 END), 0)                                     AS pending_count,
+        COALESCE(SUM(CASE WHEN ta.status = 'in_progress'
+          THEN 1 ELSE 0 END), 0)                                     AS in_progress_count,
+        COALESCE(SUM(CASE WHEN ta.status = 'completed'
+          THEN 1 ELSE 0 END), 0)                                     AS completed_count
       FROM departments d
       LEFT JOIN task_assignments ta ON ta.department_id = d.id
       WHERE d.is_active = 1
@@ -2344,42 +2359,61 @@ router.get('/reports/dashboard', auth, async (req, res) => {
     }
 
     // ── Worker Daily Report ───────────────────────────────────────────────────
-    // Tasks are assigned to a DEPARTMENT (not individual worker), so we join by dept.
-    // today_out = each worker's personal daily_progress contribution today.
+    // Opening  = yesterday's closing = (all qty assigned before today) - (all qty done before today)
+    // Today In = tasks assigned TODAY to this dept
+    // Today Out = worker's personal daily_progress logged TODAY
+    // Closing  = Opening + Today In - Today Out
+    // NOTE: These always reflect TODAY's status — date range filter does NOT apply here.
     let workerDailyReport = [];
     try {
       [workerDailyReport] = await db.query(`
         SELECT
-          u.id                                                  AS worker_id,
-          u.name                                                AS worker_name,
-          d.id                                                  AS dept_id,
-          d.name                                                AS dept_name,
-          d.color                                               AS dept_color,
+          u.id                                                        AS worker_id,
+          u.name                                                      AS worker_name,
+          d.id                                                        AS dept_id,
+          d.name                                                      AS dept_name,
+          d.color                                                     AS dept_color,
           d.stage_order,
-          COALESCE(SUM(CASE
-            WHEN ta.status = 'in_progress'
-              AND DATE(ta.created_at) < CURDATE()
-            THEN ta.quantity_assigned ELSE 0 END), 0)           AS opening_qty,
-          COALESCE(SUM(CASE
-            WHEN DATE(ta.created_at) = CURDATE()
+
+          /* Opening = yesterday closing = qty arrived before today - qty done before today */
+          GREATEST(0,
+            COALESCE(SUM(
+              CASE WHEN DATE(ta.created_at) < CURDATE()
+              THEN ta.quantity_assigned ELSE 0 END
+            ), 0)
+            - COALESCE((
+                SELECT SUM(dp0.qty_done)
+                FROM daily_progress dp0
+                WHERE dp0.department_id = d.id
+                  AND dp0.work_date < CURDATE()
+              ), 0)
+          )                                                           AS opening_qty,
+
+          /* Today In = tasks assigned to this dept TODAY */
+          COALESCE(SUM(
+            CASE WHEN DATE(ta.created_at) = CURDATE()
               AND ta.status != 'cancelled'
-            THEN ta.quantity_assigned ELSE 0 END), 0)           AS today_in,
+            THEN ta.quantity_assigned ELSE 0 END
+          ), 0)                                                       AS today_in,
+
+          /* Today Out = this worker's own daily_progress output TODAY */
           COALESCE((
             SELECT SUM(dp2.qty_done)
             FROM daily_progress dp2
-            WHERE dp2.worker_id = u.id
+            WHERE dp2.worker_id    = u.id
               AND dp2.department_id = d.id
-              AND DATE(dp2.work_date) = CURDATE()
-          ), 0)                                                 AS today_out,
+              AND dp2.work_date    = CURDATE()
+          ), 0)                                                       AS today_out,
+
           COALESCE(SUM(CASE WHEN ta.status = 'pending'
-            THEN ta.quantity_assigned ELSE 0 END), 0)           AS pending_qty,
+            THEN ta.quantity_assigned ELSE 0 END), 0)                AS pending_qty,
           COALESCE(SUM(CASE WHEN ta.status = 'in_progress'
-            THEN 1 ELSE 0 END), 0)                              AS active_tasks,
+            THEN 1 ELSE 0 END), 0)                                   AS active_tasks,
           COALESCE(SUM(CASE WHEN ta.status = 'completed'
-            THEN 1 ELSE 0 END), 0)                              AS completed_tasks,
-          COUNT(ta.id)                                          AS total_tasks,
-          COALESCE(SUM(ta.quantity_assigned),  0)               AS total_qty_assigned,
-          COALESCE(SUM(ta.quantity_completed), 0)               AS total_qty_done
+            THEN 1 ELSE 0 END), 0)                                   AS completed_tasks,
+          COUNT(ta.id)                                               AS total_tasks,
+          COALESCE(SUM(ta.quantity_assigned),  0)                    AS total_qty_assigned,
+          COALESCE(SUM(ta.quantity_completed), 0)                    AS total_qty_done
         FROM users u
         JOIN worker_departments wd ON wd.worker_id = u.id
         JOIN departments d ON d.id = wd.department_id
