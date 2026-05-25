@@ -2304,7 +2304,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       ORDER BY d.stage_order, d.name`);
 
     // Outsource Preview — ALL pending/active jobs sorted by urgency
-    // Columns: vendor_name, created_at (order placed), expected_date, proto_code,
+    // Columns: vendor_name, sent_date (order placed), expected_date, proto_code,
     //          project_name, days_until_due
     let outsourcePreview = [];
     try {
@@ -2312,17 +2312,18 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         SELECT
           oj.id,
           oj.vendor_name,
-          oj.created_at  AS order_placed_date,
+          oj.sent_date       AS order_placed_date,
           oj.expected_date,
           oj.status,
-          oj.qty_ordered,
-          p.name         AS project_name,
+          oj.qty_sent,
+          oj.qty_received,
+          p.name             AS project_name,
           pi.proto_code,
           pi.item_name,
           DATEDIFF(oj.expected_date, CURDATE()) AS days_until_due,
           CASE
-            WHEN oj.expected_date < CURDATE()                             THEN 'overdue'
-            WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR)   THEN 'next_24h'
+            WHEN oj.expected_date < CURDATE()                           THEN 'overdue'
+            WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 'next_24h'
             ELSE 'on_time'
           END AS urgency
         FROM outsource_jobs oj
