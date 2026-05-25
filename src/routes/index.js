@@ -2344,6 +2344,8 @@ router.get('/reports/dashboard', auth, async (req, res) => {
     }
 
     // ── Worker Daily Report ───────────────────────────────────────────────────
+    // Tasks are assigned to a DEPARTMENT (not individual worker), so we join by dept.
+    // today_out = each worker's personal daily_progress contribution today.
     let workerDailyReport = [];
     try {
       [workerDailyReport] = await db.query(`
@@ -2355,10 +2357,12 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           d.color                                               AS dept_color,
           d.stage_order,
           COALESCE(SUM(CASE
-            WHEN ta.status = 'in_progress' AND DATE(ta.created_at) < CURDATE()
+            WHEN ta.status = 'in_progress'
+              AND DATE(ta.created_at) < CURDATE()
             THEN ta.quantity_assigned ELSE 0 END), 0)           AS opening_qty,
           COALESCE(SUM(CASE
-            WHEN DATE(ta.created_at) = CURDATE() AND ta.status != 'cancelled'
+            WHEN DATE(ta.created_at) = CURDATE()
+              AND ta.status != 'cancelled'
             THEN ta.quantity_assigned ELSE 0 END), 0)           AS today_in,
           COALESCE((
             SELECT SUM(dp2.qty_done)
@@ -2381,7 +2385,6 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         JOIN departments d ON d.id = wd.department_id
         LEFT JOIN task_assignments ta
           ON ta.department_id = d.id
-          AND ta.worker_id = u.id
           AND ta.status NOT IN ('cancelled')
         WHERE u.role = 'worker' AND u.is_active = 1
         GROUP BY u.id, d.id
