@@ -2149,21 +2149,12 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           LIMIT 1
         ) AS current_stage
       FROM projects p
-      WHERE p.status NOT IN ('deleted','cancelled')
-        AND (
-          DATE(p.created_at) BETWEEN ? AND ?
-          OR (p.deadline IS NOT NULL AND DATE(p.deadline) BETWEEN ? AND ?)
-          OR EXISTS (
-            SELECT 1 FROM task_assignments ta
-            WHERE ta.project_id = p.id AND DATE(ta.updated_at) BETWEEN ? AND ?
-          )
-          OR p.status NOT IN ('completed')
-        )
+      WHERE p.status NOT IN ('deleted','cancelled','completed')
       ORDER BY
         CASE p.status WHEN 'active' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
         p.deadline ASC
       LIMIT 10`,
-      [from, to, from, to, from, to]);
+      []);
 
     // Project Health Data — all non-deleted projects (for health donut)
     const [projectHealthData] = await db.query(`
@@ -2226,7 +2217,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           )
         )
       ORDER BY ta.updated_at ASC
-      LIMIT 15`);
+      LIMIT 10`);
 
     // Department Workload — running/pending/delayed show CURRENT state (no date filter)
     // completed is date-filtered to show how many finished in selected range
@@ -2272,32 +2263,34 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       ORDER BY ta.updated_at ASC
       LIMIT 10`);
 
-    // Stage Flow Summary — always TODAY's data, date filter does NOT apply here
-    // total_working (opening) = active backlog before today
-    //   = SUM(qty_assigned - qty_completed) for in_progress/pending tasks created before today
+    // Stage Flow Summary — task COUNT based (not qty) as per client requirement
+    // "task ki qty chahiye na ki product ki qty" — count tasks not pieces
+    // total_working = tasks in_progress/pending before today (yesterday's closing)
+    // today_in      = new tasks assigned today
+    // today_out     = tasks completed today
+    // closing       = total_working + today_in - today_out
     const [stageFlowSummary] = await db.query(`
       SELECT d.id, d.name, d.color, d.stage_order,
 
-        /* Opening = active backlog before today */
+        /* Opening = COUNT of active tasks before today */
         COALESCE(SUM(
           CASE WHEN ta.status IN ('in_progress','pending')
             AND DATE(ta.created_at) < CURDATE()
-          THEN GREATEST(0, ta.quantity_assigned - COALESCE(ta.quantity_completed,0))
-          ELSE 0 END
+          THEN 1 ELSE 0 END
         ), 0)                                                         AS total_working,
 
-        COALESCE((
-          SELECT SUM(ta2.quantity_assigned)
-          FROM task_assignments ta2
-          WHERE ta2.department_id = d.id
-            AND DATE(ta2.created_at) = CURDATE()
-            AND ta2.status != 'cancelled'
+        /* Today In = COUNT of new tasks created today */
+        COALESCE(SUM(
+          CASE WHEN DATE(ta.created_at) = CURDATE()
+            AND ta.status != 'cancelled'
+          THEN 1 ELSE 0 END
         ), 0)                                                         AS today_in,
 
-        COALESCE((
-          SELECT SUM(dp.qty_done)
-          FROM daily_progress dp
-          WHERE dp.department_id = d.id AND dp.work_date = CURDATE()
+        /* Today Out = COUNT of tasks completed today */
+        COALESCE(SUM(
+          CASE WHEN ta.status = 'completed'
+            AND DATE(ta.updated_at) = CURDATE()
+          THEN 1 ELSE 0 END
         ), 0)                                                         AS today_out,
 
         COALESCE(SUM(CASE WHEN ta.status='pending'     THEN 1 ELSE 0 END),0) AS pending_count,
@@ -2344,7 +2337,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
             ELSE 2
           END,
           oj.expected_date ASC
-        LIMIT 20`);
+        LIMIT 10`);
     } catch(e) {
       console.warn('outsourcePreview skipped:', e.message);
     }
@@ -2535,7 +2528,7 @@ router.get('/reports/dashboard/project-overview', auth, async (req, res) => {
           WHERE ta3.project_id=p.id AND ta3.status='in_progress'
           ORDER BY COALESCE(ta3.stage_order,d.stage_order,99) ASC LIMIT 1) AS current_stage
       FROM projects p
-      WHERE p.status NOT IN ('deleted','cancelled')
+      WHERE p.status NOT IN ('deleted','cancelled','completed')
       ORDER BY
         CASE p.status WHEN 'active' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
         p.deadline ASC`);
