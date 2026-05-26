@@ -2134,7 +2134,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       SELECT
         p.id, p.project_id, p.name, p.client_name, p.status, p.deadline,
         DATEDIFF(p.deadline, CURDATE()) AS days_left,
-        (SELECT COUNT(*) FROM task_assignments WHERE project_id = p.id) AS total_tasks,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id = p.id AND status != 'cancelled') AS total_tasks,
         (SELECT COUNT(*) FROM task_assignments WHERE project_id = p.id AND status = 'completed') AS done_tasks,
         (SELECT COUNT(*) FROM task_assignments ta2
           WHERE ta2.project_id = p.id
@@ -2184,7 +2184,14 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         pi.proto_code AS item_code, pi.item_name,
         p.name AS project_name, p.id AS project_db_id,
         d.name AS current_stage,
-        u.name AS worker_name,
+        COALESCE(
+          u.name,
+          (SELECT u2.name FROM daily_progress dp2
+            JOIN users u2 ON u2.id = dp2.worker_id
+            WHERE dp2.department_id = ta.department_id
+              AND dp2.project_id = ta.project_id
+            ORDER BY dp2.work_date DESC, dp2.id DESC LIMIT 1)
+        ) AS worker_name,
         ta.updated_at AS pending_since,
         TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
       FROM task_assignments ta
@@ -2248,7 +2255,14 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         pi.proto_code AS item_code, pi.item_name,
         p.name AS project_name, p.id AS project_db_id,
         d.name AS current_stage,
-        u.name AS worker_name,
+        COALESCE(
+          u.name,
+          (SELECT u2.name FROM daily_progress dp2
+            JOIN users u2 ON u2.id = dp2.worker_id
+            WHERE dp2.department_id = ta.department_id
+              AND dp2.project_id = ta.project_id
+            ORDER BY dp2.work_date DESC, dp2.id DESC LIMIT 1)
+        ) AS worker_name,
         ta.status,
         ta.quantity_assigned, ta.quantity_completed,
         ta.updated_at AS pending_since,
@@ -2319,7 +2333,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           p.name             AS project_name,
           pi.proto_code,
           pi.item_name,
-          DATEDIFF(oj.expected_date, CURDATE()) AS days_until_due,
+          CASE WHEN oj.expected_date IS NOT NULL THEN DATEDIFF(oj.expected_date, CURDATE()) ELSE NULL END AS days_until_due,
           CASE
             WHEN oj.expected_date < CURDATE()                           THEN 'overdue'
             WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 'next_24h'
@@ -2518,7 +2532,7 @@ router.get('/reports/dashboard/project-overview', auth, async (req, res) => {
       SELECT
         p.id, p.project_id, p.name, p.client_name, p.status, p.deadline,
         DATEDIFF(p.deadline, CURDATE()) AS days_left,
-        (SELECT COUNT(*) FROM task_assignments WHERE project_id=p.id) AS total_tasks,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id=p.id AND status != 'cancelled') AS total_tasks,
         (SELECT COUNT(*) FROM task_assignments WHERE project_id=p.id AND status='completed') AS done_tasks,
         (SELECT COUNT(*) FROM task_assignments ta2
           WHERE ta2.project_id=p.id AND ta2.status NOT IN ('completed','cancelled')
@@ -2548,7 +2562,14 @@ router.get('/reports/dashboard/items-waiting', auth, async (req, res) => {
         pi.proto_code AS item_code, pi.item_name,
         p.name AS project_name, p.id AS project_db_id,
         d.name AS current_stage,
-        u.name AS worker_name,
+        COALESCE(
+          u.name,
+          (SELECT u2.name FROM daily_progress dp2
+            JOIN users u2 ON u2.id = dp2.worker_id
+            WHERE dp2.department_id = ta.department_id
+              AND dp2.project_id = ta.project_id
+            ORDER BY dp2.work_date DESC, dp2.id DESC LIMIT 1)
+        ) AS worker_name,
         ta.updated_at AS pending_since,
         TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
       FROM task_assignments ta
@@ -2600,7 +2621,7 @@ router.get('/reports/dashboard/outsource-overview', auth, async (req, res) => {
         p.name         AS project_name,
         pi.proto_code,
         pi.item_name,
-        DATEDIFF(oj.expected_date, CURDATE()) AS days_until_due,
+        CASE WHEN oj.expected_date IS NOT NULL THEN DATEDIFF(oj.expected_date, CURDATE()) ELSE NULL END AS days_until_due,
         CASE
           WHEN oj.expected_date < CURDATE()                           THEN 'overdue'
           WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 'next_24h'
