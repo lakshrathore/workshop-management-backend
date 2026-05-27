@@ -2184,14 +2184,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         pi.proto_code AS item_code, pi.item_name,
         p.name AS project_name, p.id AS project_db_id,
         d.name AS current_stage,
-        COALESCE(
-          u.name,
-          (SELECT u2.name FROM daily_progress dp2
-            JOIN users u2 ON u2.id = dp2.worker_id
-            WHERE dp2.department_id = ta.department_id
-              AND dp2.project_id = ta.project_id
-            ORDER BY dp2.work_date DESC, dp2.id DESC LIMIT 1)
-        ) AS worker_name,
+        COALESCE(u.name, dept_u.name) AS worker_name,
         ta.updated_at AS pending_since,
         TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
       FROM task_assignments ta
@@ -2199,6 +2192,14 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       JOIN projects p ON p.id = ta.project_id
       LEFT JOIN departments d ON d.id = ta.department_id
       LEFT JOIN users u ON u.id = ta.worker_id
+      /* Fallback: first active worker in that department */
+      LEFT JOIN (
+        SELECT wd.department_id, MIN(u2.id) AS first_worker_id
+        FROM worker_departments wd
+        JOIN users u2 ON u2.id = wd.worker_id AND u2.is_active = 1
+        GROUP BY wd.department_id
+      ) AS dept_w ON dept_w.department_id = ta.department_id
+      LEFT JOIN users dept_u ON dept_u.id = dept_w.first_worker_id
       WHERE ta.status = 'in_progress'
         AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
         AND p.status NOT IN ('deleted','cancelled','completed')
@@ -2255,14 +2256,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         pi.proto_code AS item_code, pi.item_name,
         p.name AS project_name, p.id AS project_db_id,
         d.name AS current_stage,
-        COALESCE(
-          u.name,
-          (SELECT u2.name FROM daily_progress dp2
-            JOIN users u2 ON u2.id = dp2.worker_id
-            WHERE dp2.department_id = ta.department_id
-              AND dp2.project_id = ta.project_id
-            ORDER BY dp2.work_date DESC, dp2.id DESC LIMIT 1)
-        ) AS worker_name,
+        u.name AS worker_name,
         ta.status,
         ta.quantity_assigned, ta.quantity_completed,
         ta.updated_at AS pending_since,
@@ -2562,14 +2556,7 @@ router.get('/reports/dashboard/items-waiting', auth, async (req, res) => {
         pi.proto_code AS item_code, pi.item_name,
         p.name AS project_name, p.id AS project_db_id,
         d.name AS current_stage,
-        COALESCE(
-          u.name,
-          (SELECT u2.name FROM daily_progress dp2
-            JOIN users u2 ON u2.id = dp2.worker_id
-            WHERE dp2.department_id = ta.department_id
-              AND dp2.project_id = ta.project_id
-            ORDER BY dp2.work_date DESC, dp2.id DESC LIMIT 1)
-        ) AS worker_name,
+        COALESCE(u.name, dept_u.name) AS worker_name,
         ta.updated_at AS pending_since,
         TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
       FROM task_assignments ta
@@ -2577,6 +2564,13 @@ router.get('/reports/dashboard/items-waiting', auth, async (req, res) => {
       JOIN projects p ON p.id=ta.project_id
       LEFT JOIN departments d ON d.id=ta.department_id
       LEFT JOIN users u ON u.id=ta.worker_id
+      LEFT JOIN (
+        SELECT wd.department_id, MIN(u2.id) AS first_worker_id
+        FROM worker_departments wd
+        JOIN users u2 ON u2.id=wd.worker_id AND u2.is_active=1
+        GROUP BY wd.department_id
+      ) AS dept_w ON dept_w.department_id=ta.department_id
+      LEFT JOIN users dept_u ON dept_u.id=dept_w.first_worker_id
       WHERE ta.status='in_progress'
         AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
         AND p.status NOT IN ('deleted','cancelled','completed')
