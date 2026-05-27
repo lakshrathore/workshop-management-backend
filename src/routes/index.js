@@ -2090,12 +2090,12 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         SUM(status NOT IN ('deleted','cancelled','completed')
             AND deadline IS NOT NULL AND deadline < CURDATE()) as overdue
       FROM projects`);
-    projStats.in_progress = 0; /* projects table has no in_progress status */
+    projStats.in_progress = 0;
 
     const [[workerStats]] = await db.query(
       `SELECT COUNT(*) as total FROM users WHERE role='worker' AND is_active=1`);
 
-    // Extra stat card counts — each wrapped individually to survive missing tables
+    // Extra stat card counts — no date filter
     let extraStats = { items_running: 0, pending_approvals: 0, dispatch_worker_qty: 0, dispatch_challan_qty: 0 };
     try {
       const [[es]] = await db.query(`
@@ -2107,14 +2107,12 @@ router.get('/reports/dashboard', auth, async (req, res) => {
               AND pi.status != 'completed'
           ) AS items_running,
           (SELECT COUNT(*) FROM approvals WHERE status = 'PENDING') AS pending_approvals,
-          /* Worker qty done in Dispatch dept today */
           (SELECT COALESCE(SUM(dp.qty_done), 0)
             FROM daily_progress dp
             JOIN departments d ON d.id = dp.department_id
             WHERE LOWER(d.name) LIKE '%dispatch%'
               AND dp.work_date = CURDATE()
           ) AS dispatch_worker_qty,
-          /* Qty on sale challans dated today */
           (SELECT COALESCE(SUM(sci.quantity), 0)
             FROM sale_challan_items sci
             JOIN sale_challans sc ON sc.id = sci.challan_id
@@ -2126,16 +2124,16 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       console.warn('extraStats partial error:', e.message);
     }
 
-    // ── DATE-FILTERED QUERIES ─────────────────────────────────────────────────
+    // ── DATE-FILTERED QUERIES — all use from/to properly ─────────────────────
 
-    // Project Overview — projects with ANY task activity in [from,to]
-    // OR deadline falls in range OR project created in range
+    // ── 1. PROJECT OVERVIEW ──────────────────────────────────────────────────
+    // Shows projects whose deadline falls in range, OR have task activity in range
     const [projectOverview] = await db.query(`
       SELECT
         p.id, p.project_id, p.name, p.client_name, p.status, p.deadline,
         DATEDIFF(p.deadline, CURDATE()) AS days_left,
         (SELECT COUNT(*) FROM task_assignments WHERE project_id = p.id AND status != 'cancelled') AS total_tasks,
-        (SELECT COUNT(*) FROM task_assignments WHERE project_id = p.id AND status = 'completed') AS done_tasks,
+        (SELECT COUNT(*) FROM task_assignments WHERE project_id = p.id AND status = 'completed')  AS done_tasks,
         (SELECT COUNT(*) FROM task_assignments ta2
           WHERE ta2.project_id = p.id
             AND ta2.status NOT IN ('completed','cancelled')
@@ -2150,13 +2148,28 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         ) AS current_stage
       FROM projects p
       WHERE p.status NOT IN ('deleted','cancelled','completed')
+        AND (
+          /* deadline falls in selected range */
+          (p.deadline IS NOT NULL AND DATE(p.deadline) BETWEEN ? AND ?)
+          OR
+          /* project created in selected range */
+          DATE(p.created_at) BETWEEN ? AND ?
+          OR
+          /* any task was active (created or updated) in selected range */
+          EXISTS (
+            SELECT 1 FROM task_assignments ta
+            WHERE ta.project_id = p.id
+              AND ta.status != 'cancelled'
+              AND (DATE(ta.created_at) BETWEEN ? AND ? OR DATE(ta.updated_at) BETWEEN ? AND ?)
+          )
+        )
       ORDER BY
         CASE p.status WHEN 'active' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
         p.deadline ASC
-      LIMIT 10`,
-      []);
+      LIMIT 20`,
+      [from, to, from, to, from, to, from, to]);
 
-    // Project Health Data — all non-deleted projects (for health donut)
+    // ── 2. PROJECT HEALTH DATA (for internal use / backward compat) ──────────
     const [projectHealthData] = await db.query(`
       SELECT p.id, p.name, p.status, p.deadline,
         DATEDIFF(p.deadline, CURDATE()) AS days_left,
@@ -2174,10 +2187,9 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       FROM projects p
       WHERE p.status NOT IN ('deleted','cancelled')`);
 
-    // Items Waiting > 24 Hours
-    // Rules: 1) Each item appears ONCE (only its current/lowest active stage)
-    //        2) Dispatch department excluded
-    //        3) Must have had no daily_progress update today in that dept
+    // ── 3. ITEMS WAITING > 24 HOURS ─────────────────────────────────────────
+    // Items whose task went in_progress WITHIN the selected date range
+    // AND have been waiting > 24 hours with no daily_progress update in that dept
     const [itemsWaiting24h] = await db.query(`
       SELECT
         ta.id, ta.task_title,
@@ -2192,7 +2204,6 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       JOIN projects p ON p.id = ta.project_id
       LEFT JOIN departments d ON d.id = ta.department_id
       LEFT JOIN users u ON u.id = ta.worker_id
-      /* Fallback: first active worker in that department */
       LEFT JOIN (
         SELECT wd.department_id, MIN(u2.id) AS first_worker_id
         FROM worker_departments wd
@@ -2202,6 +2213,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       LEFT JOIN users dept_u ON dept_u.id = dept_w.first_worker_id
       WHERE ta.status = 'in_progress'
         AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        AND DATE(ta.updated_at) BETWEEN ? AND ?
         AND p.status NOT IN ('deleted','cancelled','completed')
         AND LOWER(COALESCE(d.name,'')) NOT LIKE '%dispatch%'
         AND ta.id = (
@@ -2219,16 +2231,16 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           OR ta.project_item_id NOT IN (
             SELECT DISTINCT dp.project_item_id
             FROM daily_progress dp
-            WHERE DATE(dp.work_date) = CURDATE()
+            WHERE DATE(dp.work_date) BETWEEN ? AND ?
               AND dp.project_item_id IS NOT NULL
               AND dp.department_id = ta.department_id
           )
         )
       ORDER BY ta.updated_at ASC
-      LIMIT 10`);
+      LIMIT 50`,
+      [from, to, from, to]);
 
-    // Department Workload — running/pending/delayed show CURRENT state (no date filter)
-    // completed is date-filtered to show how many finished in selected range
+    // ── 4. DEPT WORKLOAD (date-filtered completed) ───────────────────────────
     const [deptWorkload] = await db.query(`
       SELECT d.id, d.name, d.color, d.stage_order,
         COUNT(DISTINCT wd.worker_id) AS worker_count,
@@ -2249,7 +2261,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       LIMIT 10`,
       [from, to]);
 
-    // Live Item Tracking — ALL currently in_progress tasks (no date filter on status)
+    // ── 5. LIVE ITEM TRACKING (no date filter — always current) ─────────────
     const [liveItemTracking] = await db.query(`
       SELECT
         ta.id, ta.task_title,
@@ -2271,48 +2283,50 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       ORDER BY ta.updated_at ASC
       LIMIT 10`);
 
-    // Stage Flow Summary — task COUNT based (not qty) as per client requirement
-    // "task ki qty chahiye na ki product ki qty" — count tasks not pieces
-    // total_working = tasks in_progress/pending before today (yesterday's closing)
-    // today_in      = new tasks assigned today
-    // today_out     = tasks completed today
-    // closing       = total_working + today_in - today_out
+    // ── 6. STAGE FLOW SUMMARY ────────────────────────────────────────────────
+    // total_working = tasks in_progress/pending BEFORE from date (opening balance)
+    // today_in      = tasks created/assigned in [from, to]
+    // today_out     = tasks completed in [from, to]
+    // pending_count = currently pending tasks
     const [stageFlowSummary] = await db.query(`
       SELECT d.id, d.name, d.color, d.stage_order,
 
-        /* Opening = COUNT of active tasks before today */
+        /* Opening = active tasks BEFORE the from date */
         COALESCE(SUM(
           CASE WHEN ta.status IN ('in_progress','pending')
-            AND DATE(ta.created_at) < CURDATE()
+            AND DATE(ta.created_at) < ?
           THEN 1 ELSE 0 END
-        ), 0)                                                         AS total_working,
+        ), 0) AS total_working,
 
-        /* Today In = COUNT of new tasks created today */
+        /* In = tasks created/assigned in selected range */
         COALESCE(SUM(
-          CASE WHEN DATE(ta.created_at) = CURDATE()
+          CASE WHEN DATE(ta.created_at) BETWEEN ? AND ?
             AND ta.status != 'cancelled'
           THEN 1 ELSE 0 END
-        ), 0)                                                         AS today_in,
+        ), 0) AS today_in,
 
-        /* Today Out = COUNT of tasks completed today */
+        /* Out = tasks completed in selected range */
         COALESCE(SUM(
           CASE WHEN ta.status = 'completed'
-            AND DATE(ta.updated_at) = CURDATE()
+            AND DATE(ta.updated_at) BETWEEN ? AND ?
           THEN 1 ELSE 0 END
-        ), 0)                                                         AS today_out,
+        ), 0) AS today_out,
 
         COALESCE(SUM(CASE WHEN ta.status='pending'     THEN 1 ELSE 0 END),0) AS pending_count,
         COALESCE(SUM(CASE WHEN ta.status='in_progress' THEN 1 ELSE 0 END),0) AS in_progress_count,
-        COALESCE(SUM(CASE WHEN ta.status='completed'   THEN 1 ELSE 0 END),0) AS completed_count
+        COALESCE(SUM(CASE WHEN ta.status='completed'
+          AND DATE(ta.updated_at) BETWEEN ? AND ?
+          THEN 1 ELSE 0 END),0) AS completed_count
       FROM departments d
       LEFT JOIN task_assignments ta ON ta.department_id = d.id
       WHERE d.is_active = 1
       GROUP BY d.id
-      ORDER BY d.stage_order, d.name`);
+      ORDER BY d.stage_order, d.name`,
+      [from, from, to, from, to, from, to]);
 
-    // Outsource Preview — ALL pending/active jobs sorted by urgency
-    // Columns: vendor_name, sent_date (order placed), expected_date, proto_code,
-    //          project_name, days_until_due
+    // ── 7. OUTSOURCE OVERVIEW ────────────────────────────────────────────────
+    // Show outsource jobs whose order_placed date OR expected_date falls in [from,to]
+    // OR jobs that are currently overdue/pending (always visible)
     let outsourcePreview = [];
     try {
       [outsourcePreview] = await db.query(`
@@ -2327,7 +2341,8 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           p.name             AS project_name,
           pi.proto_code,
           pi.item_name,
-          CASE WHEN oj.expected_date IS NOT NULL THEN DATEDIFF(oj.expected_date, CURDATE()) ELSE NULL END AS days_until_due,
+          CASE WHEN oj.expected_date IS NOT NULL
+            THEN DATEDIFF(oj.expected_date, CURDATE()) ELSE NULL END AS days_until_due,
           CASE
             WHEN oj.expected_date < CURDATE()                           THEN 'overdue'
             WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 'next_24h'
@@ -2337,6 +2352,16 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         LEFT JOIN projects p  ON p.id  = oj.project_id
         LEFT JOIN project_items pi ON pi.id = oj.project_item_id
         WHERE oj.status NOT IN ('Received','Cancelled')
+          AND (
+            /* order placed in selected range */
+            (oj.sent_date IS NOT NULL AND DATE(oj.sent_date) BETWEEN ? AND ?)
+            OR
+            /* expected due date falls in selected range */
+            (oj.expected_date IS NOT NULL AND DATE(oj.expected_date) BETWEEN ? AND ?)
+            OR
+            /* overdue jobs — always show regardless of range */
+            (oj.expected_date IS NOT NULL AND oj.expected_date < CURDATE())
+          )
         ORDER BY
           CASE
             WHEN oj.expected_date IS NULL        THEN 3
@@ -2345,17 +2370,16 @@ router.get('/reports/dashboard', auth, async (req, res) => {
             ELSE 2
           END,
           oj.expected_date ASC
-        LIMIT 10`);
+        LIMIT 20`,
+        [from, to, from, to]);
     } catch(e) {
       console.warn('outsourcePreview skipped:', e.message);
     }
 
-    // ── Worker Daily Report ───────────────────────────────────────────────────
-    // Opening = active backlog before today
-    //         = SUM(quantity_assigned - quantity_completed) for in_progress/pending tasks created before today
-    // Today In  = quantity_assigned on tasks created TODAY in this dept
-    // Today Out = worker's personal daily_progress.qty_done TODAY
-    // Closing   = Opening + Today In - Today Out
+    // ── 8. WORKER DAILY REPORT ───────────────────────────────────────────────
+    // Opening = backlog BEFORE from date
+    // Today In  = tasks/qty assigned in [from, to]
+    // Today Out = daily_progress qty_done in [from, to]
     let workerDailyReport = [];
     try {
       [workerDailyReport] = await db.query(`
@@ -2367,28 +2391,28 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           d.color                                                     AS dept_color,
           d.stage_order,
 
-          /* Opening = active backlog before today (in_progress/pending remaining qty) */
+          /* Opening = active backlog BEFORE from date */
           COALESCE(SUM(
             CASE WHEN ta.status IN ('in_progress','pending')
-              AND DATE(ta.created_at) < CURDATE()
+              AND DATE(ta.created_at) < ?
             THEN GREATEST(0, ta.quantity_assigned - COALESCE(ta.quantity_completed,0))
             ELSE 0 END
           ), 0)                                                       AS opening_qty,
 
-          /* Today In = new tasks assigned to this dept TODAY */
+          /* Today In = new tasks assigned in selected range */
           COALESCE(SUM(
-            CASE WHEN DATE(ta.created_at) = CURDATE()
+            CASE WHEN DATE(ta.created_at) BETWEEN ? AND ?
               AND ta.status != 'cancelled'
             THEN ta.quantity_assigned ELSE 0 END
           ), 0)                                                       AS today_in,
 
-          /* Today Out = this worker's personal daily_progress output TODAY */
+          /* Today Out = worker's daily_progress output in selected range */
           COALESCE((
             SELECT SUM(dp2.qty_done)
             FROM daily_progress dp2
             WHERE dp2.worker_id    = u.id
               AND dp2.department_id = d.id
-              AND dp2.work_date    = CURDATE()
+              AND DATE(dp2.work_date) BETWEEN ? AND ?
           ), 0)                                                       AS today_out,
 
           COALESCE(SUM(CASE WHEN ta.status='pending'
@@ -2396,6 +2420,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           COALESCE(SUM(CASE WHEN ta.status='in_progress'
             THEN 1 ELSE 0 END),0)                                    AS active_tasks,
           COALESCE(SUM(CASE WHEN ta.status='completed'
+            AND DATE(ta.updated_at) BETWEEN ? AND ?
             THEN 1 ELSE 0 END),0)                                    AS completed_tasks,
           COUNT(ta.id)                                               AS total_tasks,
           COALESCE(SUM(ta.quantity_assigned),0)                      AS total_qty_assigned,
@@ -2408,12 +2433,16 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           AND ta.status NOT IN ('cancelled')
         WHERE u.role = 'worker' AND u.is_active = 1
         GROUP BY u.id, d.id
-        ORDER BY d.stage_order, u.name`);
+        ORDER BY d.stage_order, u.name`,
+        [from, from, to, from, to, from, to]);
     } catch(e) {
       console.warn('workerDailyReport skipped:', e.message);
     }
 
-    // ── Dispatch Daily Report ─────────────────────────────────────────────────
+    // ── 9. DISPATCH DAILY REPORT ─────────────────────────────────────────────
+    // Opening = packing completed BEFORE from date (not yet dispatched)
+    // In      = packing completed IN [from, to]
+    // Out     = dispatch daily_progress qty_done IN [from, to]
     let dispatchDailyReport = [];
     try {
       [dispatchDailyReport] = await db.query(`
@@ -2421,19 +2450,27 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           p.id                          AS project_id,
           p.name                        AS project_name,
           p.project_id                  AS proj_code,
+
+          /* Opening = packing completed BEFORE from date */
           COALESCE(SUM(CASE
-            WHEN ta.status = 'completed' AND DATE(ta.updated_at) < CURDATE()
+            WHEN ta.status = 'completed'
+              AND DATE(ta.updated_at) < ?
             THEN ta.quantity_completed ELSE 0 END), 0)  AS opening_qty,
+
+          /* In = packing completed in selected range */
           COALESCE(SUM(CASE
-            WHEN ta.status = 'completed' AND DATE(ta.updated_at) = CURDATE()
+            WHEN ta.status = 'completed'
+              AND DATE(ta.updated_at) BETWEEN ? AND ?
             THEN ta.quantity_completed ELSE 0 END), 0)  AS today_in,
+
+          /* Out = dispatch dept daily_progress in selected range */
           COALESCE((
             SELECT SUM(dp.qty_done)
             FROM daily_progress dp
             JOIN departments dd ON dd.id = dp.department_id
             WHERE dp.project_id = p.id
               AND LOWER(dd.name) LIKE '%dispatch%'
-              AND DATE(dp.work_date) = CURDATE()
+              AND DATE(dp.work_date) BETWEEN ? AND ?
           ), 0)                                         AS today_out
         FROM projects p
         JOIN task_assignments ta ON ta.project_id = p.id
@@ -2444,7 +2481,8 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         GROUP BY p.id
         HAVING opening_qty > 0 OR today_in > 0
         ORDER BY today_in DESC, opening_qty DESC
-        LIMIT 30`);
+        LIMIT 30`,
+        [from, from, to, from, to]);
     } catch(e) {
       console.warn('dispatchDailyReport skipped:', e.message);
     }
