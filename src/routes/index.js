@@ -2187,9 +2187,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       FROM projects p
       WHERE p.status NOT IN ('deleted','cancelled')`);
 
-    // ── 3. ITEMS WAITING > 24 HOURS ─────────────────────────────────────────
-    // Items whose task went in_progress WITHIN the selected date range
-    // AND have been waiting > 24 hours with no daily_progress update in that dept
+    // ── 3. ITEMS WAITING > 24 HOURS — no date filter, always current stalled items ──
     const [itemsWaiting24h] = await db.query(`
       SELECT
         ta.id, ta.task_title,
@@ -2213,32 +2211,10 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       LEFT JOIN users dept_u ON dept_u.id = dept_w.first_worker_id
       WHERE ta.status = 'in_progress'
         AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-        AND DATE(ta.updated_at) BETWEEN ? AND ?
         AND p.status NOT IN ('deleted','cancelled','completed')
         AND LOWER(COALESCE(d.name,'')) NOT LIKE '%dispatch%'
-        AND ta.id = (
-          SELECT ta2.id
-          FROM task_assignments ta2
-          JOIN departments d2 ON d2.id = ta2.department_id
-          WHERE ta2.project_item_id = ta.project_item_id
-            AND ta2.status = 'in_progress'
-            AND LOWER(d2.name) NOT LIKE '%dispatch%'
-          ORDER BY COALESCE(ta2.stage_order, d2.stage_order, 99) ASC
-          LIMIT 1
-        )
-        AND (
-          ta.project_item_id IS NULL
-          OR ta.project_item_id NOT IN (
-            SELECT DISTINCT dp.project_item_id
-            FROM daily_progress dp
-            WHERE DATE(dp.work_date) BETWEEN ? AND ?
-              AND dp.project_item_id IS NOT NULL
-              AND dp.department_id = ta.department_id
-          )
-        )
       ORDER BY ta.updated_at ASC
-      LIMIT 50`,
-      [from, to, from, to]);
+      LIMIT 50`);
 
     // ── 4. DEPT WORKLOAD (date-filtered completed) ───────────────────────────
     const [deptWorkload] = await db.query(`
@@ -2324,9 +2300,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       ORDER BY d.stage_order, d.name`,
       [from, from, to, from, to, from, to]);
 
-    // ── 7. OUTSOURCE OVERVIEW ────────────────────────────────────────────────
-    // Show outsource jobs whose order_placed date OR expected_date falls in [from,to]
-    // OR jobs that are currently overdue/pending (always visible)
+    // ── 7. OUTSOURCE OVERVIEW — only pending/overdue, no date filter, limit 10 ──
     let outsourcePreview = [];
     try {
       [outsourcePreview] = await db.query(`
@@ -2351,17 +2325,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         FROM outsource_jobs oj
         LEFT JOIN projects p  ON p.id  = oj.project_id
         LEFT JOIN project_items pi ON pi.id = oj.project_item_id
-        WHERE oj.status NOT IN ('Received','Cancelled')
-          AND (
-            /* order placed in selected range */
-            (oj.sent_date IS NOT NULL AND DATE(oj.sent_date) BETWEEN ? AND ?)
-            OR
-            /* expected due date falls in selected range */
-            (oj.expected_date IS NOT NULL AND DATE(oj.expected_date) BETWEEN ? AND ?)
-            OR
-            /* overdue jobs — always show regardless of range */
-            (oj.expected_date IS NOT NULL AND oj.expected_date < CURDATE())
-          )
+        WHERE oj.status NOT IN ('Received', 'Cancelled')
         ORDER BY
           CASE
             WHEN oj.expected_date IS NULL        THEN 3
@@ -2370,8 +2334,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
             ELSE 2
           END,
           oj.expected_date ASC
-        LIMIT 20`,
-        [from, to, from, to]);
+        LIMIT 10`);
     } catch(e) {
       console.warn('outsourcePreview skipped:', e.message);
     }
