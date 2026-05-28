@@ -2300,7 +2300,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       ORDER BY d.stage_order, d.name`,
       [from, from, to, from, to, from, to]);
 
-    // ── 7. OUTSOURCE OVERVIEW — only pending/overdue, no date filter, limit 10 ──
+    // ── 7. OUTSOURCE OVERVIEW — pending/overdue only, no date filter, LIMIT 10 ──
     let outsourcePreview = [];
     try {
       [outsourcePreview] = await db.query(`
@@ -2318,18 +2318,21 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           CASE WHEN oj.expected_date IS NOT NULL
             THEN DATEDIFF(oj.expected_date, CURDATE()) ELSE NULL END AS days_until_due,
           CASE
-            WHEN oj.expected_date < CURDATE()                           THEN 'overdue'
-            WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 'next_24h'
+            WHEN oj.expected_date IS NOT NULL AND oj.expected_date < CURDATE()
+              THEN 'overdue'
+            WHEN oj.expected_date IS NOT NULL
+              AND oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR)
+              THEN 'next_24h'
             ELSE 'on_time'
           END AS urgency
         FROM outsource_jobs oj
         LEFT JOIN projects p  ON p.id  = oj.project_id
         LEFT JOIN project_items pi ON pi.id = oj.project_item_id
-        WHERE oj.status NOT IN ('Received', 'Cancelled')
+        WHERE oj.status NOT IN ('Received', 'Cancelled', 'received', 'cancelled')
         ORDER BY
           CASE
-            WHEN oj.expected_date IS NULL        THEN 3
-            WHEN oj.expected_date < CURDATE()    THEN 0
+            WHEN oj.expected_date IS NULL                              THEN 3
+            WHEN oj.expected_date < CURDATE()                         THEN 0
             WHEN oj.expected_date <= DATE_ADD(NOW(), INTERVAL 24 HOUR) THEN 1
             ELSE 2
           END,
