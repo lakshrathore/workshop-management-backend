@@ -45,8 +45,24 @@ function adminOnly(req, res, next) {
  */
 router.get('/approvals/count', auth, async (req, res) => {
   try {
-    const counts = await getPendingApprovalCounts();
-    res.json(counts);
+    const db = await getPool();
+    const [rows] = await db.query(
+      "SELECT status, COUNT(*) as count FROM approvals GROUP BY status"
+    );
+    const by_status = {};
+    let total_pending = 0;
+    rows.forEach(r => {
+      by_status[r.status] = r.count;
+      if (r.status === 'PENDING') total_pending = r.count;
+    });
+
+    const [byType] = await db.query(
+      "SELECT type, COUNT(*) as count FROM approvals WHERE status='PENDING' GROUP BY type"
+    );
+    const by_type = {};
+    byType.forEach(r => { by_type[r.type] = r.count; });
+
+    res.json({ total: total_pending, by_status, by_type });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -59,28 +75,97 @@ router.get('/approvals/count', auth, async (req, res) => {
  */
 router.get('/approvals', auth, adminOnly, async (req, res) => {
   try {
-    const filters = {
-      type: req.query.type || null,
-      userId: req.query.userId || null,
-      limit: req.query.limit || 50,
-      offset: req.query.offset || 0
-    };
-
-    const approvals = await getPendingApprovals(filters);
-
-    // Get total count
     const db = await getPool();
+    const { type, status, limit = 100, offset = 0 } = req.query;
+
+    // status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'ALL' (default: PENDING)
+    const statusFilter = (status || 'PENDING').toUpperCase();
+
+    let whereClauses = [];
+    let params = [];
+
+    if (statusFilter === 'ALL') {
+      whereClauses.push("a.status IN ('PENDING','APPROVED','REJECTED','CANCELLED')");
+    } else if (statusFilter === 'HISTORY') {
+      whereClauses.push("a.status IN ('APPROVED','REJECTED')");
+    } else {
+      whereClauses.push('a.status = ?');
+      params.push(statusFilter);
+    }
+
+    if (type) { whereClauses.push('a.type = ?'); params.push(type); }
+
+    const where = whereClauses.length ? 'WHERE ' + whereClauses.join(' AND ') : '';
+
+    const [rows] = await db.query(`
+      SELECT
+        a.id, a.type, a.related_id, a.user_id, a.requested_data,
+        a.status, a.created_at, a.admin_notes,
+        a.approved_at, a.approved_by,
+        a.rejected_reason,
+        u.name        AS user_name,
+        u.username    AS user_username,
+        u.name        AS created_by_name,
+        adm.name      AS approved_by_name
+      FROM approvals a
+      LEFT JOIN users u   ON u.id   = a.user_id
+      LEFT JOIN users adm ON adm.id = a.approved_by
+      ${where}
+      ORDER BY
+        CASE a.status WHEN 'PENDING' THEN 0 ELSE 1 END,
+        a.created_at DESC
+      LIMIT ? OFFSET ?
+    `, [...params, parseInt(limit), parseInt(offset)]);
+
     const [[countResult]] = await db.query(
-      'SELECT COUNT(*) as total FROM approvals WHERE status="PENDING"'
+      `SELECT COUNT(*) as total FROM approvals a ${where}`,
+      params
     );
 
+    // Parse requested_data + enrich with project_name
+    const parsed = rows.map(row => ({
+      ...row,
+      requested_data: row.requested_data
+        ? (typeof row.requested_data === 'string' ? JSON.parse(row.requested_data) : row.requested_data)
+        : {}
+    }));
+
+    const getProjectId = (rd) => {
+      if (!rd) return null;
+      const id = rd.project_id ?? rd.body?.project_id ?? null;
+      return id && !isNaN(id) ? Number(id) : null;
+    };
+
+    const projectIds = [...new Set(parsed.map(r => getProjectId(r.requested_data)).filter(Boolean))];
+    let projectNameMap = {};
+    if (projectIds.length > 0) {
+      const [projRows] = await db.query(
+        `SELECT id, name, project_id AS proj_code FROM projects WHERE id IN (${projectIds.join(',')})`
+      );
+      projRows.forEach(p => { projectNameMap[p.id] = { name: p.name, proj_code: p.proj_code }; });
+    }
+
+    const enriched = parsed.map(row => {
+      const rd  = { ...row.requested_data };
+      const pid = getProjectId(rd);
+      if (pid && projectNameMap[pid]) {
+        const proj  = projectNameMap[pid];
+        const label = `${proj.name} (${proj.proj_code})`;
+        if (rd.body && typeof rd.body === 'object') rd.body = { ...rd.body, project_name: label };
+        else rd.project_name = label;
+      }
+      return { ...row, requested_data: rd };
+    });
+
     res.json({
-      data: approvals,
+      data: enriched,
       total: countResult.total,
-      limit: filters.limit,
-      offset: filters.offset
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+      status_filter: statusFilter
     });
   } catch (err) {
+    console.error('GET /approvals error:', err.message);
     res.status(500).json({ message: err.message });
   }
 });
