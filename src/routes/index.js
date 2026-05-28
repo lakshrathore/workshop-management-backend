@@ -2127,7 +2127,9 @@ router.get('/reports/dashboard', auth, async (req, res) => {
     // ── DATE-FILTERED QUERIES — all use from/to properly ─────────────────────
 
     // ── 1. PROJECT OVERVIEW ──────────────────────────────────────────────────
-    // Shows projects whose deadline falls in range, OR have task activity in range
+    // Shows all active projects that were running during the selected date range:
+    // project started (created_at) <= to  AND  (deadline >= from OR deadline IS NULL)
+    // This ensures today's filter always shows currently active projects
     const [projectOverview] = await db.query(`
       SELECT
         p.id, p.project_id, p.name, p.client_name, p.status, p.deadline,
@@ -2148,26 +2150,16 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         ) AS current_stage
       FROM projects p
       WHERE p.status NOT IN ('deleted','cancelled','completed')
+        AND DATE(p.created_at) <= ?
         AND (
-          /* deadline falls in selected range */
-          (p.deadline IS NOT NULL AND DATE(p.deadline) BETWEEN ? AND ?)
-          OR
-          /* project created in selected range */
-          DATE(p.created_at) BETWEEN ? AND ?
-          OR
-          /* any task was active (created or updated) in selected range */
-          EXISTS (
-            SELECT 1 FROM task_assignments ta
-            WHERE ta.project_id = p.id
-              AND ta.status != 'cancelled'
-              AND (DATE(ta.created_at) BETWEEN ? AND ? OR DATE(ta.updated_at) BETWEEN ? AND ?)
-          )
+          p.deadline IS NULL
+          OR DATE(p.deadline) >= ?
         )
       ORDER BY
         CASE p.status WHEN 'active' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
         p.deadline ASC
-      LIMIT 20`,
-      [from, to, from, to, from, to, from, to]);
+      LIMIT 50`,
+      [to, from]);
 
     // ── 2. PROJECT HEALTH DATA (for internal use / backward compat) ──────────
     const [projectHealthData] = await db.query(`
