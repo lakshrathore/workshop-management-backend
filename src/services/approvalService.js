@@ -122,8 +122,10 @@ async function getPendingApprovals(filters = {}) {
     let query = `
       SELECT 
         a.id, a.type, a.related_id, a.user_id, a.requested_data,
-        a.status, a.created_at, a.admin_notes,
-        u.name as user_name, u.username as user_username
+        a.status, a.created_at, a.admin_notes, a.approved_at,
+        a.approved_by, a.rejected_reason,
+        u.name as user_name, u.username as user_username,
+        u.name as created_by_name
       FROM approvals a
       LEFT JOIN users u ON u.id = a.user_id
       WHERE a.status = 'PENDING'
@@ -140,7 +142,7 @@ async function getPendingApprovals(filters = {}) {
       params.push(filters.userId);
     }
 
-    query += ' ORDER BY a.created_at ASC';
+    query += ' ORDER BY a.created_at DESC';
 
     if (filters.limit) {
       query += ' LIMIT ?';

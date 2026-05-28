@@ -891,9 +891,12 @@ router.get('/projects/:id', auth, async (req, res) => {
   if (!project) return res.status(404).json({ message: 'Not found' });
   const [itemsRaw] = await db.query(`
     SELECT pi.*,
+      u_cb.name as created_by_name,
       (SELECT pii.image_path FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_path,
       (SELECT pii.resource_type FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_type
-    FROM project_items pi WHERE pi.project_id=? ORDER BY pi.id
+    FROM project_items pi
+    LEFT JOIN users u_cb ON u_cb.id = pi.created_by
+    WHERE pi.project_id=? ORDER BY pi.id
   `, [req.params.id]);
   // Apply toHttpsImageUrl on thumbnail_path so full URLs pass through correctly.
   // Expose BOTH `thumbnail_path` (legacy — ProjectDetailPage) AND `thumbnail_url`
