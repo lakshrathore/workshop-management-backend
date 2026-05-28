@@ -2206,7 +2206,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
         AND p.status NOT IN ('deleted','cancelled','completed')
         AND LOWER(COALESCE(d.name,'')) NOT LIKE '%dispatch%'
       ORDER BY ta.updated_at ASC
-      LIMIT 50`);
+      LIMIT 10`);
 
     // ── 4. DEPT WORKLOAD (date-filtered completed) ───────────────────────────
     const [deptWorkload] = await db.query(`
