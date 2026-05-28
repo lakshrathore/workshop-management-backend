@@ -102,7 +102,7 @@ router.get('/approvals', auth, adminOnly, async (req, res) => {
         a.id, a.type, a.related_id, a.user_id, a.requested_data,
         a.status, a.created_at, a.admin_notes,
         a.approved_at, a.approved_by,
-        a.rejected_reason,
+        a.rejected_at, a.rejected_reason,
         u.name        AS user_name,
         u.username    AS user_username,
         u.name        AS created_by_name,
