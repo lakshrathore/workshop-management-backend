@@ -1028,10 +1028,33 @@ router.put('/auth/change-password', auth, async (req, res) => {
 // ── PROJECT ITEMS ─────────────────────────────────────────────────────────────
 router.post('/projects/:id/items', auth, adminOrPermission('projects','write'), requireApprovalForAction('ITEM'), async (req, res) => {
   const db = await getPool();
-  const { item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes } = req.body;
-  const [r] = await db.query('INSERT INTO project_items (project_id,item_name,proto_code,description,quantity,unit,material,dimensions,unit_price,notes) VALUES (?,?,?,?,?,?,?,?,?,?)',
-    [req.params.id, item_name, proto_code, description, quantity || 1, unit || 'pcs', material, dimensions, unit_price || 0, notes]);
-  res.json({ id: r.insertId });
+  const { item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes, image_urls } = req.body;
+  const [r] = await db.query(
+    'INSERT INTO project_items (project_id,item_name,proto_code,description,quantity,unit,material,dimensions,unit_price,notes,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    [req.params.id, item_name, proto_code, description, quantity || 1, unit || 'pcs', material, dimensions, unit_price || 0, notes, req.user?.id || null]
+  );
+  const itemId = r.insertId;
+
+  // ✅ FIX: image_urls (temp-upload se aaye) project_item_images table mein save karo
+  if (Array.isArray(image_urls) && image_urls.length > 0) {
+    for (const imgObj of image_urls) {
+      let imgPath = (typeof imgObj === 'string') ? imgObj : (imgObj.url || imgObj.image_path || '');
+      if (!imgPath) continue;
+      // http → https fix (Cloudinary/CDN URLs ke liye)
+      if (imgPath.startsWith('http://')) imgPath = imgPath.replace('http://', 'https://');
+      const resType = (typeof imgObj === 'object' && imgObj.resource_type) ? imgObj.resource_type : 'image';
+      try {
+        await db.query(
+          'INSERT INTO project_item_images (project_item_id, project_id, image_path, resource_type, uploaded_by) VALUES (?,?,?,?,?)',
+          [itemId, req.params.id, imgPath, resType, req.user?.id || null]
+        );
+      } catch (e) {
+        console.warn('[items] image attach failed:', e.message);
+      }
+    }
+  }
+
+  res.json({ id: itemId });
 });
 router.put('/projects/:projectId/items/:id', auth, adminOrPermission('projects','edit'), async (req, res) => {
   const db = await getPool();

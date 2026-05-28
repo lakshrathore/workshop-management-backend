@@ -441,6 +441,8 @@ async function initializeDatabase() {
   // Link sale_challans back to a client purchase order (for fulfillment tracking)
   await safeAlter("ALTER TABLE sale_challans ADD COLUMN cpo_id INT DEFAULT NULL");
 
+  // ── FIX: project_items mein created_by column add karo (GET /projects/:id JOIN ke liye) ──
+  await safeAlter('ALTER TABLE project_items ADD COLUMN created_by INT DEFAULT NULL');
 
   // Packing Boxes table — manual + auto box management
   await db.query(`CREATE TABLE IF NOT EXISTS packing_boxes (
