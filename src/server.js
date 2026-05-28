@@ -105,7 +105,7 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign(
       { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, 
       JWT_SECRET, 
-      { expiresIn: '30m' }
+      { expiresIn: '8h' }
     );
     
     let depts = [];
@@ -215,7 +215,7 @@ app.use((err, req, res, next) => {
 app.get('/health', (req, res) => res.json({ status: 'OK' }));
 
 // Frontend is deployed on Vercel, not here
-app.get('*', (req, res) => {
+app.get('*path', (req, res) => {
   res.status(404).json({ message: 'API endpoint not found. Frontend is at https://workshop-management-frontend-885d.vercel.app' });
 });
 

@@ -205,8 +205,8 @@ router.post('/temp-upload/images', auth, tempUpload.array('images', 10), async (
   }
 });
 
-router.get('/uploads/*', (req, res) => {
-  let path = req.params[0]; // Captures everything after /uploads/
+router.get('/uploads/*path', (req, res) => {
+  let path = req.params['path'] || req.params[0]; // Captures everything after /uploads/
   if (!path) {
     return res.status(400).json({ message: 'No image path provided' });
   }
@@ -234,8 +234,8 @@ router.get('/uploads/*', (req, res) => {
 });
 
 // Serve department gallery files — redirect to Cloudinary CDN
-router.get('/gallery/*', (req, res) => {
-  const publicId = req.params[0]; // Captures everything after /gallery/
+router.get('/gallery/*path', (req, res) => {
+  const publicId = req.params['path'] || req.params[0]; // Captures everything after /gallery/
   if (!publicId) {
     return res.status(400).json({ message: 'No image path provided' });
   }
@@ -291,7 +291,7 @@ router.post('/auth/login', async (req, res) => {
     console.log('Login logged for:', user.name, user.role);
   } catch (e) { console.error('Audit insert error:', e.message); }
 
-  const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '30m' });
+  const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '8h' });
   res.json({ token, user: { id: user.id, name: user.name, username: user.username, role: user.role } });
 });
 
