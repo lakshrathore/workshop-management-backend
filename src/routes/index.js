@@ -2157,7 +2157,7 @@ router.post('/tasks/:id/manual-time', auth, async (req, res) => {
 //   Closing = Opening + In - Out  (computed on the frontend).
 // A fully-dispatched (or long-closed) project naturally falls off because its
 // Opening nets to 0 and it has no activity in the period.
-// Params order: [from, to, from, from, from, to]. Pass limitClause '' for "all".
+// Params order: [from, to, from, from, to]. Pass limitClause '' for "all".
 // ── DISPATCH PENDING REPORT (single source of truth) ────────────────────────
 // Workflow: Packing Approval → Stage Tracker → Dispatch Pending → Dispatch Done.
 //
@@ -2183,7 +2183,7 @@ router.post('/tasks/:id/manual-time', auth, async (req, res) => {
 // (remaining pending dispatch qty) is > 0, so 100%-dispatched projects fall off
 // automatically and nothing that isn't currently pending in Dispatch is shown.
 //
-// Param order (unchanged — both callers pass [from, to, from, from, from, to]):
+// Param order (unchanged — both callers pass [from, to, from, from, to]):
 //   1:from 2:to   → In window
 //   3:from        → Opening cut-off
 //   4:from        → dispatched-before-`from`
@@ -2194,35 +2194,45 @@ function dispatchSummarySql(limitClause = 'LIMIT 10') {
       t.project_id,
       t.project_name,
       t.proj_code,
-      /* items that are part of the current pending picture */
-      SUM(CASE WHEN (t.opening_qty + t.today_in) > 0 THEN 1 ELSE 0 END) AS item_count,
+      /* items still pending in dispatch (assigned − completed > 0) */
+      SUM(CASE WHEN (t.qty_to_dispatch - t.qty_dispatched) > 0 THEN 1 ELSE 0 END) AS item_count,
       MAX(t.ready_at)    AS last_done_at,
       SUM(t.opening_qty) AS opening_qty,
       SUM(t.today_in)    AS today_in,
       SUM(t.today_out)   AS today_out,
-      /* Closing computed at project level, exactly like the UI: max(0, O + In − Out) */
-      GREATEST(0, SUM(t.opening_qty) + SUM(t.today_in) - SUM(t.today_out)) AS closing_qty
+      /* Closing = true remaining pending dispatch qty = SUM(assigned − completed).
+         Reads the SAME number the Stage Tracker shows, so the report reconciles. */
+      SUM(GREATEST(0, t.qty_to_dispatch - t.qty_dispatched)) AS closing_qty
     FROM (
       SELECT
         p.id          AS project_id,
         p.name        AS project_name,
         p.project_id  AS proj_code,
-        disp.reached_at AS ready_at,
-        /* In: item reached dispatch within the period → the qty it brought to dispatch */
+        disp.reached_at      AS ready_at,
+        disp.qty_to_dispatch AS qty_to_dispatch,
+        disp.qty_dispatched  AS qty_dispatched,
+        /* Out: dispatch work in the period, capped at the REAL dispatched total so a
+           mis-dated / duplicated daily_progress row can never inflate the movement. */
+        LEAST(COALESCE(dir.qty, 0), disp.qty_dispatched)                   AS today_out,
+        /* In: item reached dispatch within the period → qty it brought to dispatch */
         CASE WHEN DATE(disp.reached_at) BETWEEN ? AND ?
              THEN disp.qty_to_dispatch ELSE 0 END                          AS today_in,
-        /* Opening: reached dispatch before the period, net of qty already dispatched */
+        /* Opening: pending at start of day = assigned − dispatched-before-from.
+           dispatched-before-from = total_dispatched − dispatched-in-period, taken
+           from quantity_completed (authoritative) NOT from daily_progress — so it
+           reconciles with the Stage Tracker even if daily_progress is missing or
+           the work was completed via challan / a direct status change. */
         CASE WHEN disp.reached_at < ?
-             THEN GREATEST(0, disp.qty_to_dispatch - COALESCE(dbf.qty, 0))
-             ELSE 0 END                                                    AS opening_qty,
-        /* Out: dispatch work logged in the period (same source as Worker Daily Report) */
-        COALESCE(dir.qty, 0)                                               AS today_out
+             THEN GREATEST(0, disp.qty_to_dispatch
+                  - (disp.qty_dispatched - LEAST(COALESCE(dir.qty,0), disp.qty_dispatched)))
+             ELSE 0 END                                                    AS opening_qty
       FROM (
         /* one row per item that has REACHED dispatch (all non-dispatch stages done) */
         SELECT
           dt.project_item_id,
           dt.project_id,
-          MAX(dt.quantity_assigned) AS qty_to_dispatch,
+          MAX(dt.quantity_assigned)  AS qty_to_dispatch,
+          MAX(dt.quantity_completed) AS qty_dispatched,
           /* reached dispatch = when its last non-dispatch stage was approved;
              fall back to the dispatch task's own start when dispatch is stage 1 */
           COALESCE(
@@ -2246,15 +2256,8 @@ function dispatchSummarySql(limitClause = 'LIMIT 10') {
         GROUP BY dt.project_item_id, dt.project_id
       ) disp
       JOIN projects p ON p.id = disp.project_id
-      /* dbf = qty already dispatched BEFORE the from-date */
-      LEFT JOIN (
-        SELECT dp.project_item_id, SUM(dp.qty_done) AS qty
-        FROM daily_progress dp
-        JOIN departments dd ON dd.id = dp.department_id
-        WHERE LOWER(dd.name) LIKE '%dispatch%' AND DATE(dp.work_date) < ?
-        GROUP BY dp.project_item_id
-      ) dbf ON dbf.project_item_id = disp.project_item_id
-      /* dir = qty dispatched WITHIN the period */
+      /* dir = qty dispatched WITHIN the period — used ONLY for the In/Out movement
+         split, never for the pending total (that comes from quantity_completed). */
       LEFT JOIN (
         SELECT dp.project_item_id, SUM(dp.qty_done) AS qty
         FROM daily_progress dp
@@ -2265,8 +2268,10 @@ function dispatchSummarySql(limitClause = 'LIMIT 10') {
       WHERE p.status NOT IN ('deleted','cancelled')
     ) t
     GROUP BY t.project_id, t.project_name, t.proj_code
-    /* Rule 6: only projects still PENDING in dispatch (remaining qty > 0) */
-    HAVING GREATEST(0, SUM(t.opening_qty) + SUM(t.today_in) - SUM(t.today_out)) > 0
+    /* Rule 6: only projects still PENDING in dispatch (assigned − completed > 0).
+       A fully-dispatched project now drops off even if it was completed via challan
+       or a direct status change that never wrote a daily_progress row. */
+    HAVING SUM(GREATEST(0, t.qty_to_dispatch - t.qty_dispatched)) > 0
     ORDER BY last_done_at DESC
     ${limitClause}`;
 }
@@ -2656,7 +2661,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
     try {
       const [allDispatch] = await db.query(
         dispatchSummarySql(''),
-        [from, to, from, from, from, to]);
+        [from, to, from, from, to]);
       extraStats.dispatch_pending_qty = allDispatch.reduce(
         (sum, r) => sum + (Number(r.closing_qty) || 0), 0);
       dispatchDailyReport = allDispatch.slice(0, 10);
@@ -2835,7 +2840,7 @@ router.get('/reports/dashboard/dispatch-report', auth, async (req, res) => {
     const to   = req.query.to   || todayDefault;
     const [rows] = await db.query(
       dispatchSummarySql(''),
-      [from, to, from, from, from, to]);
+      [from, to, from, from, to]);
     res.json(rows);
   } catch(err) {
     res.status(500).json({ message: err.message });
