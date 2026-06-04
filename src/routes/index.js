@@ -2205,33 +2205,75 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       FROM projects p
       WHERE p.status NOT IN ('deleted','cancelled')`);
 
-    // ── 3. ITEMS WAITING > 24 HOURS — no date filter, always current stalled items ──
+    // ── 3. ITEMS STALLED > 24 HOURS — item-centric, driven by REAL work logs ──
+    // Logic: for every item still in production (has a pending/in_progress
+    // non-dispatch stage), find the LAST actual work timestamp from
+    // daily_progress. If that last work (or first assignment, when nothing has
+    // ever been logged) is older than 24h → the item is stalled. We surface
+    // WHEN work last happened and on WHICH stage, plus the stage it is now
+    // waiting at. This covers both cases the floor cares about:
+    //   (a) a previous stage finished, item moved on, but the next stage has
+    //       logged no work in 24h, and
+    //   (b) no work at all on the item in the last 24h.
     const [itemsWaiting24h] = await db.query(`
       SELECT
-        ta.id, ta.task_title,
-        pi.proto_code AS item_code, pi.item_name,
-        p.name AS project_name, p.id AS project_db_id,
-        d.name AS current_stage,
-        COALESCE(u.name, dept_u.name) AS worker_name,
-        ta.updated_at AS pending_since,
-        TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
-      FROM task_assignments ta
-      LEFT JOIN project_items pi ON pi.id = ta.project_item_id
-      JOIN projects p ON p.id = ta.project_id
-      LEFT JOIN departments d ON d.id = ta.department_id
-      LEFT JOIN users u ON u.id = ta.worker_id
+        pi.id,
+        pi.proto_code  AS item_code,
+        pi.item_name,
+        pi.item_name   AS task_title,
+        p.name         AS project_name,
+        p.id           AS project_db_id,
+        /* stage the item is currently waiting at (lowest open non-dispatch stage) */
+        (SELECT d2.name FROM task_assignments ta2
+           JOIN departments d2 ON d2.id = ta2.department_id
+          WHERE ta2.project_item_id = pi.id
+            AND ta2.status IN ('pending','in_progress')
+            AND LOWER(d2.name) NOT LIKE '%dispatch%'
+          ORDER BY COALESCE(ta2.stage_order, d2.stage_order, 99) ASC LIMIT 1) AS current_stage,
+        /* worker on that current stage (assigned worker, else dept's first worker) */
+        (SELECT COALESCE(u3.name, du3.name) FROM task_assignments ta3
+           JOIN departments d3 ON d3.id = ta3.department_id
+           LEFT JOIN users u3 ON u3.id = ta3.worker_id
+           LEFT JOIN (
+             SELECT wd.department_id, MIN(uu.id) AS fid
+             FROM worker_departments wd JOIN users uu ON uu.id = wd.worker_id AND uu.is_active = 1
+             GROUP BY wd.department_id
+           ) dw ON dw.department_id = ta3.department_id
+           LEFT JOIN users du3 ON du3.id = dw.fid
+          WHERE ta3.project_item_id = pi.id
+            AND ta3.status IN ('pending','in_progress')
+            AND LOWER(d3.name) NOT LIKE '%dispatch%'
+          ORDER BY COALESCE(ta3.stage_order, d3.stage_order, 99) ASC LIMIT 1) AS worker_name,
+        lw.last_work_at  AS pending_since,
+        lw.last_stage    AS last_work_stage,
+        TIMESTAMPDIFF(HOUR, COALESCE(lw.last_work_at, ft.first_created), NOW()) AS hours_pending
+      FROM project_items pi
+      JOIN projects p ON p.id = pi.project_id
+      /* most recent real work log for this item */
       LEFT JOIN (
-        SELECT wd.department_id, MIN(u2.id) AS first_worker_id
-        FROM worker_departments wd
-        JOIN users u2 ON u2.id = wd.worker_id AND u2.is_active = 1
-        GROUP BY wd.department_id
-      ) AS dept_w ON dept_w.department_id = ta.department_id
-      LEFT JOIN users dept_u ON dept_u.id = dept_w.first_worker_id
-      WHERE ta.status = 'in_progress'
-        AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-        AND p.status NOT IN ('deleted','cancelled','completed')
-        AND LOWER(COALESCE(d.name,'')) NOT LIKE '%dispatch%'
-      ORDER BY ta.updated_at ASC
+        SELECT x.project_item_id, x.created_at AS last_work_at, dd.name AS last_stage
+        FROM daily_progress x
+        JOIN (
+          SELECT project_item_id, MAX(created_at) AS mc
+          FROM daily_progress GROUP BY project_item_id
+        ) mx ON mx.project_item_id = x.project_item_id AND mx.mc = x.created_at
+        LEFT JOIN departments dd ON dd.id = x.department_id
+      ) lw ON lw.project_item_id = pi.id
+      /* earliest assignment — fallback when no work has ever been logged */
+      LEFT JOIN (
+        SELECT project_item_id, MIN(created_at) AS first_created
+        FROM task_assignments GROUP BY project_item_id
+      ) ft ON ft.project_item_id = pi.id
+      WHERE p.status NOT IN ('deleted','cancelled','completed')
+        AND EXISTS (
+          SELECT 1 FROM task_assignments tae
+            JOIN departments de ON de.id = tae.department_id
+           WHERE tae.project_item_id = pi.id
+             AND tae.status IN ('pending','in_progress')
+             AND LOWER(de.name) NOT LIKE '%dispatch%'
+        )
+        AND COALESCE(lw.last_work_at, ft.first_created) < DATE_SUB(NOW(), INTERVAL 24 HOUR)
+      ORDER BY COALESCE(lw.last_work_at, ft.first_created) ASC
       LIMIT 10`);
 
     // ── 4. DEPT WORKLOAD (date-filtered completed) ───────────────────────────
@@ -2424,48 +2466,73 @@ router.get('/reports/dashboard', auth, async (req, res) => {
     }
 
     // ── 9. DISPATCH DAILY REPORT ─────────────────────────────────────────────
-    // Opening = packing completed BEFORE from date (not yet dispatched)
-    // In      = packing completed IN [from, to]
-    // Out     = dispatch daily_progress qty_done IN [from, to]
+    // Item-level. An item becomes "ready for dispatch" the moment it has
+    // completed the stage BEFORE dispatch — i.e. every non-dispatch stage of
+    // that item is completed. We don't hardcode "packing": the pre-dispatch
+    // stage is whatever sits last in that item's chain.
+    //   In      = item finished its last pre-dispatch stage IN [from, to]
+    //   Opening = finished BEFORE the from-date (still awaiting dispatch)
+    //   Out     = dispatch dept work logged for the item IN [from, to]
+    // We also surface the last stage name + the date/time it completed.
     let dispatchDailyReport = [];
     try {
       [dispatchDailyReport] = await db.query(`
         SELECT
-          p.id                          AS project_id,
-          p.name                        AS project_name,
-          p.project_id                  AS proj_code,
+          pi.id            AS item_id,
+          pi.item_name,
+          pi.proto_code    AS item_code,
+          p.id             AS project_id,
+          p.name           AS project_name,
+          p.project_id     AS proj_code,
+          ls.last_stage,
+          ls.done_at       AS last_done_at,
+          ls.done_qty,
 
-          /* Opening = packing completed BEFORE from date */
-          COALESCE(SUM(CASE
-            WHEN ta.status = 'completed'
-              AND DATE(ta.updated_at) < ?
-            THEN ta.quantity_completed ELSE 0 END), 0)  AS opening_qty,
-
-          /* In = packing completed in selected range */
-          COALESCE(SUM(CASE
-            WHEN ta.status = 'completed'
-              AND DATE(ta.updated_at) BETWEEN ? AND ?
-            THEN ta.quantity_completed ELSE 0 END), 0)  AS today_in,
-
-          /* Out = dispatch dept daily_progress in selected range */
+          /* Opening = last pre-dispatch stage finished BEFORE from-date */
+          CASE WHEN DATE(ls.done_at) < ?              THEN ls.done_qty ELSE 0 END AS opening_qty,
+          /* In = last pre-dispatch stage finished within range */
+          CASE WHEN DATE(ls.done_at) BETWEEN ? AND ?  THEN ls.done_qty ELSE 0 END AS today_in,
+          /* Out = dispatch dept work for this item within range */
           COALESCE((
             SELECT SUM(dp.qty_done)
             FROM daily_progress dp
             JOIN departments dd ON dd.id = dp.department_id
-            WHERE dp.project_id = p.id
+            WHERE dp.project_item_id = pi.id
               AND LOWER(dd.name) LIKE '%dispatch%'
               AND DATE(dp.work_date) BETWEEN ? AND ?
-          ), 0)                                         AS today_out
-        FROM projects p
-        JOIN task_assignments ta ON ta.project_id = p.id
-        JOIN departments d_pack
-          ON d_pack.id = ta.department_id
-          AND LOWER(d_pack.name) LIKE '%pack%'
+          ), 0)                                       AS today_out
+        FROM project_items pi
+        JOIN projects p ON p.id = pi.project_id
+        /* last completed non-dispatch stage per item: name, time, qty */
+        JOIN (
+          SELECT tx.project_item_id,
+            SUBSTRING_INDEX(
+              GROUP_CONCAT(dx.name ORDER BY COALESCE(tx.stage_order, dx.stage_order, 0) DESC), ',', 1
+            )                              AS last_stage,
+            MAX(tx.updated_at)             AS done_at,
+            MAX(tx.quantity_completed)     AS done_qty
+          FROM task_assignments tx
+          JOIN departments dx ON dx.id = tx.department_id
+          WHERE tx.status = 'completed'
+            AND LOWER(dx.name) NOT LIKE '%dispatch%'
+          GROUP BY tx.project_item_id
+        ) ls ON ls.project_item_id = pi.id
         WHERE p.status NOT IN ('deleted','cancelled')
-        GROUP BY p.id
-        HAVING opening_qty > 0 OR today_in > 0
-        ORDER BY today_in DESC, opening_qty DESC
-        LIMIT 30`,
+          /* item has at least one non-dispatch stage ... */
+          AND EXISTS (
+            SELECT 1 FROM task_assignments te JOIN departments de ON de.id = te.department_id
+             WHERE te.project_item_id = pi.id AND LOWER(de.name) NOT LIKE '%dispatch%'
+          )
+          /* ... and NONE of them are still unfinished (= pre-dispatch fully done) */
+          AND NOT EXISTS (
+            SELECT 1 FROM task_assignments tn JOIN departments dn ON dn.id = tn.department_id
+             WHERE tn.project_item_id = pi.id
+               AND LOWER(dn.name) NOT LIKE '%dispatch%'
+               AND tn.status <> 'completed'
+          )
+        HAVING opening_qty > 0 OR today_in > 0 OR today_out > 0
+        ORDER BY ls.done_at DESC
+        LIMIT 50`,
         [from, from, to, from, to]);
     } catch(e) {
       console.warn('dispatchDailyReport skipped:', e.message);
@@ -2574,47 +2641,59 @@ router.get('/reports/dashboard/items-waiting', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
       SELECT
-        ta.id, ta.task_title,
-        pi.proto_code AS item_code, pi.item_name,
-        p.name AS project_name, p.id AS project_db_id,
-        d.name AS current_stage,
-        COALESCE(u.name, dept_u.name) AS worker_name,
-        ta.updated_at AS pending_since,
-        TIMESTAMPDIFF(HOUR, ta.updated_at, NOW()) AS hours_pending
-      FROM task_assignments ta
-      LEFT JOIN project_items pi ON pi.id=ta.project_item_id
-      JOIN projects p ON p.id=ta.project_id
-      LEFT JOIN departments d ON d.id=ta.department_id
-      LEFT JOIN users u ON u.id=ta.worker_id
-      LEFT JOIN (
-        SELECT wd.department_id, MIN(u2.id) AS first_worker_id
-        FROM worker_departments wd
-        JOIN users u2 ON u2.id=wd.worker_id AND u2.is_active=1
-        GROUP BY wd.department_id
-      ) AS dept_w ON dept_w.department_id=ta.department_id
-      LEFT JOIN users dept_u ON dept_u.id=dept_w.first_worker_id
-      WHERE ta.status='in_progress'
-        AND ta.updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-        AND p.status NOT IN ('deleted','cancelled','completed')
-        AND LOWER(COALESCE(d.name,'')) NOT LIKE '%dispatch%'
-        AND ta.id = (
-          SELECT ta2.id FROM task_assignments ta2
-          JOIN departments d2 ON d2.id=ta2.department_id
-          WHERE ta2.project_item_id=ta.project_item_id
-            AND ta2.status='in_progress'
+        pi.id,
+        pi.proto_code  AS item_code,
+        pi.item_name,
+        pi.item_name   AS task_title,
+        p.name         AS project_name,
+        p.id           AS project_db_id,
+        (SELECT d2.name FROM task_assignments ta2
+           JOIN departments d2 ON d2.id = ta2.department_id
+          WHERE ta2.project_item_id = pi.id
+            AND ta2.status IN ('pending','in_progress')
             AND LOWER(d2.name) NOT LIKE '%dispatch%'
-          ORDER BY COALESCE(ta2.stage_order,d2.stage_order,99) ASC LIMIT 1
+          ORDER BY COALESCE(ta2.stage_order, d2.stage_order, 99) ASC LIMIT 1) AS current_stage,
+        (SELECT COALESCE(u3.name, du3.name) FROM task_assignments ta3
+           JOIN departments d3 ON d3.id = ta3.department_id
+           LEFT JOIN users u3 ON u3.id = ta3.worker_id
+           LEFT JOIN (
+             SELECT wd.department_id, MIN(uu.id) AS fid
+             FROM worker_departments wd JOIN users uu ON uu.id = wd.worker_id AND uu.is_active = 1
+             GROUP BY wd.department_id
+           ) dw ON dw.department_id = ta3.department_id
+           LEFT JOIN users du3 ON du3.id = dw.fid
+          WHERE ta3.project_item_id = pi.id
+            AND ta3.status IN ('pending','in_progress')
+            AND LOWER(d3.name) NOT LIKE '%dispatch%'
+          ORDER BY COALESCE(ta3.stage_order, d3.stage_order, 99) ASC LIMIT 1) AS worker_name,
+        lw.last_work_at  AS pending_since,
+        lw.last_stage    AS last_work_stage,
+        TIMESTAMPDIFF(HOUR, COALESCE(lw.last_work_at, ft.first_created), NOW()) AS hours_pending
+      FROM project_items pi
+      JOIN projects p ON p.id = pi.project_id
+      LEFT JOIN (
+        SELECT x.project_item_id, x.created_at AS last_work_at, dd.name AS last_stage
+        FROM daily_progress x
+        JOIN (
+          SELECT project_item_id, MAX(created_at) AS mc
+          FROM daily_progress GROUP BY project_item_id
+        ) mx ON mx.project_item_id = x.project_item_id AND mx.mc = x.created_at
+        LEFT JOIN departments dd ON dd.id = x.department_id
+      ) lw ON lw.project_item_id = pi.id
+      LEFT JOIN (
+        SELECT project_item_id, MIN(created_at) AS first_created
+        FROM task_assignments GROUP BY project_item_id
+      ) ft ON ft.project_item_id = pi.id
+      WHERE p.status NOT IN ('deleted','cancelled','completed')
+        AND EXISTS (
+          SELECT 1 FROM task_assignments tae
+            JOIN departments de ON de.id = tae.department_id
+           WHERE tae.project_item_id = pi.id
+             AND tae.status IN ('pending','in_progress')
+             AND LOWER(de.name) NOT LIKE '%dispatch%'
         )
-        AND (
-          ta.project_item_id IS NULL
-          OR ta.project_item_id NOT IN (
-            SELECT DISTINCT dp.project_item_id FROM daily_progress dp
-            WHERE DATE(dp.work_date)=CURDATE()
-              AND dp.project_item_id IS NOT NULL
-              AND dp.department_id=ta.department_id
-          )
-        )
-      ORDER BY ta.updated_at ASC`);
+        AND COALESCE(lw.last_work_at, ft.first_created) < DATE_SUB(NOW(), INTERVAL 24 HOUR)
+      ORDER BY COALESCE(lw.last_work_at, ft.first_created) ASC`);
     res.json(rows);
   } catch(err) {
     res.status(500).json({ message: err.message });
@@ -3771,6 +3850,13 @@ router.get('/packing/boxes', auth, async (req, res) => {
       SELECT pb.*, pb.sub_label, u.name as created_by_name,
         p.name as project_name, p.project_id as proj_code, p.client_name,
         pi.item_name,
+        pi.proto_code  AS item_proto_code,
+        pi.description AS item_description,
+        pi.quantity    AS item_quantity,
+        pi.unit        AS item_unit,
+        (SELECT pii.image_path FROM project_item_images pii
+           WHERE pii.project_item_id = pb.project_item_id
+           ORDER BY pii.created_at ASC LIMIT 1) AS item_image,
         (SELECT COUNT(*) FROM packing_box_photos pbp WHERE pbp.box_id = pb.id) as photo_count
       FROM packing_boxes pb
       LEFT JOIN users u ON u.id = pb.created_by
