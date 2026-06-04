@@ -2157,7 +2157,9 @@ function dispatchSummarySql(limitClause = 'LIMIT 10') {
         )
     ) t
     GROUP BY t.project_id, t.project_name, t.proj_code
-    HAVING opening_qty > 0 OR today_in > 0 OR today_out > 0
+    /* Show only projects that still have something pending in dispatch.
+       Fully-dispatched projects (closing = opening + in - out = 0) drop off. */
+    HAVING (opening_qty + today_in - today_out) > 0
     ORDER BY last_done_at DESC
     ${limitClause}`;
 }
