@@ -2532,7 +2532,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
           )
         HAVING opening_qty > 0 OR today_in > 0 OR today_out > 0
         ORDER BY ls.done_at DESC
-        LIMIT 50`,
+        LIMIT 10`,
         [from, from, to, from, to]);
     } catch(e) {
       console.warn('dispatchDailyReport skipped:', e.message);
@@ -2694,6 +2694,69 @@ router.get('/reports/dashboard/items-waiting', auth, async (req, res) => {
         )
         AND COALESCE(lw.last_work_at, ft.first_created) < DATE_SUB(NOW(), INTERVAL 24 HOUR)
       ORDER BY COALESCE(lw.last_work_at, ft.first_created) ASC`);
+    res.json(rows);
+  } catch(err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── Dashboard: Full Dispatch Daily Report (all items, date-filtered) ─────────
+router.get('/reports/dashboard/dispatch-report', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const todayDefault = new Date().toISOString().split('T')[0];
+    const from = req.query.from || todayDefault;
+    const to   = req.query.to   || todayDefault;
+    const [rows] = await db.query(`
+      SELECT
+        pi.id            AS item_id,
+        pi.item_name,
+        pi.proto_code    AS item_code,
+        p.id             AS project_id,
+        p.name           AS project_name,
+        p.project_id     AS proj_code,
+        ls.last_stage,
+        ls.done_at       AS last_done_at,
+        ls.done_qty,
+        CASE WHEN DATE(ls.done_at) < ?              THEN ls.done_qty ELSE 0 END AS opening_qty,
+        CASE WHEN DATE(ls.done_at) BETWEEN ? AND ?  THEN ls.done_qty ELSE 0 END AS today_in,
+        COALESCE((
+          SELECT SUM(dp.qty_done)
+          FROM daily_progress dp
+          JOIN departments dd ON dd.id = dp.department_id
+          WHERE dp.project_item_id = pi.id
+            AND LOWER(dd.name) LIKE '%dispatch%'
+            AND DATE(dp.work_date) BETWEEN ? AND ?
+        ), 0)                                       AS today_out
+      FROM project_items pi
+      JOIN projects p ON p.id = pi.project_id
+      JOIN (
+        SELECT tx.project_item_id,
+          SUBSTRING_INDEX(
+            GROUP_CONCAT(dx.name ORDER BY COALESCE(tx.stage_order, dx.stage_order, 0) DESC), ',', 1
+          )                              AS last_stage,
+          MAX(tx.updated_at)             AS done_at,
+          MAX(tx.quantity_completed)     AS done_qty
+        FROM task_assignments tx
+        JOIN departments dx ON dx.id = tx.department_id
+        WHERE tx.status = 'completed'
+          AND LOWER(dx.name) NOT LIKE '%dispatch%'
+        GROUP BY tx.project_item_id
+      ) ls ON ls.project_item_id = pi.id
+      WHERE p.status NOT IN ('deleted','cancelled')
+        AND EXISTS (
+          SELECT 1 FROM task_assignments te JOIN departments de ON de.id = te.department_id
+           WHERE te.project_item_id = pi.id AND LOWER(de.name) NOT LIKE '%dispatch%'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM task_assignments tn JOIN departments dn ON dn.id = tn.department_id
+           WHERE tn.project_item_id = pi.id
+             AND LOWER(dn.name) NOT LIKE '%dispatch%'
+             AND tn.status <> 'completed'
+        )
+      HAVING opening_qty > 0 OR today_in > 0 OR today_out > 0
+      ORDER BY ls.done_at DESC`,
+      [from, from, to, from, to]);
     res.json(rows);
   } catch(err) {
     res.status(500).json({ message: err.message });
