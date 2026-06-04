@@ -2158,40 +2158,94 @@ router.post('/tasks/:id/manual-time', auth, async (req, res) => {
 // A fully-dispatched (or long-closed) project naturally falls off because its
 // Opening nets to 0 and it has no activity in the period.
 // Params order: [from, to, from, from, from, to]. Pass limitClause '' for "all".
+// ── DISPATCH PENDING REPORT (single source of truth) ────────────────────────
+// Workflow: Packing Approval → Stage Tracker → Dispatch Pending → Dispatch Done.
+//
+// An item is "pending in dispatch" only when it has a DISPATCH task_assignment
+// AND every non-dispatch stage of that item is completed (= it has reached the
+// Dispatch Department). All quantities are driven by that dispatch task — the
+// same record the Stage Tracker / worker UI write to:
+//   qty_to_dispatch = dispatch task.quantity_assigned   (qty that must dispatch)
+//   dispatched      = SUM(daily_progress.qty_done) on the dispatch dept
+//                     (kept in lock-step with quantity_completed by the
+//                      progress-update endpoint).
+//
+// Per item, against the selected day/range [from, to]:
+//   In      = qty that REACHED dispatch within [from, to]
+//             (its last pre-dispatch stage was approved in the period).
+//   Opening = pending dispatch qty carried in from before `from`
+//             = qty_to_dispatch − dispatched-before-`from`  (reached before `from`).
+//   Out     = qty dispatched within [from, to].
+//   Closing = Opening + In − Out  (computed per PROJECT, clamped at 0 — identical
+//             to the frontend formula, so report total == dashboard pending total).
+//
+// Rule 6 / "only currently pending": a project is returned ONLY when its Closing
+// (remaining pending dispatch qty) is > 0, so 100%-dispatched projects fall off
+// automatically and nothing that isn't currently pending in Dispatch is shown.
+//
+// Param order (unchanged — both callers pass [from, to, from, from, from, to]):
+//   1:from 2:to   → In window
+//   3:from        → Opening cut-off
+//   4:from        → dispatched-before-`from`
+//   5:from 6:to   → dispatched-within-period
 function dispatchSummarySql(limitClause = 'LIMIT 10') {
   return `
     SELECT
       t.project_id,
       t.project_name,
       t.proj_code,
-      SUM(CASE WHEN (t.opening_qty + t.today_in + t.today_out) > 0 THEN 1 ELSE 0 END) AS item_count,
-      MAX(t.ready_at)   AS last_done_at,
+      /* items that are part of the current pending picture */
+      SUM(CASE WHEN (t.opening_qty + t.today_in) > 0 THEN 1 ELSE 0 END) AS item_count,
+      MAX(t.ready_at)    AS last_done_at,
       SUM(t.opening_qty) AS opening_qty,
       SUM(t.today_in)    AS today_in,
-      SUM(t.today_out)   AS today_out
+      SUM(t.today_out)   AS today_out,
+      /* Closing computed at project level, exactly like the UI: max(0, O + In − Out) */
+      GREATEST(0, SUM(t.opening_qty) + SUM(t.today_in) - SUM(t.today_out)) AS closing_qty
     FROM (
       SELECT
         p.id          AS project_id,
         p.name        AS project_name,
         p.project_id  AS proj_code,
-        pre.done_at   AS ready_at,
-        /* In: item reached dispatch within the period → its full qty */
-        CASE WHEN DATE(pre.done_at) BETWEEN ? AND ? THEN pi.quantity ELSE 0 END AS today_in,
+        disp.reached_at AS ready_at,
+        /* In: item reached dispatch within the period → the qty it brought to dispatch */
+        CASE WHEN DATE(disp.reached_at) BETWEEN ? AND ?
+             THEN disp.qty_to_dispatch ELSE 0 END                          AS today_in,
         /* Opening: reached dispatch before the period, net of qty already dispatched */
-        CASE WHEN DATE(pre.done_at) < ?
-             THEN GREATEST(0, pi.quantity - COALESCE(dbf.qty, 0)) ELSE 0 END     AS opening_qty,
+        CASE WHEN disp.reached_at < ?
+             THEN GREATEST(0, disp.qty_to_dispatch - COALESCE(dbf.qty, 0))
+             ELSE 0 END                                                    AS opening_qty,
         /* Out: dispatch work logged in the period (same source as Worker Daily Report) */
-        COALESCE(dir.qty, 0)                                                     AS today_out
-      FROM project_items pi
-      JOIN projects p ON p.id = pi.project_id
-      /* pre = when the item finished its last non-dispatch stage (= reached dispatch) */
-      JOIN (
-        SELECT tx.project_item_id, MAX(tx.updated_at) AS done_at
-        FROM task_assignments tx
-        JOIN departments dx ON dx.id = tx.department_id
-        WHERE tx.status = 'completed' AND LOWER(dx.name) NOT LIKE '%dispatch%'
-        GROUP BY tx.project_item_id
-      ) pre ON pre.project_item_id = pi.id
+        COALESCE(dir.qty, 0)                                               AS today_out
+      FROM (
+        /* one row per item that has REACHED dispatch (all non-dispatch stages done) */
+        SELECT
+          dt.project_item_id,
+          dt.project_id,
+          MAX(dt.quantity_assigned) AS qty_to_dispatch,
+          /* reached dispatch = when its last non-dispatch stage was approved;
+             fall back to the dispatch task's own start when dispatch is stage 1 */
+          COALESCE(
+            (SELECT MAX(COALESCE(pre.completed_date, DATE(pre.updated_at)))
+               FROM task_assignments pre
+               JOIN departments pd ON pd.id = pre.department_id
+              WHERE pre.project_item_id = dt.project_item_id
+                AND LOWER(pd.name) NOT LIKE '%dispatch%'),
+            DATE(MIN(dt.created_at))
+          ) AS reached_at
+        FROM task_assignments dt
+        JOIN departments dd0 ON dd0.id = dt.department_id
+        WHERE LOWER(dd0.name) LIKE '%dispatch%'
+          /* every non-dispatch stage of this item is completed = it reached dispatch */
+          AND NOT EXISTS (
+            SELECT 1 FROM task_assignments tn JOIN departments dn ON dn.id = tn.department_id
+             WHERE tn.project_item_id = dt.project_item_id
+               AND LOWER(dn.name) NOT LIKE '%dispatch%'
+               AND tn.status <> 'completed'
+          )
+        GROUP BY dt.project_item_id, dt.project_id
+      ) disp
+      JOIN projects p ON p.id = disp.project_id
       /* dbf = qty already dispatched BEFORE the from-date */
       LEFT JOIN (
         SELECT dp.project_item_id, SUM(dp.qty_done) AS qty
@@ -2199,7 +2253,7 @@ function dispatchSummarySql(limitClause = 'LIMIT 10') {
         JOIN departments dd ON dd.id = dp.department_id
         WHERE LOWER(dd.name) LIKE '%dispatch%' AND DATE(dp.work_date) < ?
         GROUP BY dp.project_item_id
-      ) dbf ON dbf.project_item_id = pi.id
+      ) dbf ON dbf.project_item_id = disp.project_item_id
       /* dir = qty dispatched WITHIN the period */
       LEFT JOIN (
         SELECT dp.project_item_id, SUM(dp.qty_done) AS qty
@@ -2207,19 +2261,12 @@ function dispatchSummarySql(limitClause = 'LIMIT 10') {
         JOIN departments dd ON dd.id = dp.department_id
         WHERE LOWER(dd.name) LIKE '%dispatch%' AND DATE(dp.work_date) BETWEEN ? AND ?
         GROUP BY dp.project_item_id
-      ) dir ON dir.project_item_id = pi.id
+      ) dir ON dir.project_item_id = disp.project_item_id
       WHERE p.status NOT IN ('deleted','cancelled')
-        /* item has actually reached dispatch = all its non-dispatch stages completed */
-        AND NOT EXISTS (
-          SELECT 1 FROM task_assignments tn JOIN departments dn ON dn.id = tn.department_id
-           WHERE tn.project_item_id = pi.id
-             AND LOWER(dn.name) NOT LIKE '%dispatch%'
-             AND tn.status <> 'completed'
-        )
     ) t
     GROUP BY t.project_id, t.project_name, t.proj_code
-    /* show projects with backlog, today's inflow, or today's dispatch activity */
-    HAVING opening_qty > 0 OR today_in > 0 OR today_out > 0
+    /* Rule 6: only projects still PENDING in dispatch (remaining qty > 0) */
+    HAVING GREATEST(0, SUM(t.opening_qty) + SUM(t.today_in) - SUM(t.today_out)) > 0
     ORDER BY last_done_at DESC
     ${limitClause}`;
 }
@@ -2257,7 +2304,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       `SELECT COUNT(*) as total FROM users WHERE role='worker' AND is_active=1`);
 
     // Extra stat card counts — no date filter
-    let extraStats = { items_running: 0, pending_approvals: 0, dispatch_worker_qty: 0, dispatch_challan_qty: 0 };
+    let extraStats = { items_running: 0, pending_approvals: 0, dispatch_worker_qty: 0, dispatch_challan_qty: 0, dispatch_pending_qty: 0 };
     try {
       const [[es]] = await db.query(`
         SELECT
@@ -2600,13 +2647,19 @@ router.get('/reports/dashboard', auth, async (req, res) => {
       console.warn('workerDailyReport skipped:', e.message);
     }
 
-    // ── 9. DISPATCH DAILY REPORT — PROJECT-LEVEL SUMMARY ─────────────────────
-    // One row per project = totals of all its items (Opening / In / Out).
+    // ── 9. DISPATCH PENDING REPORT — PROJECT-LEVEL SUMMARY ───────────────────
+    // One row per project = totals of all its items (Opening / In / Out / Closing).
+    // Computed ONCE for ALL pending projects so the dashboard "pending dispatch"
+    // total and this report can never disagree: the card = SUM(closing) over the
+    // exact same rows, and the inline table just shows the top slice of them.
     let dispatchDailyReport = [];
     try {
-      [dispatchDailyReport] = await db.query(
-        dispatchSummarySql('LIMIT 10'),
+      const [allDispatch] = await db.query(
+        dispatchSummarySql(''),
         [from, to, from, from, from, to]);
+      extraStats.dispatch_pending_qty = allDispatch.reduce(
+        (sum, r) => sum + (Number(r.closing_qty) || 0), 0);
+      dispatchDailyReport = allDispatch.slice(0, 10);
     } catch(e) {
       console.warn('dispatchDailyReport skipped:', e.message);
     }
