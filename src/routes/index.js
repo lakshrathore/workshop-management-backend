@@ -2090,58 +2090,65 @@ router.post('/tasks/:id/manual-time', auth, async (req, res) => {
 
 // ── REPORTS ───────────────────────────────────────────────────────────────────
 
-// Project-level Dispatch Summary SQL (one row per project = totals of all its
-// items). An item counts once it has completed every non-dispatch stage (the
-// stage before dispatch). We don't hardcode "packing" — the pre-dispatch stage
-// is whatever sits last in that item's chain.
-//   Opening = items that became dispatch-ready BEFORE the from-date
-//   In      = items that became dispatch-ready within [from, to]
-//   Out     = dispatch dept work logged within [from, to]
-// Params order: [from, from, to, from, to]. Pass limitClause '' for "all".
+// Project-level Dispatch Summary SQL (one row per project = item counts that
+// flow through the DISPATCH department in the stage tracker).
+//   Opening = items that entered the dispatch dept BEFORE the from-date and are
+//             still not dispatched (backlog at start of day).
+//   In      = items that became dispatch-ready (last pre-dispatch stage approved)
+//             within [from, to] — i.e. now showing pending in dispatch.
+//   Out     = items whose dispatch dept task got completed/cleared within [from, to].
+//   Closing = Opening + In - Out  (computed on the frontend).
+// "entered dispatch" time = when the item's last non-dispatch stage completed.
+// "dispatched" = the dispatch-dept task_assignment is completed.
+// Params order: [from, to, from, to, from, from]. Pass limitClause '' for "all".
 function dispatchSummarySql(limitClause = 'LIMIT 10') {
   return `
     SELECT
       t.project_id,
       t.project_name,
       t.proj_code,
-      COUNT(*)            AS item_count,
-      MAX(t.last_done_at) AS last_done_at,
-      SUM(t.opening_qty)  AS opening_qty,
-      SUM(t.today_in)     AS today_in,
-      SUM(t.today_out)    AS today_out
+      SUM(CASE WHEN (t.f_open + t.f_in + t.f_out) > 0 THEN 1 ELSE 0 END) AS item_count,
+      MAX(t.entered_at) AS last_done_at,
+      SUM(t.f_open)     AS opening_qty,
+      SUM(t.f_in)       AS today_in,
+      SUM(t.f_out)      AS today_out
     FROM (
       SELECT
         p.id          AS project_id,
         p.name        AS project_name,
         p.project_id  AS proj_code,
-        ls.done_at    AS last_done_at,
-        CASE WHEN DATE(ls.done_at) < ?              THEN ls.done_qty ELSE 0 END AS opening_qty,
-        CASE WHEN DATE(ls.done_at) BETWEEN ? AND ?  THEN ls.done_qty ELSE 0 END AS today_in,
-        COALESCE((
-          SELECT SUM(dp.qty_done)
-          FROM daily_progress dp
-          JOIN departments dd ON dd.id = dp.department_id
-          WHERE dp.project_item_id = pi.id
-            AND LOWER(dd.name) LIKE '%dispatch%'
-            AND DATE(dp.work_date) BETWEEN ? AND ?
-        ), 0)                                       AS today_out
+        pre.done_at   AS entered_at,
+        /* In: entered the dispatch dept within the period */
+        CASE WHEN DATE(pre.done_at) BETWEEN ? AND ? THEN 1 ELSE 0 END AS f_in,
+        /* Out: dispatch dept task cleared within the period */
+        CASE WHEN disp.any_completed = 1
+              AND DATE(disp.disp_done_at) BETWEEN ? AND ? THEN 1 ELSE 0 END AS f_out,
+        /* Opening: entered before the period and not yet dispatched at start */
+        CASE WHEN DATE(pre.done_at) < ?
+              AND ( disp.any_completed = 0 OR DATE(disp.disp_done_at) >= ? )
+             THEN 1 ELSE 0 END AS f_open
       FROM project_items pi
       JOIN projects p ON p.id = pi.project_id
+      /* pre = when the item finished its last non-dispatch stage (= entered dispatch) */
       JOIN (
-        SELECT tx.project_item_id,
-          MAX(tx.updated_at)         AS done_at,
-          MAX(tx.quantity_completed) AS done_qty
+        SELECT tx.project_item_id, MAX(tx.updated_at) AS done_at
         FROM task_assignments tx
         JOIN departments dx ON dx.id = tx.department_id
-        WHERE tx.status = 'completed'
-          AND LOWER(dx.name) NOT LIKE '%dispatch%'
+        WHERE tx.status = 'completed' AND LOWER(dx.name) NOT LIKE '%dispatch%'
         GROUP BY tx.project_item_id
-      ) ls ON ls.project_item_id = pi.id
+      ) pre ON pre.project_item_id = pi.id
+      /* disp = the item's dispatch-dept task: completed? when? */
+      JOIN (
+        SELECT td.project_item_id,
+          MAX(CASE WHEN td.status = 'completed' THEN 1 ELSE 0 END)         AS any_completed,
+          MAX(CASE WHEN td.status = 'completed' THEN td.updated_at END)    AS disp_done_at
+        FROM task_assignments td
+        JOIN departments dd ON dd.id = td.department_id
+        WHERE LOWER(dd.name) LIKE '%dispatch%'
+        GROUP BY td.project_item_id
+      ) disp ON disp.project_item_id = pi.id
       WHERE p.status NOT IN ('deleted','cancelled')
-        AND EXISTS (
-          SELECT 1 FROM task_assignments te JOIN departments de ON de.id = te.department_id
-           WHERE te.project_item_id = pi.id AND LOWER(de.name) NOT LIKE '%dispatch%'
-        )
+        /* all non-dispatch stages of the item are completed (it really reached dispatch) */
         AND NOT EXISTS (
           SELECT 1 FROM task_assignments tn JOIN departments dn ON dn.id = tn.department_id
            WHERE tn.project_item_id = pi.id
@@ -2537,7 +2544,7 @@ router.get('/reports/dashboard', auth, async (req, res) => {
     try {
       [dispatchDailyReport] = await db.query(
         dispatchSummarySql('LIMIT 10'),
-        [from, from, to, from, to]);
+        [from, to, from, to, from, from]);
     } catch(e) {
       console.warn('dispatchDailyReport skipped:', e.message);
     }
@@ -2713,7 +2720,7 @@ router.get('/reports/dashboard/dispatch-report', auth, async (req, res) => {
     const to   = req.query.to   || todayDefault;
     const [rows] = await db.query(
       dispatchSummarySql(''),
-      [from, from, to, from, to]);
+      [from, to, from, to, from, from]);
     res.json(rows);
   } catch(err) {
     res.status(500).json({ message: err.message });
