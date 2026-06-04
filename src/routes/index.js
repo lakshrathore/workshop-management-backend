@@ -1190,6 +1190,11 @@ router.delete('/projects/:projectId/items/:id', auth, adminOrPermission('project
     if (activeTasks[0].cnt > 0) {
       return res.status(400).json({ message: `Is item pe ${activeTasks[0].cnt} tasks kaam mein hain — pehle complete karo` });
     }
+    // Remove the item's chain + tasks first so no orphan task rows are left
+    // behind (task_assignments.project_item_id is ON DELETE SET NULL, which
+    // would otherwise leave NULL-item rows that skew project stage counts).
+    await db.query('DELETE FROM task_assignments WHERE project_item_id=? AND project_id=?', [req.params.id, req.params.projectId]);
+    await db.query('DELETE FROM production_chains WHERE project_item_id=? AND project_id=?', [req.params.id, req.params.projectId]);
     await db.query('DELETE FROM project_items WHERE id=? AND project_id=?', [req.params.id, req.params.projectId]);
     res.json({ message: 'Item deleted' });
   } catch(err) {
@@ -1306,10 +1311,14 @@ router.post('/projects/:id/chain', auth, adminOrPermission('projects','edit'), a
       const [items] = await db.query('SELECT * FROM project_items WHERE project_id=?', [req.params.id]);
       for (const item of items) {
         await _createChainTasks(db, req.params.id, item, stages, req.user.id);
+        await _pruneOrphanChainTasks(db, req.params.id, item.id, stages);
       }
     } else {
       const [[item]] = await db.query('SELECT * FROM project_items WHERE id=?', [project_item_id]);
-      if (item) await _createChainTasks(db, req.params.id, item, stages, req.user.id);
+      if (item) {
+        await _createChainTasks(db, req.params.id, item, stages, req.user.id);
+        await _pruneOrphanChainTasks(db, req.params.id, item.id, stages);
+      }
     }
     res.json({ message: 'Chain set kiya' });
   } catch (err) {
@@ -1317,6 +1326,52 @@ router.post('/projects/:id/chain', auth, adminOrPermission('projects','edit'), a
     res.status(500).json({ message: err.message });
   }
 });
+
+// ── Clean orphan tasks for a project ─────────────────────────────────────────
+// Fixes the "all items done but project shows < 100%" case: removes NON-completed
+// task_assignments that no longer belong to any current chain stage of an
+// existing item (leftovers from chain edits or deleted items). Completed tasks
+// are never touched. Returns how many rows were removed.
+router.post('/projects/:id/cleanup-orphan-tasks', auth, adminOrPermission('projects','edit'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const [r] = await db.query(`
+      DELETE ta FROM task_assignments ta
+      WHERE ta.project_id = ?
+        AND ta.status <> 'completed'
+        AND (
+          ta.project_item_id IS NULL
+          OR NOT EXISTS (SELECT 1 FROM project_items pi WHERE pi.id = ta.project_item_id)
+          OR NOT EXISTS (
+            SELECT 1 FROM production_chains pc
+             WHERE pc.project_id = ta.project_id
+               AND pc.project_item_id = ta.project_item_id
+               AND pc.department_id = ta.department_id
+          )
+        )`,
+      [req.params.id]);
+    res.json({ message: 'Orphan tasks cleaned', removed: r.affectedRows || 0 });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Remove leftover (orphan) tasks for an item whose stage/department is no
+// longer part of the current chain — but keep COMPLETED tasks so historical
+// work is never lost. This is what prevents the "all items done but project
+// shows 94%" mismatch caused by stale waiting/pending rows from chain edits.
+async function _pruneOrphanChainTasks(db, project_id, project_item_id, stages) {
+  const deptIds = [...new Set((stages || []).map(s => s.department_id))];
+  if (!deptIds.length) return;
+  const ph = deptIds.map(() => '?').join(',');
+  await db.query(
+    `DELETE FROM task_assignments
+       WHERE project_id = ? AND project_item_id = ?
+         AND status <> 'completed'
+         AND department_id NOT IN (${ph})`,
+    [project_id, project_item_id, ...deptIds]
+  );
+}
 
 async function _createChainTasks(db, project_id, item, stages, created_by) {
   for (let i = 0; i < stages.length; i++) {
