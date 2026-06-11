@@ -4104,6 +4104,17 @@ router.put('/packing/boxes/:id', auth, auditLog('UPDATE','PackingBox'), async (r
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Update only the label copies count (used by the label preview modal).
+// Separate from the full PUT so we never accidentally null-out other fields.
+router.put('/packing/boxes/:id/copies', auth, auditLog('UPDATE','PackingBoxCopies'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const finalCopies = Math.max(1, Math.min(26, parseInt(req.body.copies) || 1));
+    await db.query('UPDATE packing_boxes SET copies=? WHERE id=?', [finalCopies, req.params.id]);
+    res.json({ message: 'Updated', copies: finalCopies });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // Delete box
 router.delete('/packing/boxes/:id', auth, auditLog('DELETE','PackingBox'), async (req, res) => {
   const db = await getPool();
