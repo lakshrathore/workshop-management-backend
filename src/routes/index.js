@@ -482,7 +482,7 @@ router.patch('/workers/:id/rate', auth, adminOrPermission('workers','edit'), asy
 // ── PROJECTS ──────────────────────────────────────────────────────────────────
 router.get('/projects', auth, async (req, res) => {
   const db = await getPool();
-  const { status, search, ready } = req.query;
+  const { status, search, ready, lite } = req.query;
   let where = "WHERE p.status != 'deleted'";
   const params = [];
   if (status && status !== 'all') {
@@ -499,6 +499,23 @@ router.get('/projects', auth, async (req, res) => {
     where += ' AND (p.name LIKE ? OR p.client_name LIKE ? OR p.project_id LIKE ?)';
     params.push(`%${search}%`, `%${search}%`, `%${search}%`);
   }
+
+  // ── LITE mode: list views (e.g. Stage Tracker) only need a handful of columns.
+  // Skips ~8 correlated subqueries per row AND the N+1 per-project worker loop,
+  // so a single fast indexed query is returned. Heavy fields are NOT included.
+  if (lite) {
+    try {
+      const [rows] = await db.query(
+        `SELECT p.id, p.project_id, p.name, p.client_name, p.status,
+                p.priority, p.deadline, p.is_ready, p.created_at
+         FROM projects p
+         ${where} ORDER BY p.created_at DESC`, params);
+      return res.json(rows);
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
+    }
+  }
+
   try {
     const [rows] = await db.query(`
       SELECT p.*,
