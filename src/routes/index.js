@@ -4051,13 +4051,14 @@ router.get('/packing/boxes', auth, async (req, res) => {
 router.post('/packing/boxes', auth, auditLog('CREATE','PackingBox'), async (req, res) => {
   const db = await getPool();
   try {
-    const { project_id, project_item_id, mode, items, notes, box_number, photo_code, main_item, sub_label, description } = req.body;
+    const { project_id, project_item_id, mode, items, notes, box_number, photo_code, main_item, sub_label, description, copies } = req.body;
     const finalBoxNum = box_number || await generateBoxNumber(db);
     const finalSubLabel = sub_label ? sub_label.trim().toUpperCase() : null;
+    const finalCopies = Math.max(1, Math.min(26, parseInt(copies) || 1));
 
     const [r] = await db.query(
-      'INSERT INTO packing_boxes (box_number, sub_label, project_id, project_item_id, photo_code, main_item, mode, created_by, notes, description) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      [finalBoxNum, finalSubLabel, project_id || null, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '', description || null]
+      'INSERT INTO packing_boxes (box_number, sub_label, project_id, project_item_id, photo_code, main_item, mode, created_by, notes, description, copies) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      [finalBoxNum, finalSubLabel, project_id || null, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '', description || null, finalCopies]
     );
     const boxId = r.insertId;
 
@@ -4084,10 +4085,11 @@ router.post('/packing/boxes', auth, auditLog('CREATE','PackingBox'), async (req,
 router.put('/packing/boxes/:id', auth, auditLog('UPDATE','PackingBox'), async (req, res) => {
   const db = await getPool();
   try {
-    const { notes, items, photo_code, main_item, description } = req.body;
+    const { notes, items, photo_code, main_item, description, copies } = req.body;
+    const finalCopies = Math.max(1, Math.min(26, parseInt(copies) || 1));
     await db.query(
-      'UPDATE packing_boxes SET notes=?, photo_code=?, main_item=?, description=? WHERE id=?',
-      [notes || '', photo_code || null, main_item || null, description ?? null, req.params.id]
+      'UPDATE packing_boxes SET notes=?, photo_code=?, main_item=?, description=?, copies=? WHERE id=?',
+      [notes || '', photo_code || null, main_item || null, description ?? null, finalCopies, req.params.id]
     );
     if (items) {
       await db.query('DELETE FROM packing_box_items WHERE box_id=?', [req.params.id]);
