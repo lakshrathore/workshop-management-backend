@@ -4025,6 +4025,9 @@ router.get('/packing/boxes', auth, async (req, res) => {
         (SELECT pii.image_path FROM project_item_images pii
            WHERE pii.project_item_id = pb.project_item_id
            ORDER BY pii.created_at ASC LIMIT 1) AS item_image,
+        (SELECT pbp2.image_path FROM packing_box_photos pbp2
+           WHERE pbp2.box_id = pb.id
+           ORDER BY pbp2.id ASC LIMIT 1) AS box_image,
         (SELECT COUNT(*) FROM packing_box_photos pbp WHERE pbp.box_id = pb.id) as photo_count
       FROM packing_boxes pb
       LEFT JOIN users u ON u.id = pb.created_by
@@ -4048,13 +4051,13 @@ router.get('/packing/boxes', auth, async (req, res) => {
 router.post('/packing/boxes', auth, auditLog('CREATE','PackingBox'), async (req, res) => {
   const db = await getPool();
   try {
-    const { project_id, project_item_id, mode, items, notes, box_number, photo_code, main_item, sub_label } = req.body;
+    const { project_id, project_item_id, mode, items, notes, box_number, photo_code, main_item, sub_label, description } = req.body;
     const finalBoxNum = box_number || await generateBoxNumber(db);
     const finalSubLabel = sub_label ? sub_label.trim().toUpperCase() : null;
 
     const [r] = await db.query(
-      'INSERT INTO packing_boxes (box_number, sub_label, project_id, project_item_id, photo_code, main_item, mode, created_by, notes) VALUES (?,?,?,?,?,?,?,?,?)',
-      [finalBoxNum, finalSubLabel, project_id || null, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '']
+      'INSERT INTO packing_boxes (box_number, sub_label, project_id, project_item_id, photo_code, main_item, mode, created_by, notes, description) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      [finalBoxNum, finalSubLabel, project_id || null, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '', description || null]
     );
     const boxId = r.insertId;
 
@@ -4081,10 +4084,10 @@ router.post('/packing/boxes', auth, auditLog('CREATE','PackingBox'), async (req,
 router.put('/packing/boxes/:id', auth, auditLog('UPDATE','PackingBox'), async (req, res) => {
   const db = await getPool();
   try {
-    const { notes, items, photo_code, main_item } = req.body;
+    const { notes, items, photo_code, main_item, description } = req.body;
     await db.query(
-      'UPDATE packing_boxes SET notes=?, photo_code=?, main_item=? WHERE id=?',
-      [notes || '', photo_code || null, main_item || null, req.params.id]
+      'UPDATE packing_boxes SET notes=?, photo_code=?, main_item=?, description=? WHERE id=?',
+      [notes || '', photo_code || null, main_item || null, description ?? null, req.params.id]
     );
     if (items) {
       await db.query('DELETE FROM packing_box_items WHERE box_id=?', [req.params.id]);

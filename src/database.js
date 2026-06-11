@@ -409,6 +409,8 @@ async function initializeDatabase() {
   await safeAlter("ALTER TABLE sale_challans ADD COLUMN send_type VARCHAR(10) DEFAULT 'system' COMMENT 'system or pdf'");
   // Sub-box label support: BOX-01 (A), BOX-01 (B) etc.
   await safeAlter("ALTER TABLE packing_boxes ADD COLUMN sub_label VARCHAR(10) DEFAULT NULL COMMENT 'A, B, C etc for sub-boxes'");
+  // Box-level description shown on the printed packing label (independent of the linked project_item)
+  await safeAlter("ALTER TABLE packing_boxes ADD COLUMN description VARCHAR(500) DEFAULT NULL");
   await safeAlter("ALTER TABLE project_item_images ADD COLUMN resource_type VARCHAR(20) DEFAULT 'image'");
 
   // ── NEW COLUMNS: Client Purchase Orders — item/tax/project fields ──────────
