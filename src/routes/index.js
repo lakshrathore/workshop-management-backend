@@ -482,7 +482,7 @@ router.patch('/workers/:id/rate', auth, adminOrPermission('workers','edit'), asy
 // ── PROJECTS ──────────────────────────────────────────────────────────────────
 router.get('/projects', auth, async (req, res) => {
   const db = await getPool();
-  const { status, search, ready, lite } = req.query;
+  const { status, search, ready, lite, withWorkers } = req.query;
   let where = "WHERE p.status != 'deleted'";
   const params = [];
   if (status && status !== 'all') {
@@ -537,22 +537,26 @@ router.get('/projects', auth, async (req, res) => {
       FROM projects p
       ${where} ORDER BY p.created_at DESC`, params);
     
-    // For each project, fetch worker completion data
-    for (let project of rows) {
-      const [workers] = await db.query(`
-        SELECT 
-          u.id,
-          u.name,
-          d.name as department,
-          COALESCE(SUM(ta.quantity_assigned), 0) as assigned_qty,
-          COALESCE(SUM(ta.quantity_completed), 0) as completed_qty
-        FROM task_assignments ta
-        JOIN users u ON ta.worker_id = u.id
-        JOIN departments d ON ta.department_id = d.id
-        WHERE ta.project_id = ?
-        GROUP BY u.id, u.name, d.name
-        ORDER BY u.name`, [project.id]);
-      project.workers = workers;
+    // Per-project worker completion data — N+1 query, opt-in only.
+    // No current caller reads project.workers, so it is skipped by default to
+    // avoid one extra DB round-trip per project. Pass ?withWorkers=1 to include.
+    if (withWorkers) {
+      for (let project of rows) {
+        const [workers] = await db.query(`
+          SELECT 
+            u.id,
+            u.name,
+            d.name as department,
+            COALESCE(SUM(ta.quantity_assigned), 0) as assigned_qty,
+            COALESCE(SUM(ta.quantity_completed), 0) as completed_qty
+          FROM task_assignments ta
+          JOIN users u ON ta.worker_id = u.id
+          JOIN departments d ON ta.department_id = d.id
+          WHERE ta.project_id = ?
+          GROUP BY u.id, u.name, d.name
+          ORDER BY u.name`, [project.id]);
+        project.workers = workers;
+      }
     }
     
     // Apply toHttpsImageUrl on thumbnail_path for projects list
