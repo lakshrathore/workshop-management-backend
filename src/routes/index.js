@@ -4231,11 +4231,31 @@ router.post('/packing/boxes', auth, auditLog('CREATE','PackingBox'), async (req,
 router.put('/packing/boxes/:id', auth, auditLog('UPDATE','PackingBox'), async (req, res) => {
   const db = await getPool();
   try {
-    const { notes, items, photo_code, main_item, description, copies } = req.body;
+    const { box_number, notes, items, photo_code, main_item, description, copies, project_id } = req.body;
     const finalCopies = Math.max(1, Math.min(26, parseInt(copies) || 1));
+
+    // box_number change allowed — check duplicate only if a new number is provided
+    if (box_number && box_number.trim()) {
+      const [[dup]] = await db.query(
+        'SELECT id FROM packing_boxes WHERE box_number=? AND id!=?',
+        [box_number.trim(), req.params.id]
+      );
+      if (dup) return res.status(400).json({ message: `Box number "${box_number}" already exists` });
+    }
+
     await db.query(
-      'UPDATE packing_boxes SET notes=?, photo_code=?, main_item=?, description=?, copies=? WHERE id=?',
-      [notes || '', photo_code || null, main_item || null, description ?? null, finalCopies, req.params.id]
+      `UPDATE packing_boxes
+         SET box_number=COALESCE(NULLIF(TRIM(?),''), box_number),
+             notes=?, photo_code=?, main_item=?, description=?, copies=?,
+             project_id=?
+       WHERE id=?`,
+      [
+        box_number || null,
+        notes || '', photo_code || null, main_item || null,
+        description ?? null, finalCopies,
+        project_id || null,
+        req.params.id
+      ]
     );
     if (items) {
       await db.query('DELETE FROM packing_box_items WHERE box_id=?', [req.params.id]);
@@ -4246,7 +4266,21 @@ router.put('/packing/boxes/:id', auth, auditLog('UPDATE','PackingBox'), async (r
         );
       }
     }
-    res.json({ message: 'Updated' });
+
+    // Return updated box so frontend can refresh label preview immediately
+    const [[updated]] = await db.query(
+      `SELECT pb.*, u.name as created_by_name,
+              p.name as project_name, p.project_id as proj_code
+         FROM packing_boxes pb
+         LEFT JOIN users u ON u.id = pb.created_by
+         LEFT JOIN projects p ON p.id = pb.project_id
+        WHERE pb.id=?`,
+      [req.params.id]
+    );
+    const [boxItems] = await db.query('SELECT * FROM packing_box_items WHERE box_id=?', [req.params.id]);
+    updated.items = boxItems;
+
+    res.json({ message: 'Updated', box: updated });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
