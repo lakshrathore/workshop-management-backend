@@ -1160,7 +1160,7 @@ router.post('/projects/:projectId/items/:id/amend-qty', auth, adminOrPermission(
   const newQty = parseInt(new_qty, 10);
   const oldQty = parseInt(item.quantity, 10);
 
-  // Get all chain tasks
+  // Get all chain tasks ordered by stage
   const [tasks] = await db.query(
     'SELECT * FROM task_assignments WHERE project_item_id=? ORDER BY stage_order ASC',
     [itemId]
@@ -1181,23 +1181,77 @@ router.post('/projects/:projectId/items/:id/amend-qty', auth, adminOrPermission(
     itemId
   ]);
 
-  // Update all non-completed chain task quantities
+  // ── Update EVERY chain stage (including completed) ──────────────────────────
+  // Increasing qty:
+  //   • completed stage where done < newQty  → reopen to 'in_progress' (pending qty = newQty - done)
+  //   • completed stage where done >= newQty → stays completed (rare: reduce case allowed above)
+  //   • non-completed stage                  → update quantity_assigned
+  // Decreasing qty:
+  //   • non-completed stage where done >= newQty → auto-complete it
+  //   • others                                   → update quantity_assigned
+
+  let anyReopened = false;
+
   for (const task of tasks) {
     const done = parseInt(task.quantity_completed, 10) || 0;
-    // Only update if task is not completed — keep completed qty, update assigned
-    if (task.status !== 'completed') {
-      const newAssigned = Math.max(done, newQty);
-      await db.query(
-        'UPDATE task_assignments SET quantity_assigned=? WHERE id=?',
-        [newAssigned, task.id]
-      );
+
+    if (task.status === 'completed') {
+      if (done < newQty) {
+        // Reopen this stage — extra qty still needs to be processed here
+        await db.query(
+          `UPDATE task_assignments
+             SET quantity_assigned=?, status=?, completed_date=NULL
+           WHERE id=?`,
+          [newQty, done > 0 ? 'in_progress' : 'pending', task.id]
+        );
+        anyReopened = true;
+      }
+      // If done >= newQty, stage remains completed — nothing to do
+    } else {
+      // Non-completed task
+      if (done >= newQty) {
+        // All required qty already done — auto-complete
+        await db.query(
+          `UPDATE task_assignments
+             SET quantity_assigned=?, status='completed', completed_date=CURDATE()
+           WHERE id=?`,
+          [newQty, task.id]
+        );
+      } else {
+        // Normal update — adjust assigned qty
+        await db.query(
+          'UPDATE task_assignments SET quantity_assigned=? WHERE id=?',
+          [newQty, task.id]
+        );
+      }
     }
   }
 
+  // ── Sync item status ────────────────────────────────────────────────────────
+  // If we reopened any stage, the item can no longer be 'completed'
+  if (anyReopened) {
+    await db.query("UPDATE project_items SET status='in_progress' WHERE id=? AND status='completed'", [itemId]);
+  }
+  // If after reduce all stages are now completed, mark item done
+  if (newQty <= oldQty && tasks.length > 0) {
+    const [stillOpen] = await db.query(
+      "SELECT COUNT(*) as cnt FROM task_assignments WHERE project_item_id=? AND status != 'completed'",
+      [itemId]
+    );
+    if (stillOpen[0].cnt === 0) {
+      await db.query("UPDATE project_items SET status='completed' WHERE id=?", [itemId]);
+    }
+  }
+
+  // ── Sync project status ─────────────────────────────────────────────────────
+  await syncProjectCompletionStatus(db, projectId);
+
+  const reopenedCount = tasks.filter(t => t.status === 'completed').length;
   res.json({
-    message: `Qty updated from ${oldQty} to ${newQty}. ${tasks.filter(t => t.status !== 'completed').length} chain stage(s) updated.`,
+    message: `Qty updated from ${oldQty} to ${newQty}. ${anyReopened ? 'Completed stages reopened with pending qty.' : 'All stages updated.'}`,
     old_qty: oldQty,
     new_qty: newQty,
+    reopened: anyReopened,
   });
 });
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1377,7 +1431,38 @@ router.post('/projects/:id/cleanup-orphan-tasks', auth, adminOrPermission('proje
   }
 });
 
-// Remove leftover (orphan) tasks for an item whose stage/department is no
+// ── One-time backfill: sync completion status for ALL projects ────────────────
+// Hit POST /projects/sync-completion-status (admin only) from the browser or
+// Postman to fix any existing stuck projects on live DB.
+router.post('/projects/sync-completion-status', auth, adminOrPermission('projects','edit'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const [projects] = await db.query(
+      "SELECT id, status FROM projects WHERE status NOT IN ('deleted','cancelled')"
+    );
+    let activated = 0, completed = 0;
+    for (const proj of projects) {
+      const [[counts]] = await db.query(`
+        SELECT
+          COUNT(*)                        AS total_items,
+          SUM(pi.status = 'completed')    AS done_items,
+          SUM(pi.status != 'completed')   AS open_items
+        FROM project_items pi WHERE pi.project_id=?`, [proj.id]);
+      if (!counts || counts.total_items === 0) continue;
+      const allDone = counts.open_items === 0;
+      if (allDone && proj.status === 'active') {
+        await db.query("UPDATE projects SET status='completed' WHERE id=?", [proj.id]);
+        completed++;
+      } else if (!allDone && proj.status === 'completed') {
+        await db.query("UPDATE projects SET status='active' WHERE id=?", [proj.id]);
+        activated++;
+      }
+    }
+    res.json({ message: `Sync done. Completed: ${completed}, Reopened: ${activated}`, completed, activated });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 // longer part of the current chain — but keep COMPLETED tasks so historical
 // work is never lost. This is what prevents the "all items done but project
 // shows 94%" mismatch caused by stale waiting/pending rows from chain edits.
@@ -1440,6 +1525,37 @@ async function _createChainTasks(db, project_id, item, stages, created_by) {
         });
       }
     }
+  }
+
+  // ── Resync statuses after any reorder ─────────────────────────────────────
+  // Fetch all tasks for this item ordered by new stage_order
+  const [allTasks] = await db.query(
+    'SELECT * FROM task_assignments WHERE project_id=? AND project_item_id=? ORDER BY stage_order ASC',
+    [project_id, item.id]
+  );
+
+  // Walk in order: completed tasks stay untouched.
+  // First non-completed task → pending (if it has no progress yet) or in_progress (if it does).
+  // All subsequent non-completed tasks → waiting (unless a previous non-completed task
+  // has quantity_completed > 0, meaning it has partial work — next stage can start).
+  let prevHasProgress = true; // stage 0 predecessor is always "done" conceptually
+  for (const t of allTasks) {
+    if (t.status === 'completed') {
+      prevHasProgress = true; // completed stage always gates the next one open
+      continue;
+    }
+    const done = parseInt(t.quantity_completed, 10) || 0;
+    let newStatus;
+    if (prevHasProgress) {
+      newStatus = done > 0 ? 'in_progress' : 'pending';
+    } else {
+      newStatus = 'waiting';
+    }
+    if (newStatus !== t.status) {
+      await db.query('UPDATE task_assignments SET status=? WHERE id=?', [newStatus, t.id]);
+    }
+    // This stage gates the next: gates open only if this stage is done or has partial progress
+    prevHasProgress = done > 0;
   }
 }
 
@@ -1674,6 +1790,8 @@ async function checkAndActivateNextStage(db, task) {
     WHERE project_id=? AND project_item_id=? AND status != 'completed'`, [task.project_id, task.project_item_id]);
   if (waiting.cnt === 0) {
     await db.query("UPDATE project_items SET status='completed' WHERE id=?", [task.project_item_id]);
+    // Auto-complete project if ALL items are now done
+    await syncProjectCompletionStatus(db, task.project_id);
     await notifyAdmins(db, {
       type: 'item_completed',
       title: '✅ Item Completed!',
@@ -1684,7 +1802,35 @@ async function checkAndActivateNextStage(db, task) {
   }
 }
 
-// Helper: Get previous stage's completed quantity for stage dependency validation
+// ── Project auto-complete sync ────────────────────────────────────────────────
+// Call after ANY item/task status change. Flips project 'active' → 'completed'
+// when every item is done, or 'completed' → 'active' when something reopens.
+async function syncProjectCompletionStatus(db, project_id) {
+  try {
+    const [[proj]] = await db.query("SELECT id, status FROM projects WHERE id=?", [project_id]);
+    if (!proj) return;
+    // Don't touch deleted/cancelled projects
+    if (['deleted','cancelled'].includes(proj.status)) return;
+
+    const [[counts]] = await db.query(`
+      SELECT
+        COUNT(*)                                          AS total_items,
+        SUM(pi.status = 'completed')                     AS done_items,
+        SUM(pi.status != 'completed')                    AS open_items
+      FROM project_items pi
+      WHERE pi.project_id = ?`, [project_id]);
+
+    if (!counts || counts.total_items === 0) return; // no items yet
+
+    const allDone = counts.open_items === 0;
+
+    if (allDone && proj.status === 'active') {
+      await db.query("UPDATE projects SET status='completed' WHERE id=?", [project_id]);
+    } else if (!allDone && proj.status === 'completed') {
+      await db.query("UPDATE projects SET status='active' WHERE id=?", [project_id]);
+    }
+  } catch (err) { console.error('syncProjectCompletionStatus error:', err.message); }
+}
 async function getPreviousStageQuantity(db, projectItemId, currentStageOrder) {
   if (currentStageOrder <= 1) return null; // First stage has no dependency
 
