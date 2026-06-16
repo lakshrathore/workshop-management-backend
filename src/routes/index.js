@@ -4157,34 +4157,9 @@ async function generateBoxNumber(db) {
 router.get('/packing/boxes', auth, async (req, res) => {
   const db = await getPool();
   try {
-    const { project_id, search, page = 1, limit = 50 } = req.query;
-    const offset = (Math.max(1, parseInt(page)) - 1) * Math.min(100, parseInt(limit) || 50);
-    const pageSize = Math.min(100, parseInt(limit) || 50);
-
-    const conditions = [];
-    const params = [];
-
-    if (project_id) {
-      conditions.push('pb.project_id = ?');
-      params.push(project_id);
-    }
-    if (search && search.trim()) {
-      const s = '%' + search.trim() + '%';
-      conditions.push('(pb.box_number LIKE ? OR pb.photo_code LIKE ? OR pb.main_item LIKE ? OR p.name LIKE ? OR u.name LIKE ?)');
-      params.push(s, s, s, s, s);
-    }
-
-    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
-
-    // Total count for pagination
-    const [[{ total }]] = await db.query(
-      `SELECT COUNT(*) as total FROM packing_boxes pb
-       LEFT JOIN users u ON u.id = pb.created_by
-       LEFT JOIN projects p ON p.id = pb.project_id
-       ${where}`, params
-    );
-
-    // Main query — no correlated subqueries, no N+1
+    const { project_id } = req.query;
+    const where = project_id ? 'WHERE pb.project_id=?' : 'WHERE 1=1';
+    const params = project_id ? [project_id] : [];
     const [boxes] = await db.query(`
       SELECT pb.*, pb.sub_label, u.name as created_by_name,
         p.name as project_name, p.project_id as proj_code, p.client_name,
@@ -4192,83 +4167,38 @@ router.get('/packing/boxes', auth, async (req, res) => {
         pi.proto_code  AS item_proto_code,
         pi.description AS item_description,
         pi.quantity    AS item_quantity,
-        pi.unit        AS item_unit
+        pi.unit        AS item_unit,
+        (SELECT pii.image_path FROM project_item_images pii
+           WHERE pii.project_item_id = pb.project_item_id
+           ORDER BY pii.created_at ASC LIMIT 1) AS item_image,
+        (SELECT pbp2.image_path FROM packing_box_photos pbp2
+           WHERE pbp2.box_id = pb.id
+           ORDER BY pbp2.id ASC LIMIT 1) AS box_image,
+        (SELECT COUNT(*) FROM packing_box_photos pbp WHERE pbp.box_id = pb.id) as photo_count
       FROM packing_boxes pb
       LEFT JOIN users u ON u.id = pb.created_by
       LEFT JOIN projects p ON p.id = pb.project_id
       LEFT JOIN project_items pi ON pi.id = pb.project_item_id
-      ${where}
-      ORDER BY pb.created_at DESC
-      LIMIT ? OFFSET ?`,
-      [...params, pageSize, offset]
-    );
+      ${where} ORDER BY pb.created_at DESC`, params);
 
-    if (!boxes.length) return res.json({ boxes: [], total, page: parseInt(page), pages: Math.ceil(total / pageSize) });
-
+    // Get items for ALL boxes in ONE query (fixes the load issue).
+    // Previously this fired one SELECT per box in a sequential await loop
+    // (N+1), so as the live data grew the page kept getting slower and
+    // eventually timed out -> "Load nahi hua" / "Failed to load".
     const boxIds = boxes.map(b => b.id);
-
-    // Batch fetch all box items in one query
-    const [allItems] = await db.query(
-      `SELECT * FROM packing_box_items WHERE box_id IN (${boxIds.map(() => '?').join(',')}) ORDER BY id`,
-      boxIds
-    );
-
-    // Batch fetch first photo per box
-    const [allPhotos] = await db.query(
-      `SELECT p1.box_id, p1.image_path
-       FROM packing_box_photos p1
-       INNER JOIN (
-         SELECT box_id, MIN(id) as min_id
-         FROM packing_box_photos
-         WHERE box_id IN (${boxIds.map(() => '?').join(',')})
-         GROUP BY box_id
-       ) p2 ON p1.id = p2.min_id`,
-      boxIds
-    );
-
-    // Batch fetch photo counts
-    const [photoCounts] = await db.query(
-      `SELECT box_id, COUNT(*) as cnt FROM packing_box_photos
-       WHERE box_id IN (${boxIds.map(() => '?').join(',')}) GROUP BY box_id`,
-      boxIds
-    );
-
-    // Batch fetch first item image for linked project items
-    const itemIds = [...new Set(boxes.map(b => b.project_item_id).filter(Boolean))];
-    let itemImages = [];
-    if (itemIds.length) {
-      [itemImages] = await db.query(
-        `SELECT pii.project_item_id, pii.image_path
-         FROM project_item_images pii
-         INNER JOIN (
-           SELECT project_item_id, MIN(id) as min_id
-           FROM project_item_images
-           WHERE project_item_id IN (${itemIds.map(() => '?').join(',')})
-           GROUP BY project_item_id
-         ) t ON pii.id = t.min_id`,
-        itemIds
+    if (boxIds.length > 0) {
+      const [allItems] = await db.query(
+        'SELECT * FROM packing_box_items WHERE box_id IN (?) ORDER BY box_id, id',
+        [boxIds]
       );
+      const itemsByBox = new Map();
+      for (const it of allItems) {
+        if (!itemsByBox.has(it.box_id)) itemsByBox.set(it.box_id, []);
+        itemsByBox.get(it.box_id).push(it);
+      }
+      boxes.forEach(box => { box.items = itemsByBox.get(box.id) || []; });
     }
-
-    // Build lookup maps
-    const itemsByBox = {};
-    allItems.forEach(it => { (itemsByBox[it.box_id] = itemsByBox[it.box_id] || []).push(it); });
-    const photoByBox = {};
-    allPhotos.forEach(p => { photoByBox[p.box_id] = p.image_path; });
-    const countByBox = {};
-    photoCounts.forEach(r => { countByBox[r.box_id] = r.cnt; });
-    const imageByItem = {};
-    itemImages.forEach(r => { imageByItem[r.project_item_id] = r.image_path; });
-
-    // Merge into boxes
-    boxes.forEach(box => {
-      box.items = itemsByBox[box.id] || [];
-      box.box_image = photoByBox[box.id] || null;
-      box.photo_count = countByBox[box.id] || 0;
-      box.item_image = box.project_item_id ? (imageByItem[box.project_item_id] || null) : null;
-    });
-
-    res.json({ boxes, total, page: parseInt(page), pages: Math.ceil(total / pageSize) });
+    res.json(boxes);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
