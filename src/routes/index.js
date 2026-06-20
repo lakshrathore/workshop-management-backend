@@ -1080,8 +1080,32 @@ router.post('/projects/:id/items', auth, adminOrPermission('projects','write'), 
 router.put('/projects/:projectId/items/:id', auth, adminOrPermission('projects','edit'), async (req, res) => {
   const db = await getPool();
   const { item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes } = req.body;
+
+  // Get old item_name to detect rename + fetch department names for title rebuild
+  const [[oldItem]] = await db.query('SELECT item_name FROM project_items WHERE id=? AND project_id=?', [req.params.id, req.params.projectId]);
+
   await db.query('UPDATE project_items SET item_name=?,proto_code=?,description=?,quantity=?,unit=?,material=?,dimensions=?,unit_price=?,notes=? WHERE id=? AND project_id=?',
     [item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes, req.params.id, req.params.projectId]);
+
+  // If item_name changed, sync task_title on every chain task for this item
+  // so workers always see the current name — even on already-completed stages.
+  if (oldItem && item_name && oldItem.item_name !== item_name) {
+    const [tasks] = await db.query(
+      `SELECT ta.id, ta.task_title, d.name as dept_name
+       FROM task_assignments ta
+       LEFT JOIN departments d ON d.id = ta.department_id
+       WHERE ta.project_item_id = ?`,
+      [req.params.id]
+    );
+    for (const t of tasks) {
+      // Rebuild title as "<new item name> — <department>", preserving the dept suffix
+      const newTitle = t.dept_name ? `${item_name} — ${t.dept_name}` : item_name;
+      if (newTitle !== t.task_title) {
+        await db.query('UPDATE task_assignments SET task_title=? WHERE id=?', [newTitle, t.id]);
+      }
+    }
+  }
+
   res.json({ message: 'Updated' });
 });
 
