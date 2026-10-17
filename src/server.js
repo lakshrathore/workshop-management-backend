@@ -64,9 +64,14 @@ app.get('/api/license/payment-info', getPaymentInfo);
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { getPool } = require('./database');
+const superAdminRoutes = require('./routes/superAdminRoutes');
+const { trySuperAdminLogin, getPrimaryOrgAccess, orgAccessGuard, initSuperAdminTables } = superAdminRoutes;
 
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
+  // Super Admin (fixed credentials) — same login page / same URL
+  const sa = trySuperAdminLogin(req);
+  if (sa) return res.status(sa.status).json(sa.body);
   const db = await getPool();
   const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
   const ua = req.headers['user-agent'] || 'unknown';
@@ -93,6 +98,10 @@ app.post('/api/auth/login', async (req, res) => {
       console.log(`❌ Login failed: Wrong password for ${username}`);
       return res.status(401).json({ message: 'Invalid credentials' });
     }
+
+    // Organization suspended / subscription expired → login block
+    const access = await getPrimaryOrgAccess();
+    if (access.blocked) return res.status(403).json({ org_blocked: true, reason: access.reason, message: access.message });
     
     try {
       await db.query(
@@ -136,6 +145,11 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ message: 'Login failed: ' + err.message });
   }
 });
+
+// ── SUPER ADMIN ROUTES (packages / organizations) ─────────────────────────────
+app.use('/api', superAdminRoutes);
+// Org suspend / expire hone par logged-in users ko bhi rok do
+app.use('/api', orgAccessGuard);
 
 const apiRoutes = require('./routes');
 // const backupRoutes = require('./routes/backupRoutes');  // BACKUP SYSTEM DISABLED
@@ -220,6 +234,7 @@ app.get('*path', (req, res) => {
 });
 
 initializeDatabase().then(async () => {
+  await initSuperAdminTables().catch(err => console.error('Super Admin tables init error:', err.message));
   // Client portal tables initialize karo
   const clientRoutesModule = require('./routes/clientRoutes');
   const initFn = clientRoutesModule.initClientTables;
