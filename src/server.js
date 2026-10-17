@@ -64,14 +64,22 @@ app.get('/api/license/payment-info', getPaymentInfo);
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { getPool } = require('./database');
+const superAdminRoutes = require('./routes/superAdminRoutes');
+const { trySuperAdminLogin, getPrimaryOrgAccess, orgAccessGuard, initSuperAdminTables } = superAdminRoutes;
 
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
+  // Super Admin (fixed credentials) — same login page / same URL
+  const sa = trySuperAdminLogin(req);
+  if (sa) return res.status(sa.status).json(sa.body);
   const db = await getPool();
   try {
     const [rows] = await db.query('SELECT * FROM users WHERE username=? AND is_active=1', [username]);
     if (!rows.length) return res.status(401).json({ message: 'Invalid credentials' });
     if (!bcrypt.compareSync(password, rows[0].password)) return res.status(401).json({ message: 'Invalid credentials' });
+    // Organization suspended / subscription expired → login block
+    const access = await getPrimaryOrgAccess();
+    if (access.blocked) return res.status(403).json({ org_blocked: true, reason: access.reason, message: access.message });
     const token = jwt.sign({ id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role }, process.env.JWT_SECRET, { expiresIn: '24h' });
     const [depts] = await db.query(`SELECT d.* FROM departments d LEFT JOIN worker_departments wd ON wd.department_id=d.id WHERE wd.worker_id=?`, [rows[0].id]).catch(() => [[]]);
     res.json({ token, user: { id: rows[0].id, name: rows[0].name, username: rows[0].username, role: rows[0].role, departments: depts[0] || [] } });
@@ -80,6 +88,11 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ message: 'Login failed' });
   }
 });
+
+// ── SUPER ADMIN ROUTES (packages / organizations) ─────────────────────────────
+app.use('/api', superAdminRoutes);
+// Org suspend / expire hone par logged-in users ko bhi rok do
+app.use('/api', orgAccessGuard);
 
 const apiRoutes = require('./routes');
 // const backupRoutes = require('./routes/backupRoutes');  // BACKUP SYSTEM DISABLED
@@ -139,6 +152,7 @@ app.get('*', (req, res) => {
 });
 
 initializeDatabase().then(async () => {
+  await initSuperAdminTables().catch(err => console.error('Super Admin tables init error:', err.message));
   // Client portal tables initialize karo
   const clientRoutesModule = require('./routes/clientRoutes');
   const initFn = clientRoutesModule.initClientTables;

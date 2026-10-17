@@ -284,6 +284,9 @@ router.get('/workers', auth, async (req, res) => {
 router.post('/workers', auth, adminOnly, async (req, res) => {
   const db = await getPool();
   const { name, username, password, phone, department_ids, hourly_rate } = req.body;
+  // Package user limit (Super Admin se set hota hai)
+  const limit = await require('./superAdminRoutes').checkUserLimit();
+  if (!limit.allowed) return res.status(403).json({ message: `User limit reached (${limit.used}/${limit.limit}). Package upgrade ke liye administrator se contact karein.` });
   const hashed = bcrypt.hashSync(password, 10);
   const [r] = await db.query('INSERT INTO users (name,username,password,role,phone,hourly_rate) VALUES (?,?,?,?,?,?)', [name, username, hashed, 'worker', phone, hourly_rate || 0]);
   if (department_ids?.length) {
