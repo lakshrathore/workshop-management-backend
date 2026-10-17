@@ -45,7 +45,7 @@ function trySuperAdminLogin(req) {
   const ip = clientIp(req);
   const rec = failedAttempts.get(ip);
   if (rec && rec.lockedUntil > Date.now()) {
-    return { status: 429, body: { message: 'Too many attempts. 15 minute baad try karo.' } };
+    return { status: 429, body: { message: 'Too many attempts. Please try again after 15 minutes.' } };
   }
 
   if (!safeEqual(password, SUPER_ADMIN_PASSWORD)) {
@@ -136,7 +136,7 @@ async function initSuperAdminTables() {
     } catch {}
     await db.query(
       "INSERT INTO sa_organizations (name, status, start_date, is_primary, notes) VALUES (?, 'active', CURDATE(), 1, ?)",
-      [companyName, 'Ye current live deployment hai (isi URL par chal raha).']
+      [companyName, 'This is the current live deployment (running on this URL).']
     );
     console.log(`✅ Super Admin: primary organization created (${companyName})`);
   }
@@ -183,6 +183,19 @@ function formatSub(s) {
   return { ...s, start_date: toYMD(s.start_date), end_date: toYMD(s.end_date) };
 }
 
+// e.g. "Standard – ₹12,000 / 365 days" (package jo org ko assign kiya hai)
+function formatINR(n) {
+  return '₹' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+}
+function formatDMY(d) {
+  const [y, m, day] = toYMD(d).split('-');
+  return `${day}-${m}-${y}`;
+}
+function planText(org) {
+  if (!org.package_name) return '';
+  return `${org.package_name} – ${formatINR(org.package_price)} / ${org.package_days} days`;
+}
+
 // Primary org status — 30 sec cache. Error par fail-open (live client kabhi galti se block na ho).
 let statusCache = null;
 let statusCacheAt = 0;
@@ -190,12 +203,19 @@ async function getPrimaryOrgAccess() {
   if (statusCache && Date.now() - statusCacheAt < 30000) return statusCache;
   try {
     const db = await getPool();
-    const [[org]] = await db.query('SELECT * FROM sa_organizations WHERE is_primary=1 LIMIT 1');
+    const [[org]] = await db.query(
+      `SELECT o.*, p.name AS package_name, p.price AS package_price, p.duration_days AS package_days
+       FROM sa_organizations o LEFT JOIN sa_packages p ON p.id=o.package_id WHERE o.is_primary=1 LIMIT 1`
+    );
     let result = { blocked: false };
     if (org) {
       const st = computeStatus(org);
-      if (st === 'suspended') result = { blocked: true, reason: 'suspended', message: 'Account suspended hai. Kripya administrator se contact karein.' };
-      else if (st === 'expired') result = { blocked: true, reason: 'expired', message: 'Subscription expire ho gaya hai. Renew karne ke liye administrator se contact karein.' };
+      const plan = planText(org);
+      if (st === 'suspended') {
+        result = { blocked: true, reason: 'suspended', message: `Your account has been suspended.${plan ? ` Plan: ${plan}.` : ''} Please contact your administrator to reactivate it.` };
+      } else if (st === 'expired') {
+        result = { blocked: true, reason: 'expired', message: `Your subscription expired on ${formatDMY(org.expiry_date)}.${plan ? ` Renew your ${plan} plan to continue.` : ' Please renew to continue.'} Contact your administrator for renewal.` };
+      }
     }
     statusCache = result; statusCacheAt = Date.now();
     return result;
@@ -225,12 +245,15 @@ async function checkUserLimit() {
   try {
     const db = await getPool();
     const [[org]] = await db.query(
-      'SELECT o.max_users AS org_max, p.max_users AS pkg_max FROM sa_organizations o LEFT JOIN sa_packages p ON p.id=o.package_id WHERE o.is_primary=1 LIMIT 1'
+      `SELECT o.max_users AS org_max, p.max_users AS pkg_max, p.name AS package_name, p.price AS package_price, p.duration_days AS package_days
+       FROM sa_organizations o LEFT JOIN sa_packages p ON p.id=o.package_id WHERE o.is_primary=1 LIMIT 1`
     );
     const limit = org ? (org.org_max ?? org.pkg_max ?? null) : null;
     if (limit == null) return { allowed: true, limit: null };
     const [[{ used }]] = await db.query("SELECT COUNT(*) AS used FROM users WHERE is_active=1 AND role IN ('admin','worker')");
-    return { allowed: used < limit, limit, used };
+    const plan = planText(org);
+    const message = `User limit reached (${used}/${limit})${plan ? ` on your ${plan} plan` : ''}. Please contact your administrator to upgrade your package.`;
+    return { allowed: used < limit, limit, used, message };
   } catch { return { allowed: true, limit: null }; }
 }
 
@@ -315,8 +338,8 @@ router.get('/superadmin/packages', async (req, res) => {
 
 router.post('/superadmin/packages', async (req, res) => {
   const data = pick(req.body, PKG_FIELDS);
-  if (!data.name) return res.status(400).json({ message: 'Package name required hai' });
-  if (!data.duration_days || Number(data.duration_days) < 1) return res.status(400).json({ message: 'Duration (days) 1 ya zyada hona chahiye' });
+  if (!data.name) return res.status(400).json({ message: 'Package name is required' });
+  if (!data.duration_days || Number(data.duration_days) < 1) return res.status(400).json({ message: 'Duration must be at least 1 day' });
   try {
     const db = await getPool();
     const [r] = await db.query('INSERT INTO sa_packages SET ?', [data]);
@@ -326,7 +349,7 @@ router.post('/superadmin/packages', async (req, res) => {
 
 router.put('/superadmin/packages/:id', async (req, res) => {
   const data = pick(req.body, PKG_FIELDS);
-  if (data.name === null) return res.status(400).json({ message: 'Package name required hai' });
+  if (data.name === null) return res.status(400).json({ message: 'Package name is required' });
   if (!Object.keys(data).length) return res.status(400).json({ message: 'Nothing to update' });
   try {
     const db = await getPool();
@@ -340,7 +363,7 @@ router.delete('/superadmin/packages/:id', async (req, res) => {
   try {
     const db = await getPool();
     const [[{ c }]] = await db.query('SELECT COUNT(*) AS c FROM sa_organizations WHERE package_id=?', [req.params.id]);
-    if (c > 0) return res.status(400).json({ message: `Ye package ${c} organization(s) ko assigned hai. Pehle unka package badlo ya package ko inactive karo.` });
+    if (c > 0) return res.status(400).json({ message: `This package is assigned to ${c} organization(s). Change their package first, or mark this package inactive.` });
     await db.query('DELETE FROM sa_packages WHERE id=?', [req.params.id]);
     res.json({ message: 'Package deleted' });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -375,7 +398,7 @@ router.get('/superadmin/organizations/:id', async (req, res) => {
 
 router.post('/superadmin/organizations', async (req, res) => {
   const data = pick(req.body, ORG_FIELDS);
-  if (!data.name) return res.status(400).json({ message: 'Organization name required hai' });
+  if (!data.name) return res.status(400).json({ message: 'Organization name is required' });
   try {
     const db = await getPool();
     if (!data.start_date) data.start_date = toYMD(new Date());
@@ -391,7 +414,7 @@ router.post('/superadmin/organizations', async (req, res) => {
 
 router.put('/superadmin/organizations/:id', async (req, res) => {
   const data = pick(req.body, ORG_FIELDS);
-  if (data.name === null) return res.status(400).json({ message: 'Organization name required hai' });
+  if (data.name === null) return res.status(400).json({ message: 'Organization name is required' });
   if (!Object.keys(data).length) return res.status(400).json({ message: 'Nothing to update' });
   try {
     const db = await getPool();
@@ -420,7 +443,7 @@ router.post('/superadmin/organizations/:id/renew', async (req, res) => {
     const [[org]] = await db.query('SELECT * FROM sa_organizations WHERE id=?', [req.params.id]);
     if (!org) return res.status(404).json({ message: 'Organization not found' });
     const [[pkg]] = await db.query('SELECT * FROM sa_packages WHERE id=?', [package_id || org.package_id]);
-    if (!pkg) return res.status(400).json({ message: 'Package select karo' });
+    if (!pkg) return res.status(400).json({ message: 'Please select a package' });
 
     const days = Number(duration_days) > 0 ? Number(duration_days) : pkg.duration_days;
     const today = toYMD(new Date());
@@ -441,7 +464,7 @@ router.post('/superadmin/organizations/:id/renew', async (req, res) => {
       [org.id, pkg.id, pkg.name, amount === '' || amount == null ? pkg.price : amount, from, end, payment_mode || null, reference || null, notes || null]
     );
     clearStatusCache();
-    res.json({ message: `Subscription ${end} tak active`, expiry_date: end });
+    res.json({ message: `Subscription active until ${formatDMY(end)} (${pkg.name} – ${formatINR(amount === '' || amount == null ? pkg.price : amount)})`, expiry_date: end });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -450,7 +473,7 @@ router.delete('/superadmin/organizations/:id', async (req, res) => {
     const db = await getPool();
     const [[org]] = await db.query('SELECT is_primary FROM sa_organizations WHERE id=?', [req.params.id]);
     if (!org) return res.status(404).json({ message: 'Organization not found' });
-    if (org.is_primary) return res.status(400).json({ message: 'Primary (live) organization delete nahi ho sakta. Suspend kar sakte ho.' });
+    if (org.is_primary) return res.status(400).json({ message: 'The primary (live) organization cannot be deleted. You can suspend it instead.' });
     await db.query('DELETE FROM sa_subscriptions WHERE organization_id=?', [req.params.id]);
     await db.query('DELETE FROM sa_organizations WHERE id=?', [req.params.id]);
     res.json({ message: 'Organization deleted' });
@@ -462,7 +485,7 @@ async function requirePrimary(req, res) {
   const db = await getPool();
   const [[org]] = await db.query('SELECT is_primary FROM sa_organizations WHERE id=?', [req.params.id]);
   if (!org) { res.status(404).json({ message: 'Organization not found' }); return false; }
-  if (!org.is_primary) { res.status(400).json({ message: 'Users sirf primary (live) organization ke available hain' }); return false; }
+  if (!org.is_primary) { res.status(400).json({ message: 'Users are available only for the primary (live) organization' }); return false; }
   return true;
 }
 
@@ -477,13 +500,13 @@ router.get('/superadmin/organizations/:id/users', async (req, res) => {
 
 router.put('/superadmin/organizations/:id/users/:userId/password', async (req, res) => {
   const { password } = req.body;
-  if (!password || password.length < 4) return res.status(400).json({ message: 'Password kam se kam 4 characters ka hona chahiye' });
+  if (!password || password.length < 4) return res.status(400).json({ message: 'Password must be at least 4 characters' });
   try {
     if (!(await requirePrimary(req, res))) return;
     const db = await getPool();
     const [r] = await db.query('UPDATE users SET password=? WHERE id=?', [bcrypt.hashSync(password, 10), req.params.userId]);
     if (!r.affectedRows) return res.status(404).json({ message: 'User not found' });
-    res.json({ message: 'Password reset ho gaya' });
+    res.json({ message: 'Password has been reset' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
