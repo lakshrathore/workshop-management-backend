@@ -3,7 +3,7 @@ const nodemailer = require('nodemailer');
 // ── System Email via Resend API (OTP / Forgot Password) ───────────────────────
 // Uses Resend HTTP API (port 443) — works on Railway where SMTP ports are blocked.
 // Admin sets resend_api_key + system_email in Settings → Email tab.
-const SYSTEM_FROM_NAME = 'MOJI INNOVATORS LLP';
+const SYSTEM_FROM_NAME = 'MOZI INNOVATORS LLP';
 
 async function getSystemConfig(db) {
   const [rows] = await db.query(
@@ -83,7 +83,7 @@ async function getTransporter(db) {
     }
     return {
       transporter: _transporter,
-      from: `"${cfg.smtp_name || 'MOJI INNOVATORS LLP'}" <${cfg.smtp_email}>`,
+      from: `"${cfg.smtp_name || 'MOZI INNOVATORS LLP'}" <${cfg.smtp_email}>`,
       replyTo: cfg.smtp_email,
     };
   } catch (err) {

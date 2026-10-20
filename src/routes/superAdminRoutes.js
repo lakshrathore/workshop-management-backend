@@ -140,6 +140,16 @@ async function initSuperAdminTables() {
     );
     console.log(`✅ Super Admin: primary organization created (${companyName})`);
   }
+  // One-time firm rename MOJI → MOZI (firm ka naam badla hai). Sirf tab badlo jab
+  // value abhi bhi exactly purana naam ho, aur flag set karo taaki dobara na chale —
+  // baad mein Settings se jo naam rakha jaye wo kabhi overwrite nahi hoga.
+  const [[renamed]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='firm_rename_mozi_done'");
+  if (!renamed) {
+    const [a] = await db.query("UPDATE app_settings SET setting_value='MOZI INNOVATORS LLP' WHERE setting_key='company_name' AND setting_value='MOJI INNOVATORS LLP'");
+    const [b] = await db.query("UPDATE sa_organizations SET name='MOZI INNOVATORS LLP' WHERE is_primary=1 AND name='MOJI INNOVATORS LLP'");
+    await db.query("INSERT INTO app_settings (setting_key, setting_value) VALUES ('firm_rename_mozi_done', '1')");
+    console.log(`✅ Firm rename MOJI → MOZI applied (company_name: ${a.affectedRows}, organization: ${b.affectedRows})`);
+  }
   console.log('✅ Super Admin tables ready');
 }
 
@@ -509,6 +519,22 @@ router.put('/superadmin/organizations/:id/users/:userId/password', async (req, r
     const [r] = await db.query('UPDATE users SET password=? WHERE id=?', [bcrypt.hashSync(password, 10), req.params.userId]);
     if (!r.affectedRows) return res.status(404).json({ message: 'User not found' });
     res.json({ message: 'Password has been reset' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.put('/superadmin/organizations/:id/users/:userId/username', async (req, res) => {
+  const username = String(req.body.username || '').trim();
+  if (username.length < 3) return res.status(400).json({ message: 'Username must be at least 3 characters' });
+  if (!/^[A-Za-z0-9._@-]+$/.test(username)) return res.status(400).json({ message: 'Username can only contain letters, numbers and . _ @ -' });
+  if (username === SUPER_ADMIN_USERNAME) return res.status(400).json({ message: 'This username is reserved' });
+  try {
+    if (!(await requirePrimary(req, res))) return;
+    const db = await getPool();
+    const [[taken]] = await db.query('SELECT id FROM users WHERE username=? AND id<>?', [username, req.params.userId]);
+    if (taken) return res.status(409).json({ message: `Username "${username}" is already taken` });
+    const [r] = await db.query('UPDATE users SET username=? WHERE id=?', [username, req.params.userId]);
+    if (!r.affectedRows) return res.status(404).json({ message: 'User not found' });
+    res.json({ message: `Username changed to ${username}`, username });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 

@@ -294,7 +294,7 @@ initializeDatabase().then(async () => {
     }
   }
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 MOJI INNOVATORS LLP API`);
+    console.log(`\n🚀 MOZI INNOVATORS LLP API`);
     console.log(`   Local:  http://localhost:${PORT}`);
     console.log(`   Mobile: http://${localIP}:${PORT}`);
     console.log(`📋 Admin: admin / admin123\n`);

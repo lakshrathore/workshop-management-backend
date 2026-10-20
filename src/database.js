@@ -177,7 +177,7 @@ async function initializeDatabase() {
     ['currency_symbol', '₹'],
     ['currency_name', 'INR'],
     ['date_format', 'DD/MM/YYYY'],
-    ['company_name', 'MOJI INNOVATORS LLP'],
+    ['company_name', 'MOZI INNOVATORS LLP'],
     ['timezone', 'Asia/Kolkata'],
   ];
   for (const [k, v] of defaultSettings) {

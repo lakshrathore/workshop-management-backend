@@ -204,16 +204,16 @@ async function initWebsiteTables() {
   if (pageCount === 0) {
     await db.query(
       `INSERT INTO website_pages (slug, title, is_system, meta_title, meta_description) VALUES
-       ('home','Home',1,'Moji Innovators LLP | Furniture Manufacturing','Furniture manufacturing and export from Moji Innovators LLP.'),
-       ('about','About Us',0,'About Us | Moji Innovators LLP','Learn about Moji Innovators LLP furniture manufacturing.'),
-       ('contact','Contact',0,'Contact Us | Moji Innovators LLP','Get in touch with Moji Innovators LLP for bulk orders and enquiries.')`
+       ('home','Home',1,'MOZI Innovators LLP | Furniture Manufacturing','Furniture manufacturing and export from MOZI Innovators LLP.'),
+       ('about','About Us',0,'About Us | MOZI Innovators LLP','Learn about MOZI Innovators LLP furniture manufacturing.'),
+       ('contact','Contact',0,'Contact Us | MOZI Innovators LLP','Get in touch with MOZI Innovators LLP for bulk orders and enquiries.')`
     );
   }
 
   const [[{ c: settingsCount }]] = await db.query('SELECT COUNT(*) c FROM website_settings');
   if (settingsCount === 0) {
     const defaults = {
-      site_name: 'Moji Innovators LLP',
+      site_name: 'MOZI Innovators LLP',
       tagline: 'Furniture built on craft, engineered for scale.',
       logo_url: '',
       favicon_url: '',
@@ -227,14 +227,14 @@ async function initWebsiteTables() {
       linkedin_url: '',
       hero_image: 'https://images.unsplash.com/photo-1683115099860-5379ac101bce?auto=format&fit=crop&w=1900&q=80',
       hero_heading: "Furniture built on craft, engineered for scale.",
-      hero_subheading: 'Moji Innovators LLP designs and manufactures furniture for dealers, hospitality projects, and retail brands across India.',
+      hero_subheading: 'MOZI Innovators LLP designs and manufactures furniture for dealers, hospitality projects, and retail brands across India.',
       stat_1_num: '12+', stat_1_label: 'Years Manufacturing',
       stat_2_num: '40,000', stat_2_label: 'Sq. Ft. Facility',
       stat_3_num: '180+', stat_3_label: 'Dealer Partners',
       stat_4_num: '6', stat_4_label: 'States Served',
-      seo_default_title: 'Moji Innovators LLP | Furniture Manufacturing',
-      seo_default_description: 'Furniture manufacturing and export from Moji Innovators LLP — dealers, retailers, and hospitality projects.',
-      seo_default_keywords: 'furniture manufacturer, furniture export, Jaipur furniture, Moji Innovators',
+      seo_default_title: 'MOZI Innovators LLP | Furniture Manufacturing',
+      seo_default_description: 'Furniture manufacturing and export from MOZI Innovators LLP — dealers, retailers, and hospitality projects.',
+      seo_default_keywords: 'furniture manufacturer, furniture export, Jaipur furniture, MOZI Innovators',
       og_image: 'https://images.unsplash.com/photo-1683115099860-5379ac101bce?auto=format&fit=crop&w=1200&q=80',
       google_analytics_id: '',
     };

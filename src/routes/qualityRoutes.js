@@ -169,7 +169,7 @@ router.post('/quality/reports', auth, adminOrPermission('quality_report', 'write
            qc_person_id, inspection_level, inspection_date, sku_number, status, can_add_sections, created_by)
          VALUES (?,?,?,?,?,?,?,?,?,?,'draft',?,?)`,
         [reportNo, b.project_id, b.project_item_id || null, b.client_name || null,
-         b.vendor_name || sMap.company_name || 'Moji Innovators LLP', b.location || sMap.company_address || null,
+         b.vendor_name || sMap.company_name || 'MOZI Innovators LLP', b.location || sMap.company_address || null,
          b.qc_person_id || null, b.inspection_level || 'final', b.inspection_date || null,
          b.sku_number || null, b.can_add_sections ? 1 : 0, req.user.id]);
 
