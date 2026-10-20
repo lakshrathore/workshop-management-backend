@@ -18,15 +18,17 @@ async function getPool() {
 }
 
 async function initializeDatabase() {
-  const tempPool = mysql.createPool({
-    host: process.env.DB_HOST || 'localhost',
-    port: process.env.DB_PORT || 3306,
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    waitForConnections: true, connectionLimit: 2,
-  });
-  await tempPool.query(`CREATE DATABASE IF NOT EXISTS \`${process.env.DB_NAME || 'workshop_manager'}\``);
-  await tempPool.end();
+  if (process.env.DB_CREATE_DATABASE !== 'false') {
+    const tempPool = mysql.createPool({
+      host: process.env.DB_HOST || 'localhost',
+      port: process.env.DB_PORT || 3306,
+      user: process.env.DB_USER || 'root',
+      password: process.env.DB_PASSWORD || '',
+      waitForConnections: true, connectionLimit: 2,
+    });
+    await tempPool.query(`CREATE DATABASE IF NOT EXISTS \`${process.env.DB_NAME || 'workshop_manager'}\``);
+    await tempPool.end();
+  }
 
   const db = await getPool();
 
@@ -761,6 +763,384 @@ async function initializeDatabase() {
   for (const [k, v, d] of approvalSettings) {
     await db.query('INSERT IGNORE INTO approval_settings (setting_key, setting_value, description) VALUES (?,?,?)', [k, v, d]);
   }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // MAIN PO MODULE (Phase 1) — additive only. New tables + nullable columns.
+  // No existing table is dropped, renamed, or destructively modified.
+  // ══════════════════════════════════════════════════════════════════════════
+  await db.query(`CREATE TABLE IF NOT EXISTS main_pos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    po_no VARCHAR(50) UNIQUE NOT NULL,
+    project_name VARCHAR(255) NOT NULL,
+    client_name VARCHAR(255),
+    pmc_name VARCHAR(255),
+    order_date DATE,
+    timelines VARCHAR(255),
+    remarks TEXT,
+    status ENUM('draft','submitted','approved','rejected') DEFAULT 'draft',
+    project_id INT NULL,
+    submitted_by INT NULL, submitted_at DATETIME NULL,
+    approved_by INT NULL, approved_at DATETIME NULL,
+    rejected_by INT NULL, rejected_at DATETIME NULL, rejected_reason TEXT,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_mainpo_status (status),
+    INDEX idx_mainpo_project (project_id),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS main_po_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    main_po_id INT NOT NULL,
+    s_no INT DEFAULT 1,
+    area VARCHAR(100),
+    proto_code VARCHAR(100),
+    product_name VARCHAR(255) NOT NULL,
+    product_size VARCHAR(255),
+    finishes_note TEXT,
+    is_paint_finish TINYINT(1) DEFAULT 0,
+    is_fabric_finish TINYINT(1) DEFAULT 0,
+    is_metal_finish TINYINT(1) DEFAULT 0,
+    size_length VARCHAR(50),
+    size_width VARCHAR(50),
+    size_thickness VARCHAR(50),
+    qty DECIMAL(10,2) DEFAULT 1,
+    remark TEXT,
+    project_item_id INT NULL,
+    sort_order INT DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_mpi_po (main_po_id),
+    FOREIGN KEY (main_po_id) REFERENCES main_pos(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_item_id) REFERENCES project_items(id) ON DELETE SET NULL
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS main_po_item_images (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    main_po_item_id INT NOT NULL,
+    image_path VARCHAR(500) NOT NULL,
+    public_id VARCHAR(255),
+    caption TEXT,
+    sort_order INT DEFAULT 0,
+    uploaded_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_mpimg_item (main_po_item_id),
+    FOREIGN KEY (main_po_item_id) REFERENCES main_po_items(id) ON DELETE CASCADE
+  )`);
+
+  // approvals.type: APPEND 'MAIN_PO' member. Appending ENUM values is
+  // backward-compatible — existing rows/queries are unaffected.
+  await safeAlter(`ALTER TABLE approvals MODIFY COLUMN type ENUM('PROJECT','ITEM','CHALLAN','PO_STATUS','SALE','MAIN_PO') NOT NULL`);
+
+  // Traceability columns (nullable — NULL for all existing/manual records)
+  await ensureColumn('projects', 'source_main_po_id', 'source_main_po_id INT NULL');
+  await ensureColumn('project_items', 'area', 'area VARCHAR(100) NULL');
+  await ensureColumn('project_items', 'source_main_po_item_id', 'source_main_po_item_id INT NULL');
+
+  // Main PO number series (INSERT IGNORE — never overwrites configured values)
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('main_po_prefix', 'MPO')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('main_po_start_number', '1001')").catch(()=>{});
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // FINISH MODULE (Phase 2: Paint / Fabric / Metal) — additive only.
+  // One sheet per (main_po, finish_type); entries per flagged PO item.
+  // Base product data is never copied — read live from main_po_items.
+  // ══════════════════════════════════════════════════════════════════════════
+  await db.query(`CREATE TABLE IF NOT EXISTS finish_sheets (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    main_po_id INT NOT NULL,
+    finish_type ENUM('paint','fabric','metal') NOT NULL,
+    status ENUM('draft','submitted') DEFAULT 'draft',
+    remarks TEXT,
+    submitted_by INT NULL, submitted_at DATETIME NULL,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_finish_sheet (main_po_id, finish_type),
+    FOREIGN KEY (main_po_id) REFERENCES main_pos(id) ON DELETE CASCADE
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS finish_entries (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sheet_id INT NOT NULL,
+    main_po_item_id INT NOT NULL,
+    paint_finish_name VARCHAR(255) NULL,
+    fabric_name VARCHAR(255) NULL,
+    per_item_fabric_qty DECIMAL(10,2) NULL,
+    total_qty DECIMAL(12,2) NULL,
+    fabric_unit VARCHAR(20) NULL,
+    material_type ENUM('sheet','pipe','pipe_material','other') NULL,
+    material_other VARCHAR(255) NULL,
+    metal_finish_details TEXT NULL,
+    size_length VARCHAR(50) NULL,
+    size_width VARCHAR(50) NULL,
+    size_thickness VARCHAR(50) NULL,
+    size_other VARCHAR(255) NULL,
+    remark TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_finish_entry (sheet_id, main_po_item_id),
+    FOREIGN KEY (sheet_id) REFERENCES finish_sheets(id) ON DELETE CASCADE,
+    FOREIGN KEY (main_po_item_id) REFERENCES main_po_items(id) ON DELETE CASCADE
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS finish_entry_images (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    entry_id INT NOT NULL,
+    image_type ENUM('finish','sample') DEFAULT 'finish',
+    image_path VARCHAR(500) NOT NULL,
+    public_id VARCHAR(255),
+    caption TEXT,
+    sort_order INT DEFAULT 0,
+    uploaded_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_fei_entry (entry_id),
+    FOREIGN KEY (entry_id) REFERENCES finish_entries(id) ON DELETE CASCADE
+  )`);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // CASH BOOK MODULE (Phase 3) — additive only.
+  // ══════════════════════════════════════════════════════════════════════════
+  await db.query(`CREATE TABLE IF NOT EXISTS expense_ledgers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(150) UNIQUE NOT NULL,
+    is_default TINYINT(1) DEFAULT 0,
+    is_active TINYINT(1) DEFAULT 1,
+    created_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS cashbook_advances (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    voucher_no VARCHAR(50) UNIQUE NULL,
+    worker_id INT NOT NULL,
+    amount DECIMAL(12,2) NOT NULL,
+    advance_date DATE,
+    payment_mode ENUM('cash','upi','cheque','bank_transfer') DEFAULT 'cash',
+    particulars TEXT,
+    status ENUM('pending','approved','rejected') DEFAULT 'pending',
+    submitted_by INT NULL, submitted_at DATETIME NULL,
+    approved_by INT NULL, approved_at DATETIME NULL,
+    rejected_by INT NULL, rejected_at DATETIME NULL, rejected_reason TEXT,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_cba_worker (worker_id, status),
+    FOREIGN KEY (worker_id) REFERENCES users(id)
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS cashbook_expenses (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    worker_id INT NOT NULL,
+    ledger_id INT NOT NULL,
+    expense_date DATE,
+    amount DECIMAL(12,2) NOT NULL,
+    particulars TEXT,
+    status ENUM('pending','approved','rejected') DEFAULT 'pending',
+    submitted_by INT NULL, submitted_at DATETIME NULL,
+    approved_by INT NULL, approved_at DATETIME NULL,
+    rejected_by INT NULL, rejected_at DATETIME NULL, rejected_reason TEXT,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_cbe_worker (worker_id, status),
+    FOREIGN KEY (worker_id) REFERENCES users(id),
+    FOREIGN KEY (ledger_id) REFERENCES expense_ledgers(id)
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS cashbook_attachments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    expense_id INT NOT NULL,
+    image_path VARCHAR(500) NOT NULL,
+    public_id VARCHAR(255),
+    caption TEXT,
+    uploaded_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_cbatt_expense (expense_id),
+    FOREIGN KEY (expense_id) REFERENCES cashbook_expenses(id) ON DELETE CASCADE
+  )`);
+
+  // approvals.type: APPEND cash book members (backward-compatible ENUM append)
+  await safeAlter(`ALTER TABLE approvals MODIFY COLUMN type ENUM('PROJECT','ITEM','CHALLAN','PO_STATUS','SALE','MAIN_PO','CASHBOOK_ADVANCE','CASHBOOK_EXPENSE') NOT NULL`);
+
+  // Voucher series + default ledgers (INSERT IGNORE — never overwrites)
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cashbook_voucher_prefix', 'CPV')").catch(()=>{});
+  for (const ledgerName of ['Parts', 'Freight/Parcel Expenses', 'Other Specific Details', 'Refreshment Expenses']) {
+    await db.query('INSERT IGNORE INTO expense_ledgers (name, is_default, is_active) VALUES (?,1,1)', [ledgerName]).catch(()=>{});
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // PAYROLL MODULE (Phase 4) — additive only, FULLY SEPARATE from users.
+  // users.hourly_rate and worker_time_logs are never touched.
+  // ══════════════════════════════════════════════════════════════════════════
+  await db.query(`CREATE TABLE IF NOT EXISTS payroll_import_batches (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    imported_by INT NULL,
+    total_rows INT DEFAULT 0,
+    imported_rows INT DEFAULT 0,
+    skipped_rows INT DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS payroll_employees (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    emp_code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    department VARCHAR(150),
+    designation VARCHAR(150),
+    hourly_rate DECIMAL(10,2) DEFAULT 0,
+    overtime_rate DECIMAL(10,2) DEFAULT 0,
+    is_active TINYINT(1) DEFAULT 1,
+    import_batch_id INT NULL,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_pe_active (is_active)
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS payroll_time_entries (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    employee_id INT NOT NULL,
+    project_id INT NULL,
+    proto_code VARCHAR(100) NULL,
+    entry_date DATE NOT NULL,
+    in_time TIME NOT NULL,
+    out_time TIME NOT NULL,
+    total_minutes INT NOT NULL DEFAULT 0,
+    normal_minutes INT NOT NULL DEFAULT 0,
+    ot_minutes INT NOT NULL DEFAULT 0,
+    entered_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_pte_emp_date (employee_id, entry_date),
+    FOREIGN KEY (employee_id) REFERENCES payroll_employees(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
+  )`);
+
+  // Payroll time-window settings (INSERT IGNORE — never overwrites configured values)
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('payroll_normal_start','09:00')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('payroll_normal_end','18:00')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('payroll_ot_start','18:00')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('payroll_ot_end','23:59')").catch(()=>{});
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // QUALITY REPORT MODULE (Phase 5) — additive only.
+  // ══════════════════════════════════════════════════════════════════════════
+  await db.query(`CREATE TABLE IF NOT EXISTS qc_persons (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) UNIQUE NOT NULL,
+    is_active TINYINT(1) DEFAULT 1,
+    created_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS quality_reports (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    report_no VARCHAR(50) UNIQUE NOT NULL,
+    project_id INT NOT NULL,
+    project_item_id INT NULL,
+    client_name VARCHAR(255),
+    vendor_name VARCHAR(255),
+    location VARCHAR(500),
+    qc_person_id INT NULL,
+    inspection_level ENUM('final','white_body') DEFAULT 'final',
+    inspection_date DATE NULL,
+    sku_number VARCHAR(100),
+    status ENUM('draft','assigned','submitted','approved','rejected') DEFAULT 'draft',
+    can_add_sections TINYINT(1) DEFAULT 0,
+    assigned_to INT NULL,
+    submitted_by INT NULL, submitted_at DATETIME NULL,
+    approved_by INT NULL, approved_at DATETIME NULL,
+    rejected_by INT NULL, rejected_at DATETIME NULL, rejected_reason TEXT,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_qr_status (status),
+    INDEX idx_qr_assigned (assigned_to),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_item_id) REFERENCES project_items(id) ON DELETE SET NULL,
+    FOREIGN KEY (qc_person_id) REFERENCES qc_persons(id) ON DELETE SET NULL
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS quality_report_sections (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    report_id INT NOT NULL,
+    section_name VARCHAR(255) NOT NULL,
+    description TEXT,
+    sort_order INT DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_qrs_report (report_id),
+    FOREIGN KEY (report_id) REFERENCES quality_reports(id) ON DELETE CASCADE
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS quality_report_images (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    section_id INT NOT NULL,
+    image_path VARCHAR(500) NOT NULL,
+    public_id VARCHAR(255),
+    caption TEXT,
+    corner_note VARCHAR(255),
+    sort_order INT DEFAULT 0,
+    uploaded_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_qri_section (section_id),
+    FOREIGN KEY (section_id) REFERENCES quality_report_sections(id) ON DELETE CASCADE
+  )`);
+
+  // approvals.type: APPEND QUALITY_REPORT (backward-compatible ENUM append)
+  await safeAlter(`ALTER TABLE approvals MODIFY COLUMN type ENUM('PROJECT','ITEM','CHALLAN','PO_STATUS','SALE','MAIN_PO','CASHBOOK_ADVANCE','CASHBOOK_EXPENSE','QUALITY_REPORT') NOT NULL`);
+
+  // Report series (INSERT IGNORE — never overwrites)
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('qr_prefix','QR')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('qr_start_number','1')").catch(()=>{});
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // CFT MODULE (Phase 6 — Solid Wood Issue Sheet) — additive only.
+  // Formula + 30% offcut are fixed in code (not configurable per Q7).
+  // ══════════════════════════════════════════════════════════════════════════
+  await db.query(`CREATE TABLE IF NOT EXISTS cft_sheets (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sheet_no VARCHAR(50) UNIQUE NOT NULL,
+    project_id INT NOT NULL,
+    project_item_id INT NULL,
+    wood_type VARCHAR(150),
+    remarks TEXT,
+    offcut_percent DECIMAL(5,2) DEFAULT 30.00,
+    total_demand_cft DECIMAL(14,4) DEFAULT 0,
+    offcut_cft DECIMAL(14,4) DEFAULT 0,
+    total_required_cft DECIMAL(14,4) DEFAULT 0,
+    total_issue_cft DECIMAL(14,4) DEFAULT 0,
+    total_return_cft DECIMAL(14,4) DEFAULT 0,
+    difference DECIMAL(14,4) DEFAULT 0,
+    net_difference DECIMAL(14,4) DEFAULT 0,
+    status ENUM('draft','submitted') DEFAULT 'draft',
+    submitted_by INT NULL, submitted_at DATETIME NULL,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_cft_status (status),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_item_id) REFERENCES project_items(id) ON DELETE SET NULL
+  )`);
+
+  await db.query(`CREATE TABLE IF NOT EXISTS cft_rows (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sheet_id INT NOT NULL,
+    row_type ENUM('demand','issue','return') NOT NULL,
+    label VARCHAR(255),
+    length DECIMAL(12,3) DEFAULT 0,
+    width DECIMAL(12,3) DEFAULT 0,
+    thickness DECIMAL(12,3) DEFAULT 0,
+    qty DECIMAL(12,2) DEFAULT 0,
+    gross_cft DECIMAL(14,4) DEFAULT 0,
+    net_cft DECIMAL(14,4) DEFAULT 0,
+    sort_order INT DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_cftrow_sheet (sheet_id, row_type),
+    FOREIGN KEY (sheet_id) REFERENCES cft_sheets(id) ON DELETE CASCADE
+  )`);
+
+  // CFT sheet series (INSERT IGNORE — never overwrites)
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_prefix','CFT')").catch(()=>{});
 
   console.log('✅ Workshop App Database initialized');
   return db;

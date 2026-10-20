@@ -356,6 +356,15 @@ async function rejectRequest(approvalId, adminId, reason = '') {
       [adminId, reason, approvalId]
     );
 
+    // 2.5 ── Type-specific reject hooks (Phase 1: MAIN_PO). Types with no
+    // registered hook are untouched; hook errors can never fail a reject.
+    try {
+      const { runRejectHook } = require('./approvalHooks');
+      await runRejectHook(approval, adminId, reason);
+    } catch (hookErr) {
+      console.warn('Reject hook warning:', hookErr.message);
+    }
+
     // 3. Decrement pending count in approval_queue
     await db.query(
       `UPDATE approval_queue

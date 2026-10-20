@@ -230,6 +230,8 @@ function clearStatusCache() { statusCache = null; statusCacheAt = 0; }
 async function orgAccessGuard(req, res, next) {
   const p = req.path;
   if (p.startsWith('/superadmin') || p.startsWith('/auth') || p.startsWith('/license')) return next();
+  // Public website (moji.org.in) visitors ke liye hamesha open — CMS admin routes guard ke andar hi rehte hain
+  if (p.startsWith('/website/public')) return next();
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return next();
   try {

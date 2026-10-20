@@ -30,7 +30,7 @@ const corsOptions = {
     if (process.env.ALLOW_ALL_ORIGINS === 'true') {
       console.log('⚠️ CORS: Allowing all origins (ALLOW_ALL_ORIGINS=true)');
       callback(null, true);
-    } else if (!origin || allowedOrigins.some(allowed => origin.includes(allowed)) || origin.includes('vercel.app')) {
+    } else if (!origin || allowedOrigins.some(allowed => origin.includes(allowed)) || origin.includes('vercel.app') || origin.includes('moji.org.in')) {
       console.log(`✅ CORS: Allowing origin: ${origin || 'same-origin'}`);
       callback(null, true);
     } else {
@@ -180,10 +180,41 @@ app.use('/api', apiRoutes);
 const approvalRoutes = require('./routes/approvalRoutes');
 app.use('/api', approvalRoutes);
 
+// ── MAIN PO MODULE (Phase 1) — new routes + approval resolver registration ──
+const mainPoRoutes = require('./routes/mainPoRoutes');
+app.use('/api', mainPoRoutes);
+require('./services/mainPoApproval').registerMainPoApproval();
+
+// ── FINISH MODULE (Phase 2) — Paint / Fabric / Metal finish sheets ──
+const finishRoutes = require('./routes/finishRoutes');
+app.use('/api', finishRoutes);
+
+// ── CASH BOOK MODULE (Phase 3) — advances, expenses, ledgers, vouchers ──
+const cashbookRoutes = require('./routes/cashbookRoutes');
+app.use('/api', cashbookRoutes);
+cashbookRoutes.registerCashbookApproval();
+
+// ── PAYROLL MODULE (Phase 4) — employees, time entry, OT, reports ──
+const payrollRoutes = require('./routes/payrollRoutes');
+app.use('/api', payrollRoutes);
+
+// ── QUALITY REPORT MODULE (Phase 5) — dynamic sections, approval, PDF ──
+const qualityRoutes = require('./routes/qualityRoutes');
+app.use('/api', qualityRoutes);
+qualityRoutes.registerQualityApproval();
+
+// ── CFT MODULE (Phase 6) — Solid Wood Issue Sheet, demand/issue/return ──
+const cftRoutes = require('./routes/cftRoutes');
+app.use('/api', cftRoutes);
+
 // ── CLIENT PORTAL ROUTES ──────────────────────────────────────────────────────
 const clientRoutes = require('./routes/clientRoutes');
 app.use('/api', clientRoutes);
 // app.use('/api', backupRoutes);  // BACKUP SYSTEM DISABLED
+
+// ── PUBLIC WEBSITE + CMS ROUTES ───────────────────────────────────────────────
+const websiteRoutes = require('./routes/websiteRoutes');
+app.use('/api/website', websiteRoutes.router);
 
 // Multer error handling middleware
 app.use((err, req, res, next) => {
@@ -243,6 +274,10 @@ initializeDatabase().then(async () => {
   } else {
     console.warn('⚠️ initClientTables not found — skipping client table init');
   }
+
+  // Website CMS tables initialize karo
+  const websiteRoutesModule = require('./routes/websiteRoutes');
+  await websiteRoutesModule.initWebsiteTables().catch(err => console.error('Website tables init error:', err.message));
 
   // ── Approval system self-check (loud warning if misconfigured) ────────────
   await selfCheckApprovalSystem();
