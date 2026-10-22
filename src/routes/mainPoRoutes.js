@@ -22,6 +22,37 @@ function validateHeader(body) {
   return null;
 }
 
+// Manufacturing Order No. is typed by the user. Returns { value } (null = not sent) or { error }.
+function readPoNo(body) {
+  if (body.po_no === undefined || body.po_no === null) return { value: null };
+  const v = String(body.po_no).replace(/\s+/g, ' ').trim();
+  if (!v) return { error: 'Manufacturing Order No. is required' };
+  if (v.length > 50) return { error: 'Manufacturing Order No. can be at most 50 characters' };
+  if (!/^[A-Za-z0-9][A-Za-z0-9 ._\/-]*$/.test(v))
+    return { error: 'Manufacturing Order No. can use letters, numbers, space and - _ / .' };
+  return { value: v };
+}
+
+// Automatic number (only used when a screen sends no number). Typed numbers can
+// make the series land on one that exists, so step forward until it is free.
+async function nextFreeAutoPoNo(db) {
+  let candidate = await generateSeriesNumber(db, {
+    prefixKey: 'main_po_prefix', startKey: 'main_po_start_number',
+    defaultPrefix: 'MPO', table: 'main_pos', column: 'po_no',
+  });
+  for (let i = 0; i < 1000 && await poNoTaken(db, candidate); i++) {
+    candidate = candidate.replace(/(\d+)$/, d => String(Number(d) + 1));
+  }
+  return candidate;
+}
+
+async function poNoTaken(db, poNo, exceptId = null) {
+  const [[row]] = await db.query(
+    `SELECT id FROM main_pos WHERE po_no = ? ${exceptId ? 'AND id <> ?' : ''} LIMIT 1`,
+    exceptId ? [poNo, exceptId] : [poNo]);
+  return !!row;
+}
+
 function normalizeItem(it, idx) {
   return {
     id: it.id || null,
@@ -121,11 +152,13 @@ router.post('/main-pos', auth, adminOrPermission('main_po', 'write'), auditLog('
         return res.status(400).json({ message: 'Every item row needs a Product Name' });
     }
 
+    const manual = readPoNo(req.body);
+    if (manual.error) return res.status(400).json({ message: manual.error });
+    if (manual.value && await poNoTaken(conn, manual.value))
+      return res.status(400).json({ message: `Manufacturing Order No. "${manual.value}" is already used` });
+
     await conn.beginTransaction();
-    const poNo = await generateSeriesNumber(conn, {
-      prefixKey: 'main_po_prefix', startKey: 'main_po_start_number',
-      defaultPrefix: 'MPO', table: 'main_pos', column: 'po_no',
-    });
+    const poNo = manual.value || await nextFreeAutoPoNo(conn);
     const b = req.body;
     const [r] = await conn.query(
       `INSERT INTO main_pos (po_no, project_name, client_name, pmc_name, order_date, timelines, remarks, status, created_by)
@@ -148,6 +181,8 @@ router.post('/main-pos', auth, adminOrPermission('main_po', 'write'), auditLog('
     res.json({ id: poId, po_no: poNo, message: 'Main PO saved as draft' });
   } catch (err) {
     try { await conn.rollback(); } catch (e) { /* noop */ }
+    // Two people saving the same number at once: the unique key catches it
+    if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ message: 'This Manufacturing Order No. is already used' });
     console.error('Main PO create error:', err.message);
     res.status(500).json({ message: err.message });
   } finally {
@@ -172,10 +207,17 @@ router.put('/main-pos/:id', auth, adminOrPermission('main_po', 'edit'), auditLog
     }
 
     const b = req.body;
+    const manual = readPoNo(b);
+    if (manual.error) { await conn.rollback(); return res.status(400).json({ message: manual.error }); }
+    const poNo = manual.value || po.po_no;
+    if (poNo !== po.po_no && await poNoTaken(conn, poNo, po.id)) {
+      await conn.rollback();
+      return res.status(400).json({ message: `Manufacturing Order No. "${poNo}" is already used` });
+    }
     await conn.query(
-      `UPDATE main_pos SET project_name=?, client_name=?, pmc_name=?, order_date=?, timelines=?, remarks=?, updated_by=?
+      `UPDATE main_pos SET po_no=?, project_name=?, client_name=?, pmc_name=?, order_date=?, timelines=?, remarks=?, updated_by=?
        WHERE id=?`,
-      [b.project_name.trim(), b.client_name || null, b.pmc_name || null, b.order_date || null,
+      [poNo, b.project_name.trim(), b.client_name || null, b.pmc_name || null, b.order_date || null,
        b.timelines || null, b.remarks || null, req.user.id, po.id]);
 
     const items = Array.isArray(b.items) ? b.items : [];
@@ -213,6 +255,8 @@ router.put('/main-pos/:id', auth, adminOrPermission('main_po', 'edit'), auditLog
     res.json({ message: 'Main PO updated' });
   } catch (err) {
     try { await conn.rollback(); } catch (e) { /* noop */ }
+    // Two people saving the same number at once: the unique key catches it
+    if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ message: 'This Manufacturing Order No. is already used' });
     console.error('Main PO update error:', err.message);
     res.status(500).json({ message: err.message });
   } finally {
