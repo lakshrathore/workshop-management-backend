@@ -9,6 +9,24 @@ const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0;
 const strOrNull = (v) => { const s = v == null ? '' : String(v).trim(); return s || null; };
 const idOrNull = (v) => { const n = parseInt(v, 10); return Number.isInteger(n) && n > 0 ? n : null; };
 
+// Ticked packing boxes for a challan line → JSON text (null when none). Accepts the
+// array the page sends or the stored JSON text.
+function tickedJson(v) {
+  let list = v;
+  if (typeof list === 'string') { try { list = JSON.parse(list); } catch (e) { list = []; } }
+  if (!Array.isArray(list)) return null;
+  const seen = new Set();
+  const clean = [];
+  for (const b of list) {
+    const id = idOrNull(b && b.id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    clean.push({ id, box_number: String((b && b.box_number) || '').slice(0, 100) });
+    if (clean.length >= 200) break;
+  }
+  return clean.length ? JSON.stringify(clean) : null;
+}
+
 function packingStatus(qty, packed) {
   if (packed <= 0) return 'pending';
   if (packed + 1e-9 >= qty) return 'fully_packed';
@@ -22,10 +40,10 @@ async function insertChallanItem(db, challanId, it, sortOrder) {
   const rate = num(it.rate);
   await db.query(
     `INSERT INTO sale_challan_items
-       (challan_id,item_name,description,quantity,unit,rate,total,sort_order,proto_code,project_item_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+       (challan_id,item_name,description,quantity,unit,rate,total,sort_order,proto_code,project_item_id,ticked_boxes)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     [challanId, it.item_name, it.description || '', qty, it.unit || 'pcs', rate, qty * rate, sortOrder,
-      strOrNull(it.proto_code), idOrNull(it.project_item_id)]
+      strOrNull(it.proto_code), idOrNull(it.project_item_id), tickedJson(it.ticked_boxes)]
   );
 }
 
@@ -104,10 +122,11 @@ async function syncChallanItems(conn, challanId, items) {
     const old = byId.get(id);
     const proto = it.proto_code !== undefined ? strOrNull(it.proto_code) : old.proto_code;
     const pItem = it.project_item_id !== undefined ? idOrNull(it.project_item_id) : old.project_item_id;
+    const ticked = it.ticked_boxes !== undefined ? tickedJson(it.ticked_boxes) : old.ticked_boxes;
     await conn.query(
       `UPDATE sale_challan_items SET item_name=?, description=?, quantity=?, unit=?, rate=?, total=?,
-              sort_order=?, proto_code=?, project_item_id=? WHERE id=?`,
-      [it.item_name, it.description || '', qty, it.unit || 'pcs', rate, qty * rate, i, proto, pItem, id]);
+              sort_order=?, proto_code=?, project_item_id=?, ticked_boxes=? WHERE id=?`,
+      [it.item_name, it.description || '', qty, it.unit || 'pcs', rate, qty * rate, i, proto, pItem, ticked, id]);
   }
 }
 
@@ -215,7 +234,10 @@ async function challanPackingReport(db, q = {}) {
 // may also carry a code. Matching is case-insensitive. With a project given,
 // only that project's boxes are returned, so the same code used on another
 // project never shows up on this challan.
-const normCode = v => String(v || '').trim().toUpperCase();
+// Proto codes are compared loosely: letters + digits only, upper case, without a
+// leading "PROTO" — so PROTO_86005, PROTO-86005, proto 86005 and 86005 are the same.
+const normCode = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^PROTO/, '');
+const sqlNorm = col => `REGEXP_REPLACE(REGEXP_REPLACE(UPPER(COALESCE(${col}, '')), '[^A-Z0-9]', ''), '^PROTO', '')`;
 
 async function boxesByProto(db, codes, projectId = null) {
   const wanted = [...new Set((codes || []).map(normCode).filter(Boolean))].slice(0, 200);
@@ -232,7 +254,7 @@ async function boxesByProto(db, codes, projectId = null) {
   const [boxes] = await db.query(
     `SELECT DISTINCT pb.id, pb.box_number, pb.sub_label, pb.copies, pb.main_item, pb.description, pb.notes,
             pb.created_at, pb.project_id, pb.sale_challan_id,
-            UPPER(TRIM(COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code))) AS box_code,
+            ${sqlNorm("COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code)")} AS box_code,
             p.name AS project_name, p.project_id AS proj_code, pi.item_name,
             u.name AS created_by_name, sc.challan_number AS sale_challan_number,
             (SELECT COUNT(*) FROM packing_box_photos ph WHERE ph.box_id = pb.id) AS photo_count
@@ -242,8 +264,8 @@ async function boxesByProto(db, codes, projectId = null) {
        LEFT JOIN users u ON u.id = pb.created_by
        LEFT JOIN sale_challans sc ON sc.id = pb.sale_challan_id
        LEFT JOIN packing_box_items pbi ON pbi.box_id = pb.id
-      WHERE (UPPER(TRIM(COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code))) IN (?)
-             OR UPPER(TRIM(pbi.proto_code)) IN (?))
+      WHERE (${sqlNorm("COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code)")} IN (?)
+             OR ${sqlNorm('pbi.proto_code')} IN (?))
         ${projectSql}
       ORDER BY pb.box_number, pb.id`, params);
   if (!boxes.length) return out;
@@ -277,7 +299,7 @@ async function boxesByProto(db, codes, projectId = null) {
 }
 
 module.exports = {
-  boxesByProto,
+  boxesByProto, normCode, sqlNorm,
   insertChallanItems, syncChallanItems, challanPackingStatus,
   validateBoxAgainstChallan, challanPackingReport, packingStatus,
 };

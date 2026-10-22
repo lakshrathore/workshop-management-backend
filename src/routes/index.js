@@ -4662,16 +4662,19 @@ router.get('/barcodes/lookup', auth, async (req, res) => {
   try {
     const { code } = req.query;
     if (!code?.trim()) return res.status(400).json({ message: 'Barcode code required' });
-    const [items] = await db.query(`
-      SELECT
+    const cols = `
         pi.id, pi.item_name, pi.proto_code, pi.quantity, pi.unit,
         pi.unit_price, pi.description, pi.dimensions,
         p.id as project_id, p.name as project_name, p.project_id as proj_code, p.client_name
       FROM project_items pi
-      JOIN projects p ON p.id = pi.project_id
-      WHERE pi.proto_code = ? AND p.status != 'deleted'
-      LIMIT 5
-    `, [code.trim()]);
+      JOIN projects p ON p.id = pi.project_id`;
+    let [items] = await db.query(`SELECT ${cols} WHERE pi.proto_code = ? AND p.status != 'deleted' LIMIT 5`, [code.trim()]);
+    // Fallback: loose match, so "86005" finds PROTO_86005 (and the other way round)
+    const loose = challanPacking.normCode(code);
+    if (!items.length && loose) {
+      [items] = await db.query(
+        `SELECT ${cols} WHERE ${challanPacking.sqlNorm('pi.proto_code')} = ? AND p.status != 'deleted' LIMIT 5`, [loose]);
+    }
     if (!items.length) return res.status(404).json({ message: `No item found for barcode: ${code}` });
     res.json(items);
   } catch (err) {

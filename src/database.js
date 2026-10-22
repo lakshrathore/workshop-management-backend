@@ -335,7 +335,9 @@ async function initializeDatabase() {
     );
 
     if (!rows || rows.length === 0) {
-      await db.query(`ALTER TABLE \`${table}\` ADD COLUMN ${definition}`);
+      // Another instance starting at the same moment may add it first — that's fine
+      await db.query(`ALTER TABLE \`${table}\` ADD COLUMN ${definition}`)
+        .catch(err => { if (err.code !== 'ER_DUP_FIELDNAME') throw err; });
     }
   };
 
@@ -598,6 +600,8 @@ async function initializeDatabase() {
   // Proto Code + source project item on each challan line
   await ensureColumn('sale_challan_items', 'proto_code', 'proto_code VARCHAR(100) NULL');
   await ensureColumn('sale_challan_items', 'project_item_id', 'project_item_id INT NULL');
+  // Packing boxes ticked for this line in the Box Details popup: JSON [{id, box_number}]
+  await ensureColumn('sale_challan_items', 'ticked_boxes', 'ticked_boxes TEXT NULL');
   // A packing box can be created from a challan; each content line can point at a challan line
   await ensureColumn('packing_boxes', 'sale_challan_id', 'sale_challan_id INT NULL');
   await ensureColumn('packing_boxes', 'request_key', 'request_key VARCHAR(64) NULL');
