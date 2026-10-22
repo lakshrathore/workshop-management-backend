@@ -10,7 +10,9 @@ const strOrNull = (v) => { const s = v == null ? '' : String(v).trim(); return s
 const idOrNull = (v) => { const n = parseInt(v, 10); return Number.isInteger(n) && n > 0 ? n : null; };
 
 // Ticked packing boxes for a challan line → JSON text (null when none). Accepts the
-// array the page sends or the stored JSON text.
+// array the page sends or the stored JSON text. A box printed with label copies
+// (MJ-10-A, MJ-10-B) is one physical box per label, so a tick may carry `label`.
+// A tick without a label means the whole box (all its labels).
 function tickedJson(v) {
   let list = v;
   if (typeof list === 'string') { try { list = JSON.parse(list); } catch (e) { list = []; } }
@@ -19,12 +21,22 @@ function tickedJson(v) {
   const clean = [];
   for (const b of list) {
     const id = idOrNull(b && b.id);
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    clean.push({ id, box_number: String((b && b.box_number) || '').slice(0, 100) });
-    if (clean.length >= 200) break;
+    const label = String((b && b.label) || '').trim().slice(0, 100);
+    if (!id || seen.has(`${id}|${label}`)) continue;
+    seen.add(`${id}|${label}`);
+    const t = { id, box_number: String((b && b.box_number) || '').slice(0, 100) };
+    if (label) t.label = label;
+    clean.push(t);
+    if (clean.length >= 500) break;
   }
   return clean.length ? JSON.stringify(clean) : null;
+}
+
+// Label names of a box: copies > 1 → BOX-A, BOX-B, …; otherwise just the box number
+const SUBS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+function boxLabels(boxNumber, copies) {
+  const n = Math.max(1, Math.min(26, parseInt(copies, 10) || 1));
+  return n > 1 ? Array.from({ length: n }, (_, i) => `${boxNumber}-${SUBS[i]}`) : [boxNumber];
 }
 
 function packingStatus(qty, packed) {
@@ -343,18 +355,19 @@ async function packingDispatchReport(db, q = {}) {
     if (!Array.isArray(list)) continue;
     for (const t of list) {
       const id = idOrNull(t && t.id);
-      if (id) ticks.push({ ...r, ticked_boxes: undefined, box_id: id });
+      if (id) ticks.push({ ...r, ticked_boxes: undefined, box_id: id, label: String((t && t.label) || '').trim() });
     }
   }
   const [made] = await db.query(
     `SELECT pb.id AS box_id, sc.id AS challan_id, sc.challan_number, sc.challan_date, sc.client_name, sc.vehicle_number, sc.vehicle_length, sc.transport_name
        FROM packing_boxes pb JOIN sale_challans sc ON sc.id = pb.sale_challan_id
       WHERE sc.status <> 'cancelled'`);
-  const usage = new Map();   // box_id → [{challan_id, challan_number, challan_date}]
-  for (const u of [...ticks, ...made]) {
+  // box_id → [{challan…, label}] ; label '' = the whole box (all its labels)
+  const usage = new Map();
+  for (const u of [...ticks, ...made.map(m => ({ ...m, label: '' }))]) {
     if (!usage.has(u.box_id)) usage.set(u.box_id, []);
     const list = usage.get(u.box_id);
-    if (!list.some(x => x.challan_id === u.challan_id)) list.push(u);
+    if (!list.some(x => x.challan_id === u.challan_id && x.label === (u.label || ''))) list.push({ ...u, label: u.label || '' });
   }
 
   // 3. Challan quantity per project + code (non-cancelled challans)
@@ -370,12 +383,12 @@ async function packingDispatchReport(db, q = {}) {
   const challanFilter = String(q.challan || '').trim().toLowerCase();
   const search = String(q.item || '').trim().toLowerCase();
   const searchKey = normCode(q.item);
-  let boxRows = boxes.map(b => {
-    const used = usage.get(b.id) || [];
-    const copies = Math.max(1, Math.min(26, parseInt(b.copies, 10) || 1));
+  // Each label of a box (MJ-10-A, MJ-10-B) is one physical box → one row each
+  let boxRows = boxes.flatMap(b => boxLabels(b.box_number, b.copies).map((label, li, all) => ({ b, label, multi: all.length > 1 }))).map(({ b, label, multi }) => {
+    const used = (usage.get(b.id) || []).filter(u => !u.label || u.label === label || (!multi && u.label === b.box_number));
     const contents = lines.get(b.id) || [];
     return {
-      id: b.id, box_number: b.box_number, sub_label: b.sub_label, labels: copies,
+      id: b.id, unit_key: `${b.id}|${label}`, box_number: label, parent_box_number: multi ? b.box_number : '', sub_label: b.sub_label, labels: 1,
       project_id: b.project_id, project_name: b.project_name || '', proj_code: b.proj_code || '',
       // No main item / project item: name the box after its first content line
       proto_code: b.proto_code || '', code_key: b.code_key || '', main_item: b.main_item || b.item_name || (contents[0] && contents[0].item_name) || '',
@@ -447,7 +460,7 @@ async function packingDispatchReport(db, q = {}) {
       if (c.transport_name) v.transports.add(c.transport_name);
       if (!v.challans.has(c.id)) v.challans.set(c.id, { id: c.id, challan_number: c.challan_number, challan_date: c.challan_date, client_name: c.client_name, boxes: 0 });
       v.challans.get(c.id).boxes += 1;
-      if (!v.boxes.has(b.id)) { v.boxes.add(b.id); v.labels += b.labels; }
+      if (!v.boxes.has(b.unit_key)) { v.boxes.add(b.unit_key); v.labels += b.labels; }
       const itemKey = b.code_key || b.main_item;
       if (itemKey && !v.items.has(itemKey)) v.items.set(itemKey, [b.proto_code, b.main_item].filter(Boolean).join(' · '));
       const pj = [b.proj_code, b.project_name].filter(Boolean).join(' — ');
@@ -478,7 +491,7 @@ async function packingDispatchReport(db, q = {}) {
 }
 
 module.exports = {
-  packingDispatchReport,
+  packingDispatchReport, boxLabels,
   boxesByProto, normCode, sqlNorm,
   insertChallanItems, syncChallanItems, challanPackingStatus,
   validateBoxAgainstChallan, challanPackingReport, packingStatus,
