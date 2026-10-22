@@ -143,11 +143,43 @@ function canWorkerTouch(report, user) {
 }
 
 // ══ QC PERSONS (small master) ════════════════════════════════════════════════
+// Active workers in a "Quality…" / "QC" department are QC persons automatically.
+// Make sure each one has a qc_persons row (reports store qc_persons.id) and return their user ids.
+async function syncQcWorkers(db) {
+  const [workers] = await db.query(
+    `SELECT DISTINCT u.id, u.name, u.username FROM users u
+       JOIN worker_departments wd ON wd.worker_id = u.id
+       JOIN departments d ON d.id = wd.department_id
+      WHERE u.is_active = 1 AND (LOWER(d.name) LIKE '%quality%' OR LOWER(d.name) IN ('qc', 'q.c', 'q c'))`);
+  for (const w of workers) {
+    const [[linked]] = await db.query('SELECT id FROM qc_persons WHERE user_id=? LIMIT 1', [w.id]);
+    if (linked) {
+      await db.query('UPDATE qc_persons SET is_active=1 WHERE id=?', [linked.id]);
+      continue;
+    }
+    // Reuse a hand-added entry with the same name, otherwise create one
+    const [[byName]] = await db.query('SELECT id FROM qc_persons WHERE name=? AND user_id IS NULL LIMIT 1', [w.name]);
+    if (byName) { await db.query('UPDATE qc_persons SET user_id=?, is_active=1 WHERE id=?', [w.id, byName.id]); continue; }
+    try {
+      await db.query('INSERT INTO qc_persons (name, is_active, user_id) VALUES (?,1,?)', [w.name, w.id]);
+    } catch (err) {
+      if (err.code !== 'ER_DUP_ENTRY') throw err;
+      await db.query('INSERT IGNORE INTO qc_persons (name, is_active, user_id) VALUES (?,1,?)', [`${w.name} (@${w.username})`, w.id]);
+    }
+  }
+  return workers.map(w => w.id);
+}
+
 router.get('/quality/qc-persons', auth, adminOrPermission('quality_report', 'read'), async (req, res) => {
   const db = await getPool();
   try {
+    const qcWorkerIds = await syncQcWorkers(db);
+    const where = [];
+    if (req.query.all !== '1') where.push('is_active=1');
+    // Hand-added names always show; worker-linked names only while the worker is in a QC department
+    where.push(qcWorkerIds.length ? `(user_id IS NULL OR user_id IN (${qcWorkerIds.map(() => '?').join(',')}))` : 'user_id IS NULL');
     const [rows] = await db.query(
-      `SELECT * FROM qc_persons ${req.query.all === '1' ? '' : 'WHERE is_active=1'} ORDER BY name`);
+      `SELECT * FROM qc_persons WHERE ${where.join(' AND ')} ORDER BY name`, qcWorkerIds);
     res.json(rows);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });

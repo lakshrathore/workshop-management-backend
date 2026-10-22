@@ -1088,6 +1088,8 @@ async function initializeDatabase() {
 
   // QC inspection form (printed page 2) — additive, all nullable. NULL = not
   // entered yet, so the print never shows invented values.
+  // Links a QC person to a worker in the Quality Check department (NULL = added by hand)
+  await ensureColumn('qc_persons', 'user_id', 'user_id INT NULL');
   await ensureColumn('quality_reports', 'mo_number', 'mo_number VARCHAR(100) NULL');
   await ensureColumn('quality_reports', 'drawing_revision', 'drawing_revision VARCHAR(150) NULL');
   await ensureColumn('quality_reports', 'finish_code', 'finish_code VARCHAR(255) NULL');
