@@ -298,7 +298,187 @@ async function boxesByProto(db, codes, projectId = null) {
   return out;
 }
 
+// ── Packing → Sale Challan report (new workflow) ──────────────────────────
+// Packing comes first. A box is "used" once a challan line has it ticked in Box
+// Details (or it was made from a challan, older workflow). Cancelled challans
+// don't count. Items = boxes grouped by project + loose proto code.
+const ITEM_STATUS = { pending: 'pending', partial: 'partial', full: 'full' };
+
+async function packingDispatchReport(db, q = {}) {
+  // 1. Boxes (filtered by packing date / project / search)
+  const where = ['1=1'];
+  const params = [];
+  if (q.date_from) { where.push('DATE(pb.created_at) >= ?'); params.push(q.date_from); }
+  if (q.date_to) { where.push('DATE(pb.created_at) <= ?'); params.push(q.date_to); }
+  if (q.project_id) { where.push('COALESCE(pb.project_id, pi.project_id) = ?'); params.push(q.project_id); }
+  const [boxes] = await db.query(
+    `SELECT pb.id, pb.box_number, pb.sub_label, pb.copies, pb.main_item, pb.created_at, pb.sale_challan_id,
+            COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code) AS proto_code,
+            ${sqlNorm("COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code)")} AS code_key,
+            COALESCE(pb.project_id, pi.project_id) AS project_id,
+            p.name AS project_name, p.project_id AS proj_code, pi.item_name
+       FROM packing_boxes pb
+       LEFT JOIN project_items pi ON pi.id = pb.project_item_id
+       LEFT JOIN projects p ON p.id = COALESCE(pb.project_id, pi.project_id)
+      WHERE ${where.join(' AND ')}
+      ORDER BY pb.created_at DESC, pb.id DESC`, params);
+
+  const boxIds = boxes.map(b => b.id);
+  const lines = new Map();
+  if (boxIds.length) {
+    const [rows] = await db.query(
+      'SELECT box_id, item_name, quantity, unit FROM packing_box_items WHERE box_id IN (?) ORDER BY box_id, id', [boxIds]);
+    rows.forEach(r => { if (!lines.has(r.box_id)) lines.set(r.box_id, []); lines.get(r.box_id).push(r); });
+  }
+
+  // 2. Where each box is used: ticks on challan lines + boxes made from a challan
+  const [tickRows] = await db.query(
+    `SELECT sci.ticked_boxes, sc.id AS challan_id, sc.challan_number, sc.challan_date, sc.client_name, sc.vehicle_number, sc.vehicle_length, sc.transport_name
+       FROM sale_challan_items sci JOIN sale_challans sc ON sc.id = sci.challan_id
+      WHERE sci.ticked_boxes IS NOT NULL AND sc.status <> 'cancelled'`);
+  const ticks = [];
+  for (const r of tickRows) {
+    let list = [];
+    try { list = JSON.parse(r.ticked_boxes); } catch (e) { list = []; }   // a bad value only skips that line
+    if (!Array.isArray(list)) continue;
+    for (const t of list) {
+      const id = idOrNull(t && t.id);
+      if (id) ticks.push({ ...r, ticked_boxes: undefined, box_id: id });
+    }
+  }
+  const [made] = await db.query(
+    `SELECT pb.id AS box_id, sc.id AS challan_id, sc.challan_number, sc.challan_date, sc.client_name, sc.vehicle_number, sc.vehicle_length, sc.transport_name
+       FROM packing_boxes pb JOIN sale_challans sc ON sc.id = pb.sale_challan_id
+      WHERE sc.status <> 'cancelled'`);
+  const usage = new Map();   // box_id → [{challan_id, challan_number, challan_date}]
+  for (const u of [...ticks, ...made]) {
+    if (!usage.has(u.box_id)) usage.set(u.box_id, []);
+    const list = usage.get(u.box_id);
+    if (!list.some(x => x.challan_id === u.challan_id)) list.push(u);
+  }
+
+  // 3. Challan quantity per project + code (non-cancelled challans)
+  const [clines] = await db.query(
+    `SELECT sc.project_id, ${sqlNorm('sci.proto_code')} AS code_key, SUM(sci.quantity) AS qty,
+            GROUP_CONCAT(DISTINCT sc.challan_number ORDER BY sc.challan_number SEPARATOR ', ') AS challans
+       FROM sale_challan_items sci JOIN sale_challans sc ON sc.id = sci.challan_id
+      WHERE sc.status <> 'cancelled' AND sci.proto_code IS NOT NULL AND sci.proto_code <> ''
+      GROUP BY sc.project_id, code_key`);
+  const challanQty = new Map(clines.map(r => [`${r.project_id || ''}|${r.code_key}`, r]));
+
+  // 4. Per box rows
+  const challanFilter = String(q.challan || '').trim().toLowerCase();
+  const search = String(q.item || '').trim().toLowerCase();
+  const searchKey = normCode(q.item);
+  let boxRows = boxes.map(b => {
+    const used = usage.get(b.id) || [];
+    const copies = Math.max(1, Math.min(26, parseInt(b.copies, 10) || 1));
+    const contents = lines.get(b.id) || [];
+    return {
+      id: b.id, box_number: b.box_number, sub_label: b.sub_label, labels: copies,
+      project_id: b.project_id, project_name: b.project_name || '', proj_code: b.proj_code || '',
+      // No main item / project item: name the box after its first content line
+      proto_code: b.proto_code || '', code_key: b.code_key || '', main_item: b.main_item || b.item_name || (contents[0] && contents[0].item_name) || '',
+      item_real: b.main_item || b.item_name || '',   // a real item name (not taken from contents)
+      contents: contents.map(l => ({ item_name: l.item_name, quantity: Number(l.quantity) || 0, unit: l.unit })),
+      packed_at: b.created_at,
+      status: used.length ? 'used' : 'pending',
+      challans: used.map(u => ({ id: u.challan_id, challan_number: u.challan_number, challan_date: u.challan_date, client_name: u.client_name || '',
+        vehicle_number: u.vehicle_number || '', vehicle_length: u.vehicle_length || '', transport_name: u.transport_name || '' })),
+    };
+  });
+  if (search) {
+    boxRows = boxRows.filter(b => (searchKey && b.code_key.includes(searchKey))
+      || `${b.box_number} ${b.main_item} ${b.proto_code} ${b.contents.map(c => c.item_name).join(' ')}`.toLowerCase().includes(search));
+  }
+  if (challanFilter) boxRows = boxRows.filter(b => b.challans.some(c => String(c.challan_number).toLowerCase().includes(challanFilter)));
+  // Vehicle filter: spaces / hyphens / case ignored (RJ14GA1234 = RJ-14-GA-1234)
+  const vKey = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const vehicleFilter = vKey(q.vehicle);
+  if (vehicleFilter) boxRows = boxRows.filter(b => b.challans.some(c => vKey(c.vehicle_number).includes(vehicleFilter)));
+
+  // 5. Items: group boxes by project + code
+  const groups = new Map();
+  for (const b of boxRows) {
+    const key = `${b.project_id || ''}|${b.code_key || `#box${b.id}`}`;
+    if (!groups.has(key)) {
+      groups.set(key, { key, project_id: b.project_id, project_name: b.project_name, proj_code: b.proj_code,
+        proto_code: b.proto_code, code_key: b.code_key, item_name: b.item_real || b.main_item, has_real: !!b.item_real, boxes: 0, labels: 0,
+        used_boxes: 0, used_labels: 0, box_numbers: [], challans: new Set() });
+    }
+    const g = groups.get(key);
+    g.boxes += 1; g.labels += b.labels; g.box_numbers.push(b.box_number);
+    // Prefer a real item name from any box in the group over one taken from contents
+    if (b.item_real && !g.has_real) { g.item_name = b.item_real; g.has_real = true; }
+    else if (!g.item_name && b.main_item) g.item_name = b.main_item;
+    if (b.status === 'used') { g.used_boxes += 1; g.used_labels += b.labels; b.challans.forEach(c => g.challans.add(c.challan_number)); }
+  }
+  const itemRows = [...groups.values()].map(g => {
+    const cq = g.code_key ? challanQty.get(`${g.project_id || ''}|${g.code_key}`) : null;
+    const status = g.used_boxes === 0 ? ITEM_STATUS.pending : g.used_boxes >= g.boxes ? ITEM_STATUS.full : ITEM_STATUS.partial;
+    return { ...g, challans: [...g.challans].sort(), pending_boxes: g.boxes - g.used_boxes, pending_labels: g.labels - g.used_labels,
+      challan_qty: cq ? Number(cq.qty) || 0 : 0, status };
+  }).sort((a, b) => (a.code_key ? 0 : 1) - (b.code_key ? 0 : 1)   // items with a Proto Code first
+    || `${a.proj_code}|${a.proto_code}`.localeCompare(`${b.proj_code}|${b.proto_code}`));
+
+  // 6. Status filter applies to the matching view (box: used/pending, item: pending/partial/full)
+  const st = q.status || '';
+  const boxesOut = ['used', 'pending'].includes(st) ? boxRows.filter(b => b.status === st)
+    : ['partial', 'full'].includes(st) ? boxRows.filter(b => itemRows.find(i => i.status === st && i.key === `${b.project_id || ''}|${b.code_key || `#box${b.id}`}`))
+    : boxRows;
+  const itemsOut = ['pending', 'partial', 'full'].includes(st) ? itemRows.filter(i => i.status === st)
+    : st === 'used' ? itemRows.filter(i => i.used_boxes > 0)
+    : itemRows;
+
+  // Vehicles: challans (with boxes from this report) grouped by vehicle number
+  const vehicles = new Map();
+  for (const b of boxesOut) {
+    for (const c of b.challans) {
+      if (vehicleFilter && !vKey(c.vehicle_number).includes(vehicleFilter)) continue;
+      const key = vKey(c.vehicle_number) || '__none';
+      if (!vehicles.has(key)) {
+        vehicles.set(key, { key, vehicle_number: '', lengths: new Set(), transports: new Set(),
+          challans: new Map(), boxes: new Set(), labels: 0, items: new Map(), projects: new Set() });
+      }
+      const v = vehicles.get(key);
+      // Show the fullest spelling seen (RJ-14-GA-1234 rather than rj14ga1234), in capitals
+      if (String(c.vehicle_number || '').trim().length > v.vehicle_number.length) v.vehicle_number = String(c.vehicle_number).trim();
+      if (c.vehicle_length) v.lengths.add(c.vehicle_length);
+      if (c.transport_name) v.transports.add(c.transport_name);
+      if (!v.challans.has(c.id)) v.challans.set(c.id, { id: c.id, challan_number: c.challan_number, challan_date: c.challan_date, client_name: c.client_name, boxes: 0 });
+      v.challans.get(c.id).boxes += 1;
+      if (!v.boxes.has(b.id)) { v.boxes.add(b.id); v.labels += b.labels; }
+      const itemKey = b.code_key || b.main_item;
+      if (itemKey && !v.items.has(itemKey)) v.items.set(itemKey, [b.proto_code, b.main_item].filter(Boolean).join(' · '));
+      const pj = [b.proj_code, b.project_name].filter(Boolean).join(' — ');
+      if (pj) v.projects.add(pj);
+    }
+  }
+  const vehicleRows = [...vehicles.values()].map(v => ({
+    key: v.key, vehicle_number: v.vehicle_number.toUpperCase(), vehicle_lengths: [...v.lengths], transports: [...v.transports],
+    challans: [...v.challans.values()].sort((a, b) => String(b.challan_date).localeCompare(String(a.challan_date))),
+    trips: v.challans.size, boxes: v.boxes.size, labels: v.labels, items: [...v.items.values()], projects: [...v.projects],
+  })).sort((a, b) => (a.key === '__none') - (b.key === '__none') || b.boxes - a.boxes);
+
+  const summary = {
+    vehicles: vehicleRows.filter(v => v.key !== '__none').length,
+    boxes: boxRows.length,
+    used_boxes: boxRows.filter(b => b.status === 'used').length,
+    labels: boxRows.reduce((s, b) => s + b.labels, 0),
+    used_labels: boxRows.filter(b => b.status === 'used').reduce((s, b) => s + b.labels, 0),
+    items: itemRows.length,
+    items_full: itemRows.filter(i => i.status === 'full').length,
+    items_partial: itemRows.filter(i => i.status === 'partial').length,
+    items_pending: itemRows.filter(i => i.status === 'pending').length,
+    challans: new Set(boxRows.flatMap(b => b.challans.map(c => c.id))).size,
+  };
+  summary.pending_boxes = summary.boxes - summary.used_boxes;
+  summary.pending_labels = summary.labels - summary.used_labels;
+  return { summary, items: itemsOut, boxes: boxesOut, vehicles: vehicleRows };
+}
+
 module.exports = {
+  packingDispatchReport,
   boxesByProto, normCode, sqlNorm,
   insertChallanItems, syncChallanItems, challanPackingStatus,
   validateBoxAgainstChallan, challanPackingReport, packingStatus,

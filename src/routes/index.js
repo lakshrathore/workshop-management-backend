@@ -4382,7 +4382,8 @@ router.delete('/packing/boxes/:id', auth, auditLog('DELETE','PackingBox'), async
 router.get('/packing/challan-report', auth, adminOrPermission('packing', 'read'), async (req, res) => {
   const db = await getPool();
   try {
-    res.json(await challanPacking.challanPackingReport(db, req.query));
+    // Packing → Sale Challan: boxes used (ticked on a challan) vs pending, per item and per box
+    res.json(await challanPacking.packingDispatchReport(db, req.query));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
