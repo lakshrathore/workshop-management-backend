@@ -209,7 +209,75 @@ async function challanPackingReport(db, q = {}) {
   return { rows: out, summary };
 }
 
+// ── Packing boxes by Proto Code (Sale Challan row "Box Details") ──────────
+// Packing is made before the challan; this only reads it. A box's proto code is
+// its own Proto Code field, else its linked project item's code; content lines
+// may also carry a code. Matching is case-insensitive. With a project given,
+// only that project's boxes are returned, so the same code used on another
+// project never shows up on this challan.
+const normCode = v => String(v || '').trim().toUpperCase();
+
+async function boxesByProto(db, codes, projectId = null) {
+  const wanted = [...new Set((codes || []).map(normCode).filter(Boolean))].slice(0, 200);
+  const out = {};
+  wanted.forEach(c => { out[c] = []; });
+  if (!wanted.length) return out;
+
+  const params = [wanted, wanted];
+  let projectSql = '';
+  if (projectId) {
+    projectSql = 'AND (pb.project_id = ? OR (pb.project_id IS NULL AND pi.project_id = ?))';
+    params.push(projectId, projectId);
+  }
+  const [boxes] = await db.query(
+    `SELECT DISTINCT pb.id, pb.box_number, pb.sub_label, pb.copies, pb.main_item, pb.description, pb.notes,
+            pb.created_at, pb.project_id, pb.sale_challan_id,
+            UPPER(TRIM(COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code))) AS box_code,
+            p.name AS project_name, p.project_id AS proj_code, pi.item_name,
+            u.name AS created_by_name, sc.challan_number AS sale_challan_number,
+            (SELECT COUNT(*) FROM packing_box_photos ph WHERE ph.box_id = pb.id) AS photo_count
+       FROM packing_boxes pb
+       LEFT JOIN project_items pi ON pi.id = pb.project_item_id
+       LEFT JOIN projects p ON p.id = COALESCE(pb.project_id, pi.project_id)
+       LEFT JOIN users u ON u.id = pb.created_by
+       LEFT JOIN sale_challans sc ON sc.id = pb.sale_challan_id
+       LEFT JOIN packing_box_items pbi ON pbi.box_id = pb.id
+      WHERE (UPPER(TRIM(COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code))) IN (?)
+             OR UPPER(TRIM(pbi.proto_code)) IN (?))
+        ${projectSql}
+      ORDER BY pb.box_number, pb.id`, params);
+  if (!boxes.length) return out;
+
+  const [lines] = await db.query(
+    'SELECT box_id, item_name, quantity, unit, proto_code FROM packing_box_items WHERE box_id IN (?) ORDER BY box_id, id',
+    [boxes.map(b => b.id)]);
+  const linesByBox = new Map();
+  lines.forEach(l => { if (!linesByBox.has(l.box_id)) linesByBox.set(l.box_id, []); linesByBox.get(l.box_id).push(l); });
+
+  for (const b of boxes) {
+    const items = linesByBox.get(b.id) || [];
+    const copies = Math.max(1, Math.min(26, parseInt(b.copies, 10) || 1));
+    const labels = copies > 1 ? Array.from({ length: copies }, (_, i) => `${b.box_number}-${'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[i]}`) : [];
+    // A box goes under every requested code it matches: its own code or a content line's code
+    const codesHere = new Set([b.box_code, ...items.map(l => normCode(l.proto_code))].filter(c => wanted.includes(c)));
+    for (const c of codesHere) {
+      // Box matched by its own code: show all contents. Matched only through a
+      // content line: show just the lines for this code.
+      const shown = b.box_code === c ? items : items.filter(l => normCode(l.proto_code) === c);
+      out[c].push({
+        id: b.id, box_number: b.box_number, sub_label: b.sub_label, labels, main_item: b.main_item || b.item_name || '',
+        description: b.description || '', notes: b.notes || '', project_name: b.project_name || '', proj_code: b.proj_code || '',
+        created_by_name: b.created_by_name || '', created_at: b.created_at, photo_count: Number(b.photo_count) || 0,
+        sale_challan_number: b.sale_challan_number || '', items: shown,
+        total_qty: shown.reduce((s, l) => s + (Number(l.quantity) || 0), 0),
+      });
+    }
+  }
+  return out;
+}
+
 module.exports = {
+  boxesByProto,
   insertChallanItems, syncChallanItems, challanPackingStatus,
   validateBoxAgainstChallan, challanPackingReport, packingStatus,
 };

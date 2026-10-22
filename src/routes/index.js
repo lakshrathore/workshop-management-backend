@@ -5016,6 +5016,23 @@ router.put('/sale-challans/:id', auth, adminOrPermission('sale_challans','edit')
   } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
 });
 
+// GET existing packing boxes for Sale Challan rows, by Proto Code
+// ?codes=A,B,C&project_id=12  →  { "A": [boxes], "B": [], ... }
+router.get('/packing/boxes-by-proto', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    if (req.user.role !== 'admin') {
+      const [perms] = await db.query(
+        `SELECT 1 FROM worker_permissions WHERE worker_id=? AND menu_key IN ('sale_challans','packing')
+            AND (can_read=1 OR can_write=1) LIMIT 1`, [req.user.id]);
+      if (!perms.length) return res.status(403).json({ message: 'Access denied' });
+    }
+    const codes = String(req.query.codes || '').split(',');
+    const projectId = parseInt(req.query.project_id, 10) || null;
+    res.json(await challanPacking.boxesByProto(db, codes, projectId));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // GET packed vs challan quantity for one challan (drives the "create packing?" prompt)
 router.get('/sale-challans/:id/packing-status', auth, async (req, res) => {
   const db = await getPool();
