@@ -46,7 +46,10 @@ const QC_CHECKLIST = [
 const CHECK_RESULTS = ['pass', 'fail', 'na'];
 const INSPECTION_RESULTS = ['approved', 'rework', 'rejected'];
 
-// Template + saved results → [{key,label,criteria,result|null}]. Unanswered stays null
+// Optional short note per checklist row (prints in the Remarks column)
+const cleanRemark = v => (v == null ? '' : String(v).replace(/\s+/g, ' ').trim().slice(0, 200));
+
+// Template + saved results → [{key,label,criteria,result|null,remark}]. Unanswered stays null
 // (never defaulted to pass). Saved keys no longer in the template are kept.
 function mergeChecklist(json) {
   let saved = [];
@@ -56,12 +59,12 @@ function mergeChecklist(json) {
   const rows = QC_CHECKLIST.map(t => {
     const s = byKey.get(t.key);
     return { ...t, label: s?.label || t.label, criteria: s?.criteria || t.criteria,
-             result: CHECK_RESULTS.includes(s?.result) ? s.result : null };
+             result: CHECK_RESULTS.includes(s?.result) ? s.result : null, remark: cleanRemark(s?.remark) };
   });
   for (const s of saved) {
     if (s?.key && !QC_CHECKLIST.some(t => t.key === s.key))
       rows.push({ key: s.key, label: s.label || s.key, criteria: s.criteria || '',
-                  result: CHECK_RESULTS.includes(s.result) ? s.result : null });
+                  result: CHECK_RESULTS.includes(s.result) ? s.result : null, remark: cleanRemark(s.remark) });
   }
   return rows;
 }
@@ -442,8 +445,8 @@ router.put('/quality/reports/:id/inspection', auth, adminOrPermission('quality_r
           return res.status(400).json({ message: `Invalid checklist result "${it.result}"` });
       }
       // Snapshot label/criteria with each result (template rows merged in by key)
-      const checklist = mergeChecklist(JSON.stringify(items.map(it => ({ key: it?.key, result: it?.result || null }))))
-        .map(({ key, label, criteria, result }) => ({ key, label, criteria, result }));
+      const checklist = mergeChecklist(JSON.stringify(items.map(it => ({ key: it?.key, result: it?.result || null, remark: it?.remark }))))
+        .map(({ key, label, criteria, result, remark }) => ({ key, label, criteria, result, remark }));
       if (b.signoff_date && !/^\d{4}-\d{2}-\d{2}$/.test(b.signoff_date))
         return res.status(400).json({ message: 'Invalid sign-off date' });
 
