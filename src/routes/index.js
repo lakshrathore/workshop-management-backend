@@ -4947,6 +4947,8 @@ router.post('/sale-challans', auth, adminOrPermission('sale_challans','write'), 
     if (!client_name?.trim()) return res.status(400).json({ message: 'Client name required' });
     if (!items?.length) return res.status(400).json({ message: 'Please add at least one item' });
 
+    // A packing box can be on one challan only
+    await challanPacking.validateTicks(db, items);
     const cType = challan_type || 'delivery';
     const challanMode = await getNumberingMode(db, cType);
     let challan_number;
@@ -4977,7 +4979,7 @@ router.post('/sale-challans', auth, adminOrPermission('sale_challans','write'), 
     const challanId = r.insertId;
     await challanPacking.insertChallanItems(db, challanId, items);
     res.json({ id: challanId, challan_number, message: 'Sale Challan created successfully' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
 });
 
 // PUT update challan
@@ -5013,6 +5015,7 @@ router.put('/sale-challans/:id', auth, adminOrPermission('sale_challans','edit')
           transport_name||'', vehicle_number||'', req.body.vehicle_length === undefined ? null : String(req.body.vehicle_length || '').trim().slice(0, 50), notes||'',
           req.body.cgst||null, req.body.sgst||null, req.body.igst||null, cpo_id||null, req.params.id]
       );
+      await challanPacking.validateTicks(conn, items, Number(req.params.id));
       await challanPacking.syncChallanItems(conn, Number(req.params.id), items);
       await conn.commit();
     } catch (e) { await conn.rollback().catch(() => {}); throw e; }
@@ -5034,7 +5037,8 @@ router.get('/packing/boxes-by-proto', auth, async (req, res) => {
     }
     const codes = String(req.query.codes || '').split(',');
     const projectId = parseInt(req.query.project_id, 10) || null;
-    res.json(await challanPacking.boxesByProto(db, codes, projectId));
+    const exceptChallan = parseInt(req.query.challan_id, 10) || null;   // the challan being edited
+    res.json(await challanPacking.boxesByProto(db, codes, projectId, exceptChallan));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -5059,9 +5063,15 @@ router.patch('/sale-challans/:id/status', auth, adminOrPermission('sale_challans
   const db = await getPool();
   try {
     const { status } = req.body;
+    // Re-opening a cancelled challan must not bring back boxes another challan now uses
+    const [[cur]] = await db.query('SELECT status FROM sale_challans WHERE id=?', [req.params.id]);
+    if (cur && cur.status === 'cancelled' && status !== 'cancelled') {
+      const [lines] = await db.query('SELECT ticked_boxes FROM sale_challan_items WHERE challan_id=?', [req.params.id]);
+      await challanPacking.validateTicks(db, lines, Number(req.params.id));
+    }
     await db.query('UPDATE sale_challans SET status=? WHERE id=?', [status, req.params.id]);
     res.json({ message: 'Status updated successfully' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
 });
 
 // DELETE challan

@@ -240,6 +240,70 @@ async function challanPackingReport(db, q = {}) {
   return { rows: out, summary };
 }
 
+// ── Box re-use guard: a box (or one label of it) can be on one challan only ──
+// Ticks on every non-cancelled challan except `exceptChallanId`:
+// [{ box_id, label ('' = whole box), challan_id, challan_number }]
+async function ticksOnOtherChallans(db, exceptChallanId = null) {
+  const [rows] = await db.query(
+    `SELECT sci.ticked_boxes, sc.id AS challan_id, sc.challan_number
+       FROM sale_challan_items sci JOIN sale_challans sc ON sc.id = sci.challan_id
+      WHERE sci.ticked_boxes IS NOT NULL AND sc.status <> 'cancelled' ${exceptChallanId ? 'AND sc.id <> ?' : ''}`,
+    exceptChallanId ? [exceptChallanId] : []);
+  const out = [];
+  for (const r of rows) {
+    let list = [];
+    try { list = JSON.parse(r.ticked_boxes); } catch (e) { list = []; }
+    if (!Array.isArray(list)) continue;
+    for (const t of list) {
+      const id = idOrNull(t && t.id);
+      if (id) out.push({ box_id: id, label: String((t && t.label) || '').trim(), challan_id: r.challan_id, challan_number: r.challan_number });
+    }
+  }
+  return out;
+}
+const sameUnit = (a, b) => a.box_id === b.box_id && (!a.label || !b.label || a.label === b.label);
+
+// Refuse ticks that are already on another challan, or ticked twice on this one.
+async function validateTicks(db, items, exceptChallanId = null) {
+  const mine = [];
+  (items || []).forEach((it, line) => {
+    let list = it && it.ticked_boxes;
+    if (typeof list === 'string') { try { list = JSON.parse(list); } catch (e) { list = []; } }
+    if (!Array.isArray(list)) return;
+    const seen = new Set();   // repeats within one line are just tidied away (tickedJson drops them)
+    for (const t of list) {
+      const id = idOrNull(t && t.id);
+      const label = String((t && t.label) || '').trim();
+      if (!id || seen.has(`${id}|${label}`)) continue;
+      seen.add(`${id}|${label}`);
+      mine.push({ line, box_id: id, label, name: (t && (t.label || t.box_number)) || `box #${id}` });
+    }
+  });
+  if (!mine.length) return;
+  // Readable names for ticks sent without a box number
+  const unnamed = [...new Set(mine.filter(m => /^box #/.test(m.name)).map(m => m.box_id))];
+  if (unnamed.length) {
+    const [rows] = await db.query('SELECT id, box_number FROM packing_boxes WHERE id IN (?)', [unnamed]);
+    mine.forEach(m => { const r = rows.find(x => x.id === m.box_id); if (r && /^box #/.test(m.name)) m.name = r.box_number; });
+  }
+  for (let i = 0; i < mine.length; i++) {
+    for (let k = i + 1; k < mine.length; k++) {
+      if (mine[i].line !== mine[k].line && sameUnit(mine[i], mine[k])) {
+        const e = new Error(`Box ${mine[k].name} is ticked twice on this challan. Tick each box on one item only.`);
+        e.status = 400; throw e;
+      }
+    }
+  }
+  const others = await ticksOnOtherChallans(db, exceptChallanId);
+  for (const t of mine) {
+    const clash = others.find(o => sameUnit(o, t));
+    if (clash) {
+      const e = new Error(`Box ${t.name} is already on challan ${clash.challan_number}. Untick it there first (or cancel that challan).`);
+      e.status = 400; throw e;
+    }
+  }
+}
+
 // ── Packing boxes by Proto Code (Sale Challan row "Box Details") ──────────
 // Packing is made before the challan; this only reads it. A box's proto code is
 // its own Proto Code field, else its linked project item's code; content lines
@@ -251,7 +315,7 @@ async function challanPackingReport(db, q = {}) {
 const normCode = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^PROTO/, '');
 const sqlNorm = col => `REGEXP_REPLACE(REGEXP_REPLACE(UPPER(COALESCE(${col}, '')), '[^A-Z0-9]', ''), '^PROTO', '')`;
 
-async function boxesByProto(db, codes, projectId = null) {
+async function boxesByProto(db, codes, projectId = null, exceptChallanId = null) {
   const wanted = [...new Set((codes || []).map(normCode).filter(Boolean))].slice(0, 200);
   const out = {};
   wanted.forEach(c => { out[c] = []; });
@@ -288,6 +352,8 @@ async function boxesByProto(db, codes, projectId = null) {
   const linesByBox = new Map();
   lines.forEach(l => { if (!linesByBox.has(l.box_id)) linesByBox.set(l.box_id, []); linesByBox.get(l.box_id).push(l); });
 
+  // Labels already on another challan (hidden in Box Details; the server refuses them anyway)
+  const used = await ticksOnOtherChallans(db, exceptChallanId);
   for (const b of boxes) {
     const items = linesByBox.get(b.id) || [];
     const copies = Math.max(1, Math.min(26, parseInt(b.copies, 10) || 1));
@@ -303,6 +369,8 @@ async function boxesByProto(db, codes, projectId = null) {
         description: b.description || '', notes: b.notes || '', project_name: b.project_name || '', proj_code: b.proj_code || '',
         created_by_name: b.created_by_name || '', created_at: b.created_at, photo_count: Number(b.photo_count) || 0,
         sale_challan_number: b.sale_challan_number || '', items: shown,
+        // [{ label ('' = whole box), challan_number }] ticked on OTHER challans
+        used_on: used.filter(u => u.box_id === b.id).map(u => ({ label: u.label, challan_number: u.challan_number })),
         total_qty: shown.reduce((s, l) => s + (Number(l.quantity) || 0), 0),
       });
     }
@@ -347,7 +415,7 @@ async function packingDispatchReport(db, q = {}) {
 
   // 2. Where each box is used: ticks on challan lines + boxes made from a challan
   const [tickRows] = await db.query(
-    `SELECT sci.ticked_boxes, sc.id AS challan_id, sc.challan_number, sc.challan_date, sc.client_name, sc.vehicle_number, sc.vehicle_length, sc.transport_name
+    `SELECT sci.ticked_boxes, sc.id AS challan_id, sc.challan_number, sc.challan_date, sc.client_name, sc.vehicle_number, sc.vehicle_length, sc.transport_name, sc.status AS challan_status
        FROM sale_challan_items sci JOIN sale_challans sc ON sc.id = sci.challan_id
       WHERE sci.ticked_boxes IS NOT NULL AND sc.status <> 'cancelled'`);
   const ticks = [];
@@ -361,7 +429,7 @@ async function packingDispatchReport(db, q = {}) {
     }
   }
   const [made] = await db.query(
-    `SELECT pb.id AS box_id, sc.id AS challan_id, sc.challan_number, sc.challan_date, sc.client_name, sc.vehicle_number, sc.vehicle_length, sc.transport_name
+    `SELECT pb.id AS box_id, sc.id AS challan_id, sc.challan_number, sc.challan_date, sc.client_name, sc.vehicle_number, sc.vehicle_length, sc.transport_name, sc.status AS challan_status
        FROM packing_boxes pb JOIN sale_challans sc ON sc.id = pb.sale_challan_id
       WHERE sc.status <> 'cancelled'`);
   // box_id → [{challan…, label}] ; label '' = the whole box (all its labels)
@@ -400,6 +468,7 @@ async function packingDispatchReport(db, q = {}) {
       packed_at: b.created_at,
       status: used.length ? 'used' : 'pending',
       challans: used.map(u => ({ id: u.challan_id, challan_number: u.challan_number, challan_date: u.challan_date, client_name: u.client_name || '',
+        challan_status: u.challan_status || '',
         vehicle_number: u.vehicle_number || '', vehicle_length: u.vehicle_length || '', transport_name: u.transport_name || '' })),
     };
   });
@@ -506,7 +575,7 @@ async function packingDispatchReport(db, q = {}) {
 }
 
 module.exports = {
-  packingDispatchReport, boxLabels,
+  packingDispatchReport, boxLabels, validateTicks,
   boxesByProto, normCode, sqlNorm,
   insertChallanItems, syncChallanItems, challanPackingStatus,
   validateBoxAgainstChallan, challanPackingReport, packingStatus,

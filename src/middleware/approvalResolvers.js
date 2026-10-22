@@ -14,7 +14,7 @@
  */
 
 const { getPool } = require('../database');
-const { insertChallanItems } = require('../services/challanPacking');
+const { insertChallanItems, validateTicks } = require('../services/challanPacking');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers (self-contained — routes/index.js ke helpers se decoupled)
@@ -213,6 +213,9 @@ async function resolveChallan(approval, db) {
   if (!Array.isArray(items) || items.length === 0) {
     throw new Error('No items in approval payload');
   }
+
+  // A packing box can be on one challan only (checked again at approval time)
+  await validateTicks(db, items);
 
   // Numbering — re-resolve at approval time so sequence stays gap-free
   const cType       = challan_type || 'delivery';
