@@ -27,6 +27,45 @@ const { createApprovalRequest } = require('../services/approvalService');
 
 const INSPECTION_LEVELS = ['final', 'white_body'];
 
+// Standard QC inspection checklist (printed form, section 2). Results are saved
+// per key in quality_reports.checklist_json together with a label/criteria
+// snapshot, so an old report always prints exactly what was inspected.
+const QC_CHECKLIST = [
+  { key: 'dimensions',  label: 'Dimensions / tolerance',          criteria: 'As approved drawing' },
+  { key: 'material',    label: 'Material & component quality',    criteria: 'Approved specification' },
+  { key: 'joinery',     label: 'Joinery / structural stability',  criteria: 'No loose joints / wobble' },
+  { key: 'surface',     label: 'Surface / sanding quality',       criteria: 'Smooth, no visible defects' },
+  { key: 'finish',      label: 'Paint / polish / finish',         criteria: 'Shade, sheen, uniformity' },
+  { key: 'upholstery',  label: 'Fabric / upholstery / stitching', criteria: 'Code, alignment, neatness' },
+  { key: 'hardware',    label: 'Hardware / fittings',             criteria: 'Correct fit and operation' },
+  { key: 'edges',       label: 'Edges / corners / safety',        criteria: 'No sharp edges / burrs' },
+  { key: 'function',    label: 'Functionality / leveling',        criteria: 'Stable, opens / closes well' },
+  { key: 'cleanliness', label: 'Cleanliness / final appearance',  criteria: 'No stains, dents, scratches' },
+  { key: 'packaging',   label: 'Labeling / packaging',            criteria: 'Correct label, safe packing' },
+];
+const CHECK_RESULTS = ['pass', 'fail', 'na'];
+const INSPECTION_RESULTS = ['approved', 'rework', 'rejected'];
+
+// Template + saved results → [{key,label,criteria,result|null}]. Unanswered stays null
+// (never defaulted to pass). Saved keys no longer in the template are kept.
+function mergeChecklist(json) {
+  let saved = [];
+  try { saved = json ? JSON.parse(json) : []; } catch (e) { saved = []; }
+  if (!Array.isArray(saved)) saved = [];
+  const byKey = new Map(saved.filter(s => s && s.key).map(s => [s.key, s]));
+  const rows = QC_CHECKLIST.map(t => {
+    const s = byKey.get(t.key);
+    return { ...t, label: s?.label || t.label, criteria: s?.criteria || t.criteria,
+             result: CHECK_RESULTS.includes(s?.result) ? s.result : null };
+  });
+  for (const s of saved) {
+    if (s?.key && !QC_CHECKLIST.some(t => t.key === s.key))
+      rows.push({ key: s.key, label: s.label || s.key, criteria: s.criteria || '',
+                  result: CHECK_RESULTS.includes(s.result) ? s.result : null });
+  }
+  return rows;
+}
+
 // Report series QR-2026-0001 (configurable prefix, full year, 4-digit pad)
 async function generateReportNo(db) {
   let prefix = 'QR';
@@ -67,6 +106,35 @@ async function loadReport(db, id) {
       'SELECT * FROM quality_report_images WHERE section_id IN (?) ORDER BY sort_order, id', [secIds]);
   }
   r.sections = sections.map(s => ({ ...s, images: images.filter(im => im.section_id === s.id) }));
+  r.checklist = mergeChecklist(r.checklist_json);
+  delete r.checklist_json;
+
+  // Linked data for the printed form (read-only, best effort — missing links stay null)
+  try {
+    const [[linked]] = await db.query(
+      `SELECT pi.quantity AS item_quantity, pi.unit AS item_unit, pi.source_main_po_item_id,
+              mp.po_no AS main_po_no, mpi.finishes_note AS main_po_finishes_note
+       FROM quality_reports qr
+       LEFT JOIN projects p ON p.id = qr.project_id
+       LEFT JOIN project_items pi ON pi.id = qr.project_item_id
+       LEFT JOIN main_pos mp ON mp.id = p.source_main_po_id
+       LEFT JOIN main_po_items mpi ON mpi.id = pi.source_main_po_item_id
+       WHERE qr.id=?`, [id]);
+    Object.assign(r, {
+      item_quantity: linked?.item_quantity ?? null, item_unit: linked?.item_unit || null,
+      main_po_no: linked?.main_po_no || null, main_po_finishes_note: linked?.main_po_finishes_note || null,
+      finish_sheet_codes: [],
+    });
+    if (linked?.source_main_po_item_id) {
+      const [fe] = await db.query(
+        `SELECT fs.finish_type, fe.paint_finish_name, fe.fabric_name, fe.metal_finish_details
+         FROM finish_entries fe JOIN finish_sheets fs ON fs.id = fe.sheet_id
+         WHERE fe.main_po_item_id=? ORDER BY FIELD(fs.finish_type,'paint','fabric','metal')`, [linked.source_main_po_item_id]);
+      r.finish_sheet_codes = fe
+        .map(e => e.paint_finish_name || e.fabric_name || e.metal_finish_details)
+        .filter(Boolean);
+    }
+  } catch (e) { /* linked tables missing on very old DBs — form just shows blanks */ }
   return r;
 }
 
@@ -307,6 +375,57 @@ router.delete('/quality/sections/:sectionId', auth, adminOrPermission('quality_r
     res.json({ message: 'Section deleted' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
+
+// ══ INSPECTION FORM (printed page 2) ═════════════════════════════════════════
+// Same access rule as image upload: admin, or the assigned worker, while not locked.
+router.put('/quality/reports/:id/inspection', auth, adminOrPermission('quality_report', 'write'),
+  auditLog('UPDATE', 'QualityReportInspection'), async (req, res) => {
+    const db = await getPool();
+    try {
+      const [[r]] = await db.query('SELECT id, status, assigned_to FROM quality_reports WHERE id=?', [req.params.id]);
+      if (!r) return res.status(404).json({ message: 'Report not found' });
+      if (['submitted', 'approved'].includes(r.status))
+        return res.status(400).json({ message: `Report is ${r.status} and locked` });
+      if (req.user.role !== 'admin' && r.assigned_to !== req.user.id)
+        return res.status(403).json({ message: 'This report is not assigned to you' });
+
+      const b = req.body || {};
+      const text = (v, max) => (v == null || String(v).trim() === '' ? null : String(v).trim().slice(0, max));
+      const qty = {};
+      for (const k of ['order_qty', 'inspected_qty', 'accepted_qty', 'rework_qty', 'rejected_qty']) {
+        if (b[k] == null || b[k] === '') { qty[k] = null; continue; }
+        const n = Number(b[k]);
+        if (!Number.isFinite(n) || n < 0) return res.status(400).json({ message: `${k.replace('_', ' ')} must be a positive number` });
+        qty[k] = n;
+      }
+      const outcome = (qty.accepted_qty || 0) + (qty.rework_qty || 0) + (qty.rejected_qty || 0);
+      if (qty.inspected_qty != null && outcome > qty.inspected_qty)
+        return res.status(400).json({ message: `Accepted + Rework + Rejected (${outcome}) cannot exceed Inspected Qty (${qty.inspected_qty})` });
+
+      if (b.inspection_result != null && b.inspection_result !== '' && !INSPECTION_RESULTS.includes(b.inspection_result))
+        return res.status(400).json({ message: 'Invalid inspection result' });
+      const items = Array.isArray(b.checklist) ? b.checklist : [];
+      for (const it of items) {
+        if (it?.result != null && it.result !== '' && !CHECK_RESULTS.includes(it.result))
+          return res.status(400).json({ message: `Invalid checklist result "${it.result}"` });
+      }
+      // Snapshot label/criteria with each result (template rows merged in by key)
+      const checklist = mergeChecklist(JSON.stringify(items.map(it => ({ key: it?.key, result: it?.result || null }))))
+        .map(({ key, label, criteria, result }) => ({ key, label, criteria, result }));
+      if (b.signoff_date && !/^\d{4}-\d{2}-\d{2}$/.test(b.signoff_date))
+        return res.status(400).json({ message: 'Invalid sign-off date' });
+
+      await db.query(
+        `UPDATE quality_reports SET mo_number=?, drawing_revision=?, finish_code=?, order_qty=?, inspected_qty=?,
+           accepted_qty=?, rework_qty=?, rejected_qty=?, checklist_json=?, inspection_result=?, qc_remarks=?,
+           production_head=?, signoff_date=?, updated_by=? WHERE id=?`,
+        [text(b.mo_number, 100), text(b.drawing_revision, 150), text(b.finish_code, 255),
+         qty.order_qty, qty.inspected_qty, qty.accepted_qty, qty.rework_qty, qty.rejected_qty,
+         JSON.stringify(checklist), b.inspection_result || null, text(b.qc_remarks, 5000),
+         text(b.production_head, 150), b.signoff_date || null, req.user.id, r.id]);
+      res.json({ message: 'Inspection form saved' });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
 
 // ══ SECTION IMAGES ═══════════════════════════════════════════════════════════
 router.post('/quality/sections/:sectionId/images', auth, adminOrPermission('quality_report', 'write'),

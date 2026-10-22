@@ -1086,6 +1086,22 @@ async function initializeDatabase() {
     FOREIGN KEY (section_id) REFERENCES quality_report_sections(id) ON DELETE CASCADE
   )`);
 
+  // QC inspection form (printed page 2) — additive, all nullable. NULL = not
+  // entered yet, so the print never shows invented values.
+  await ensureColumn('quality_reports', 'mo_number', 'mo_number VARCHAR(100) NULL');
+  await ensureColumn('quality_reports', 'drawing_revision', 'drawing_revision VARCHAR(150) NULL');
+  await ensureColumn('quality_reports', 'finish_code', 'finish_code VARCHAR(255) NULL');
+  await ensureColumn('quality_reports', 'order_qty', 'order_qty DECIMAL(10,2) NULL');
+  await ensureColumn('quality_reports', 'inspected_qty', 'inspected_qty DECIMAL(10,2) NULL');
+  await ensureColumn('quality_reports', 'accepted_qty', 'accepted_qty DECIMAL(10,2) NULL');
+  await ensureColumn('quality_reports', 'rework_qty', 'rework_qty DECIMAL(10,2) NULL');
+  await ensureColumn('quality_reports', 'rejected_qty', 'rejected_qty DECIMAL(10,2) NULL');
+  await ensureColumn('quality_reports', 'checklist_json', 'checklist_json LONGTEXT NULL');
+  await ensureColumn('quality_reports', 'inspection_result', "inspection_result ENUM('approved','rework','rejected') NULL");
+  await ensureColumn('quality_reports', 'qc_remarks', 'qc_remarks TEXT NULL');
+  await ensureColumn('quality_reports', 'production_head', 'production_head VARCHAR(150) NULL');
+  await ensureColumn('quality_reports', 'signoff_date', 'signoff_date DATE NULL');
+
   // approvals.type: APPEND QUALITY_REPORT (backward-compatible ENUM append)
   await safeAlter(`ALTER TABLE approvals MODIFY COLUMN type ENUM('PROJECT','ITEM','CHALLAN','PO_STATUS','SALE','MAIN_PO','CASHBOOK_ADVANCE','CASHBOOK_EXPENSE','QUALITY_REPORT') NOT NULL`);
 
