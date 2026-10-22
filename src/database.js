@@ -591,6 +591,29 @@ async function initializeDatabase() {
     FOREIGN KEY (challan_id) REFERENCES sale_challans(id) ON DELETE CASCADE
   )`);
 
+  // ── Sale Challan ↔ Packing link ────────────────────────────────────────────
+  // Proto Code + source project item on each challan line
+  await ensureColumn('sale_challan_items', 'proto_code', 'proto_code VARCHAR(100) NULL');
+  await ensureColumn('sale_challan_items', 'project_item_id', 'project_item_id INT NULL');
+  // A packing box can be created from a challan; each content line can point at a challan line
+  await ensureColumn('packing_boxes', 'sale_challan_id', 'sale_challan_id INT NULL');
+  await ensureColumn('packing_boxes', 'request_key', 'request_key VARCHAR(64) NULL');
+  await ensureColumn('packing_box_items', 'sale_challan_item_id', 'sale_challan_item_id INT NULL');
+  await ensureColumn('packing_box_items', 'proto_code', 'proto_code VARCHAR(100) NULL');
+  const ensureIndex = async (table, name, ddl) => {
+    const [rows] = await db.query(
+      'SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1',
+      [table, name]);
+    if (!rows.length) await db.query(ddl);
+  };
+  // Same request_key twice (retry / double click) must not create a second box
+  await ensureIndex('packing_boxes', 'uniq_packing_request_key',
+    'ALTER TABLE packing_boxes ADD UNIQUE KEY uniq_packing_request_key (request_key)');
+  await ensureIndex('packing_boxes', 'idx_packing_sale_challan',
+    'ALTER TABLE packing_boxes ADD KEY idx_packing_sale_challan (sale_challan_id)');
+  await ensureIndex('packing_box_items', 'idx_pbi_sale_challan_item',
+    'ALTER TABLE packing_box_items ADD KEY idx_pbi_sale_challan_item (sale_challan_item_id)');
+
   // Auto-seed PO number prefix setting
   // Purchase Order numbering
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('po_numbering_mode', 'auto')").catch(()=>{});

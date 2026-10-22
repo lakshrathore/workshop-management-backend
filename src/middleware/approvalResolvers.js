@@ -14,6 +14,7 @@
  */
 
 const { getPool } = require('../database');
+const { insertChallanItems } = require('../services/challanPacking');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers (self-contained — routes/index.js ke helpers se decoupled)
@@ -252,17 +253,7 @@ async function resolveChallan(approval, db) {
   );
   const challanId = r.insertId;
 
-  for (let i = 0; i < items.length; i++) {
-    const it   = items[i];
-    const qty  = parseFloat(it.quantity) || 0;
-    const rate = parseFloat(it.rate) || 0;
-    await db.query(
-      `INSERT INTO sale_challan_items
-        (challan_id,item_name,description,quantity,unit,rate,total,sort_order)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [challanId, it.item_name, it.description || '', qty, it.unit || 'pcs', rate, qty * rate, i]
-    );
-  }
+  await insertChallanItems(db, challanId, items);
 
   return { id: challanId, challan_number };
 }

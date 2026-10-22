@@ -29,6 +29,7 @@
 
 const express = require('express');
 const router = express.Router();
+const challanPacking = require('../services/challanPacking');
 const { getPool } = require('../database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -4190,6 +4191,7 @@ router.get('/packing/boxes', auth, async (req, res) => {
     const [boxes] = await db.query(`
       SELECT pb.*, pb.sub_label, u.name as created_by_name,
         p.name as project_name, p.project_id as proj_code, p.client_name,
+        sc.challan_number AS sale_challan_number,
         pi.item_name,
         pi.proto_code  AS item_proto_code,
         pi.description AS item_description,
@@ -4206,6 +4208,7 @@ router.get('/packing/boxes', auth, async (req, res) => {
       LEFT JOIN users u ON u.id = pb.created_by
       LEFT JOIN projects p ON p.id = pb.project_id
       LEFT JOIN project_items pi ON pi.id = pb.project_item_id
+      LEFT JOIN sale_challans sc ON sc.id = pb.sale_challan_id
       ${where} ORDER BY pb.created_at DESC`, params);
 
     // Get items for ALL boxes in ONE query (fixes the load issue).
@@ -4234,24 +4237,50 @@ router.post('/packing/boxes', auth, auditLog('CREATE','PackingBox'), async (req,
   const db = await getPool();
   try {
     const { project_id, project_item_id, mode, items, notes, box_number, photo_code, main_item, sub_label, description, copies } = req.body;
-    const finalBoxNum = box_number || await generateBoxNumber(db);
-    const finalSubLabel = sub_label ? sub_label.trim().toUpperCase() : null;
-    const finalCopies = Math.max(1, Math.min(26, parseInt(copies) || 1));
+    const saleChallanId = parseInt(req.body.sale_challan_id, 10) || null;
+    const requestKey = req.body.request_key ? String(req.body.request_key).slice(0, 64) : null;
 
-    const [r] = await db.query(
-      'INSERT INTO packing_boxes (box_number, sub_label, project_id, project_item_id, photo_code, main_item, mode, created_by, notes, description, copies) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-      [finalBoxNum, finalSubLabel, project_id || null, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '', description || null, finalCopies]
-    );
-    const boxId = r.insertId;
+    // Same request sent again (retry / double click) -> hand back the box already made
+    const findByKey = async () => {
+      if (!requestKey) return null;
+      const [[b]] = await db.query('SELECT id FROM packing_boxes WHERE request_key=?', [requestKey]);
+      return b ? b.id : null;
+    };
+    let boxId = await findByKey();
+    let duplicate = !!boxId;
 
-    // Add items to box
-    if (items && items.length > 0) {
-      for (const item of items) {
-        await db.query(
-          'INSERT INTO packing_box_items (box_id, item_name, quantity, unit, notes) VALUES (?,?,?,?,?)',
-          [boxId, item.item_name, item.quantity || 1, item.unit || 'pcs', item.notes || '']
+    if (!boxId) {
+      const finalBoxNum = box_number || await generateBoxNumber(db);
+      const finalSubLabel = sub_label ? sub_label.trim().toUpperCase() : null;
+      const finalCopies = Math.max(1, Math.min(26, parseInt(copies) || 1));
+      const conn = await db.getConnection();
+      try {
+        await conn.beginTransaction();
+        let projectId = project_id || null;
+        if (saleChallanId) {
+          // Locks the challan lines, so two packers can't both take the last units
+          const ch = await challanPacking.validateBoxAgainstChallan(conn, saleChallanId, items || []);
+          if (!projectId) projectId = ch.project_id || null;
+        }
+        const [r] = await conn.query(
+          'INSERT INTO packing_boxes (box_number, sub_label, project_id, project_item_id, photo_code, main_item, mode, created_by, notes, description, copies, sale_challan_id, request_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          [finalBoxNum, finalSubLabel, projectId, project_item_id || null, photo_code || null, main_item || null, mode || 'manual', req.user.id, notes || '', description || null, finalCopies, saleChallanId, requestKey]
         );
-      }
+        boxId = r.insertId;
+        for (const item of (items || [])) {
+          await conn.query(
+            'INSERT INTO packing_box_items (box_id, item_name, quantity, unit, notes, sale_challan_item_id, proto_code) VALUES (?,?,?,?,?,?,?)',
+            [boxId, item.item_name, item.quantity || 1, item.unit || 'pcs', item.notes || '',
+              saleChallanId ? (parseInt(item.sale_challan_item_id, 10) || null) : null, item.proto_code || null]
+          );
+        }
+        await conn.commit();
+      } catch (e) {
+        await conn.rollback().catch(() => {});
+        boxId = null;
+        if (e.code === 'ER_DUP_ENTRY' && requestKey && (boxId = await findByKey())) duplicate = true;
+        else throw e;
+      } finally { conn.release(); }
     }
 
     const [[box]] = await db.query(
@@ -4259,8 +4288,8 @@ router.post('/packing/boxes', auth, auditLog('CREATE','PackingBox'), async (req,
       [boxId]
     );
     const [boxItems] = await db.query('SELECT * FROM packing_box_items WHERE box_id=?', [boxId]);
-    res.json({ ...box, items: boxItems });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    res.json({ ...box, items: boxItems, duplicate });
+  } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
 });
 
 // Update box
@@ -4279,29 +4308,40 @@ router.put('/packing/boxes/:id', auth, auditLog('UPDATE','PackingBox'), async (r
       if (dup) return res.status(400).json({ message: `Box number "${box_number}" already exists` });
     }
 
-    await db.query(
-      `UPDATE packing_boxes
-         SET box_number=COALESCE(NULLIF(TRIM(?),''), box_number),
-             notes=?, photo_code=?, main_item=?, description=?, copies=?,
-             project_id=?
-       WHERE id=?`,
-      [
-        box_number || null,
-        notes || '', photo_code || null, main_item || null,
-        description ?? null, finalCopies,
-        project_id || null,
-        req.params.id
-      ]
-    );
-    if (items) {
-      await db.query('DELETE FROM packing_box_items WHERE box_id=?', [req.params.id]);
-      for (const item of items) {
-        await db.query(
-          'INSERT INTO packing_box_items (box_id, item_name, quantity, unit, notes) VALUES (?,?,?,?,?)',
-          [req.params.id, item.item_name, item.quantity || 1, item.unit || 'pcs', item.notes || '']
-        );
+    const [[cur]] = await db.query('SELECT sale_challan_id FROM packing_boxes WHERE id=?', [req.params.id]);
+    const saleChallanId = cur ? cur.sale_challan_id : null;
+    const conn = await db.getConnection();
+    try {
+      await conn.beginTransaction();
+      // Box made from a challan: edited contents must still fit the remaining challan qty
+      if (saleChallanId && items) await challanPacking.validateBoxAgainstChallan(conn, saleChallanId, items, Number(req.params.id));
+      await conn.query(
+        `UPDATE packing_boxes
+           SET box_number=COALESCE(NULLIF(TRIM(?),''), box_number),
+               notes=?, photo_code=?, main_item=?, description=?, copies=?,
+               project_id=?
+         WHERE id=?`,
+        [
+          box_number || null,
+          notes || '', photo_code || null, main_item || null,
+          description ?? null, finalCopies,
+          project_id || null,
+          req.params.id
+        ]
+      );
+      if (items) {
+        await conn.query('DELETE FROM packing_box_items WHERE box_id=?', [req.params.id]);
+        for (const item of items) {
+          await conn.query(
+            'INSERT INTO packing_box_items (box_id, item_name, quantity, unit, notes, sale_challan_item_id, proto_code) VALUES (?,?,?,?,?,?,?)',
+            [req.params.id, item.item_name, item.quantity || 1, item.unit || 'pcs', item.notes || '',
+              saleChallanId ? (parseInt(item.sale_challan_item_id, 10) || null) : null, item.proto_code || null]
+          );
+        }
       }
-    }
+      await conn.commit();
+    } catch (e) { await conn.rollback().catch(() => {}); throw e; }
+    finally { conn.release(); }
 
     // Return updated box so frontend can refresh label preview immediately
     const [[updated]] = await db.query(
@@ -4317,7 +4357,7 @@ router.put('/packing/boxes/:id', auth, auditLog('UPDATE','PackingBox'), async (r
     updated.items = boxItems;
 
     res.json({ message: 'Updated', box: updated });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
 });
 
 // Update only the label copies count (used by the label preview modal).
@@ -4336,6 +4376,14 @@ router.delete('/packing/boxes/:id', auth, auditLog('DELETE','PackingBox'), async
   const db = await getPool();
   await db.query('DELETE FROM packing_boxes WHERE id=?', [req.params.id]);
   res.json({ message: 'Deleted' });
+});
+
+// Sale Challan vs Packing quantity report
+router.get('/packing/challan-report', auth, adminOrPermission('packing', 'read'), async (req, res) => {
+  const db = await getPool();
+  try {
+    res.json(await challanPacking.challanPackingReport(db, req.query));
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // Get next box number (for UI preview)
@@ -4923,15 +4971,7 @@ router.post('/sale-challans', auth, adminOrPermission('sale_challans','write'), 
         req.body.cgst||null, req.body.sgst||null, req.body.igst||null, cpo_id||null, req.user.id]
     );
     const challanId = r.insertId;
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      const qty = parseFloat(it.quantity) || 0;
-      const rate = parseFloat(it.rate) || 0;
-      await db.query(
-        'INSERT INTO sale_challan_items (challan_id,item_name,description,quantity,unit,rate,total,sort_order) VALUES (?,?,?,?,?,?,?,?)',
-        [challanId, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
-      );
-    }
+    await challanPacking.insertChallanItems(db, challanId, items);
     res.json({ id: challanId, challan_number, message: 'Sale Challan created successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -4953,28 +4993,42 @@ router.put('/sale-challans/:id', auth, adminOrPermission('sale_challans','edit')
     const tax_amount = parseFloat(((subtotal - disc) * taxPct / 100).toFixed(2));
     const total_amount = parseFloat((subtotal - disc + tax_amount).toFixed(2));
 
-    await db.query(
-      `UPDATE sale_challans SET client_name=?,client_phone=?,client_address=?,client_gstin=?,challan_type=?,
-        project_id=?,challan_date=?,delivery_date=?,status=?,subtotal=?,tax_percent=?,
-        tax_amount=?,discount_amount=?,total_amount=?,transport_name=?,vehicle_number=?,notes=?,
-        cgst=?,sgst=?,igst=?,cpo_id=? WHERE id=?`,
-      [client_name.trim(), client_phone||'', client_address||'', client_gstin||'', challan_type||'delivery',
-        project_id||null, challan_date, delivery_date||null, status||'draft',
-        subtotal, taxPct, tax_amount, disc, total_amount,
-        transport_name||'', vehicle_number||'', notes||'',
-        req.body.cgst||null, req.body.sgst||null, req.body.igst||null, cpo_id||null, req.params.id]
-    );
-    await db.query('DELETE FROM sale_challan_items WHERE challan_id=?', [req.params.id]);
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      const qty = parseFloat(it.quantity) || 0;
-      const rate = parseFloat(it.rate) || 0;
-      await db.query(
-        'INSERT INTO sale_challan_items (challan_id,item_name,description,quantity,unit,rate,total,sort_order) VALUES (?,?,?,?,?,?,?,?)',
-        [req.params.id, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
+    // Items are updated in place (not delete + re-insert) so packing links keep pointing at them
+    const conn = await db.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(
+        `UPDATE sale_challans SET client_name=?,client_phone=?,client_address=?,client_gstin=?,challan_type=?,
+          project_id=?,challan_date=?,delivery_date=?,status=?,subtotal=?,tax_percent=?,
+          tax_amount=?,discount_amount=?,total_amount=?,transport_name=?,vehicle_number=?,notes=?,
+          cgst=?,sgst=?,igst=?,cpo_id=? WHERE id=?`,
+        [client_name.trim(), client_phone||'', client_address||'', client_gstin||'', challan_type||'delivery',
+          project_id||null, challan_date, delivery_date||null, status||'draft',
+          subtotal, taxPct, tax_amount, disc, total_amount,
+          transport_name||'', vehicle_number||'', notes||'',
+          req.body.cgst||null, req.body.sgst||null, req.body.igst||null, cpo_id||null, req.params.id]
       );
-    }
+      await challanPacking.syncChallanItems(conn, Number(req.params.id), items);
+      await conn.commit();
+    } catch (e) { await conn.rollback().catch(() => {}); throw e; }
+    finally { conn.release(); }
     res.json({ message: 'Sale Challan updated successfully' });
+  } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
+});
+
+// GET packed vs challan quantity for one challan (drives the "create packing?" prompt)
+router.get('/sale-challans/:id/packing-status', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    if (req.user.role !== 'admin') {
+      const [perms] = await db.query(
+        `SELECT 1 FROM worker_permissions WHERE worker_id=? AND menu_key IN ('sale_challans','packing')
+            AND (can_read=1 OR can_write=1) LIMIT 1`, [req.user.id]);
+      if (!perms.length) return res.status(403).json({ message: 'Access denied' });
+    }
+    const st = await challanPacking.challanPackingStatus(db, req.params.id);
+    if (!st) return res.status(404).json({ message: 'Challan not found' });
+    res.json(st);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -4992,6 +5046,11 @@ router.patch('/sale-challans/:id/status', auth, adminOrPermission('sale_challans
 router.delete('/sale-challans/:id', auth, adminOrPermission('sale_challans','delete'), auditLog('DELETE','SaleChallan'), async (req, res) => {
   const db = await getPool();
   try {
+    // Packed boxes stay; they just stop pointing at the deleted challan
+    await db.query(
+      `UPDATE packing_box_items pbi JOIN packing_boxes pb ON pb.id = pbi.box_id
+          SET pbi.sale_challan_item_id = NULL WHERE pb.sale_challan_id = ?`, [req.params.id]);
+    await db.query('UPDATE packing_boxes SET sale_challan_id = NULL WHERE sale_challan_id = ?', [req.params.id]);
     await db.query('DELETE FROM sale_challans WHERE id=?', [req.params.id]);
     res.json({ message: 'Challan deleted successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -5089,15 +5148,7 @@ router.post('/dispatch/challans', auth,
         transport_name||'', vehicle_number||'', notes||'', req.user.id]
     );
     const challanId = r.insertId;
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      const qty = parseFloat(it.quantity) || 0;
-      const rate = parseFloat(it.rate) || 0;
-      await db.query(
-        'INSERT INTO sale_challan_items (challan_id,item_name,description,quantity,unit,rate,total,sort_order) VALUES (?,?,?,?,?,?,?,?)',
-        [challanId, it.item_name, it.description||'', qty, it.unit||'pcs', rate, qty*rate, i]
-      );
-    }
+    await challanPacking.insertChallanItems(db, challanId, items);
     res.json({ id: challanId, challan_number, message: 'Delivery Challan created successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
