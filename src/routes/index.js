@@ -4962,12 +4962,12 @@ router.post('/sale-challans', auth, adminOrPermission('sale_challans','write'), 
     const [r] = await db.query(
       `INSERT INTO sale_challans (challan_number,client_name,client_phone,client_address,client_gstin,challan_type,
         project_id,challan_date,delivery_date,status,subtotal,tax_percent,tax_amount,discount_amount,
-        total_amount,transport_name,vehicle_number,notes,cgst,sgst,igst,cpo_id,created_by)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        total_amount,transport_name,vehicle_number,vehicle_length,notes,cgst,sgst,igst,cpo_id,created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [challan_number, client_name.trim(), client_phone||'', client_address||'', client_gstin||'',
         challan_type||'delivery', project_id||null, challan_date, delivery_date||null, status||'draft',
         subtotal, taxPct, tax_amount, disc, total_amount,
-        transport_name||'', vehicle_number||'', notes||'',
+        transport_name||'', vehicle_number||'', String(req.body.vehicle_length || '').trim().slice(0, 50) || null, notes||'',
         req.body.cgst||null, req.body.sgst||null, req.body.igst||null, cpo_id||null, req.user.id]
     );
     const challanId = r.insertId;
@@ -5000,12 +5000,13 @@ router.put('/sale-challans/:id', auth, adminOrPermission('sale_challans','edit')
       await conn.query(
         `UPDATE sale_challans SET client_name=?,client_phone=?,client_address=?,client_gstin=?,challan_type=?,
           project_id=?,challan_date=?,delivery_date=?,status=?,subtotal=?,tax_percent=?,
-          tax_amount=?,discount_amount=?,total_amount=?,transport_name=?,vehicle_number=?,notes=?,
+          tax_amount=?,discount_amount=?,total_amount=?,transport_name=?,vehicle_number=?,vehicle_length=COALESCE(?, vehicle_length),notes=?,
           cgst=?,sgst=?,igst=?,cpo_id=? WHERE id=?`,
         [client_name.trim(), client_phone||'', client_address||'', client_gstin||'', challan_type||'delivery',
           project_id||null, challan_date, delivery_date||null, status||'draft',
           subtotal, taxPct, tax_amount, disc, total_amount,
-          transport_name||'', vehicle_number||'', notes||'',
+          // Screens that don't send vehicle_length (e.g. the invoice page) keep the saved value
+          transport_name||'', vehicle_number||'', req.body.vehicle_length === undefined ? null : String(req.body.vehicle_length || '').trim().slice(0, 50), notes||'',
           req.body.cgst||null, req.body.sgst||null, req.body.igst||null, cpo_id||null, req.params.id]
       );
       await challanPacking.syncChallanItems(conn, Number(req.params.id), items);
@@ -5157,12 +5158,12 @@ router.post('/dispatch/challans', auth,
     const [r] = await db.query(
       `INSERT INTO sale_challans (challan_number,client_name,client_phone,client_address,client_gstin,challan_type,
         project_id,challan_date,delivery_date,status,subtotal,tax_percent,tax_amount,discount_amount,
-        total_amount,transport_name,vehicle_number,notes,created_by)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        total_amount,transport_name,vehicle_number,vehicle_length,notes,created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [challan_number, client_name.trim(), client_phone||'', client_address||'', client_gstin||'',
         challan_type, project_id||null, challan_date, delivery_date||null, 'draft',
         subtotal, taxPct, tax_amount, disc, total_amount,
-        transport_name||'', vehicle_number||'', notes||'', req.user.id]
+        transport_name||'', vehicle_number||'', String(req.body.vehicle_length || '').trim().slice(0, 50) || null, notes||'', req.user.id]
     );
     const challanId = r.insertId;
     await challanPacking.insertChallanItems(db, challanId, items);

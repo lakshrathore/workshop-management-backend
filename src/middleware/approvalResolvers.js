@@ -241,13 +241,13 @@ async function resolveChallan(approval, db) {
     `INSERT INTO sale_challans
       (challan_number,client_name,client_phone,client_address,client_gstin,challan_type,
        project_id,challan_date,delivery_date,status,subtotal,tax_percent,tax_amount,discount_amount,
-       total_amount,transport_name,vehicle_number,notes,cgst,sgst,igst,cpo_id,created_by)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       total_amount,transport_name,vehicle_number,vehicle_length,notes,cgst,sgst,igst,cpo_id,created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       challan_number, client_name.trim(), client_phone || '', client_address || '', client_gstin || '',
       cType, resolvedProjectId, challan_date, delivery_date || null, status || 'draft',
       subtotal, taxPct, tax_amount, disc, total_amount,
-      transport_name || '', vehicle_number || '', notes || '',
+      transport_name || '', vehicle_number || '', String(body.vehicle_length || '').trim().slice(0, 50) || null, notes || '',
       cgst || null, sgst || null, igst || null, cpo_id || null, userId
     ]
   );

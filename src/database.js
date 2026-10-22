@@ -591,6 +591,9 @@ async function initializeDatabase() {
     FOREIGN KEY (challan_id) REFERENCES sale_challans(id) ON DELETE CASCADE
   )`);
 
+  // Vehicle length (e.g. "17 ft") next to the vehicle number on a challan
+  await ensureColumn('sale_challans', 'vehicle_length', 'vehicle_length VARCHAR(50) NULL');
+
   // ── Sale Challan ↔ Packing link ────────────────────────────────────────────
   // Proto Code + source project item on each challan line
   await ensureColumn('sale_challan_items', 'proto_code', 'proto_code VARCHAR(100) NULL');
