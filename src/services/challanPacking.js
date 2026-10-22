@@ -328,6 +328,8 @@ async function packingDispatchReport(db, q = {}) {
             COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code) AS proto_code,
             ${sqlNorm("COALESCE(NULLIF(pb.photo_code, ''), pi.proto_code)")} AS code_key,
             COALESCE(pb.project_id, pi.project_id) AS project_id,
+            (SELECT pbx.proto_code FROM packing_box_items pbx
+              WHERE pbx.box_id = pb.id AND pbx.proto_code IS NOT NULL AND pbx.proto_code <> '' ORDER BY pbx.id LIMIT 1) AS line_code,
             p.name AS project_name, p.project_id AS proj_code, pi.item_name
        FROM packing_boxes pb
        LEFT JOIN project_items pi ON pi.id = pb.project_item_id
@@ -391,7 +393,8 @@ async function packingDispatchReport(db, q = {}) {
       id: b.id, unit_key: `${b.id}|${label}`, box_number: label, parent_box_number: multi ? b.box_number : '', sub_label: b.sub_label, labels: 1,
       project_id: b.project_id, project_name: b.project_name || '', proj_code: b.proj_code || '',
       // No main item / project item: name the box after its first content line
-      proto_code: b.proto_code || '', code_key: b.code_key || '', main_item: b.main_item || b.item_name || (contents[0] && contents[0].item_name) || '',
+      // Box code, else the code on a content line (same rule as Box Details)
+      proto_code: b.proto_code || b.line_code || '', code_key: b.code_key || normCode(b.line_code) || '', main_item: b.main_item || b.item_name || (contents[0] && contents[0].item_name) || '',
       item_real: b.main_item || b.item_name || '',   // a real item name (not taken from contents)
       contents: contents.map(l => ({ item_name: l.item_name, quantity: Number(l.quantity) || 0, unit: l.unit })),
       packed_at: b.created_at,
@@ -404,7 +407,19 @@ async function packingDispatchReport(db, q = {}) {
     boxRows = boxRows.filter(b => (searchKey && b.code_key.includes(searchKey))
       || `${b.box_number} ${b.main_item} ${b.proto_code} ${b.contents.map(c => c.item_name).join(' ')}`.toLowerCase().includes(search));
   }
-  if (challanFilter) boxRows = boxRows.filter(b => b.challans.some(c => String(c.challan_number).toLowerCase().includes(challanFilter)));
+  // Challan filter: every item on the matching challan(s), with ALL its boxes —
+  // used and still pending — so "5 boxes, 4 on this challan, 1 pending" reads right.
+  if (challanFilter) {
+    const itemKeyOf = b => `${b.project_id || ''}|${b.code_key || `#box${b.id}`}`;
+    const keys = new Set(boxRows.filter(b => b.challans.some(c => String(c.challan_number).toLowerCase().includes(challanFilter))).map(itemKeyOf));
+    const [onChallan] = await db.query(
+      `SELECT sc.project_id, ${sqlNorm('sci.proto_code')} AS code_key
+         FROM sale_challan_items sci JOIN sale_challans sc ON sc.id = sci.challan_id
+        WHERE sc.status <> 'cancelled' AND LOWER(sc.challan_number) LIKE ? AND sci.proto_code IS NOT NULL AND sci.proto_code <> ''`,
+      [`%${challanFilter}%`]);
+    onChallan.forEach(r => { if (r.code_key) keys.add(`${r.project_id || ''}|${r.code_key}`); });
+    boxRows = boxRows.filter(b => keys.has(itemKeyOf(b)));
+  }
   // Vehicle filter: spaces / hyphens / case ignored (RJ14GA1234 = RJ-14-GA-1234)
   const vKey = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   const vehicleFilter = vKey(q.vehicle);
