@@ -208,6 +208,9 @@ const cftRoutes = require('./routes/cftRoutes');
 app.use('/api', cftRoutes);
 cftRoutes.registerCftApproval();
 
+// ── QUOTATIONS against a Manufacturing Order (revisions, rate × qty + GST) ──
+app.use('/api', require('./routes/quotationRoutes'));
+
 // ── CLIENT PORTAL ROUTES ──────────────────────────────────────────────────────
 const clientRoutes = require('./routes/clientRoutes');
 app.use('/api', clientRoutes);

@@ -1224,6 +1224,41 @@ async function initializeDatabase() {
     FOREIGN KEY (sheet_id) REFERENCES cft_sheets(id) ON DELETE CASCADE,
     FOREIGN KEY (worker_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
+  // ── Quotations against a Manufacturing Order (revisions share quote_no) ──
+  await db.query(`CREATE TABLE IF NOT EXISTS quotations (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    quote_no VARCHAR(50) NOT NULL,
+    revision INT NOT NULL DEFAULT 0,
+    main_po_id INT NULL,
+    status ENUM('draft','sent','accepted','rejected','revised') NOT NULL DEFAULT 'draft',
+    client_name VARCHAR(255), client_address TEXT, client_gstin VARCHAR(30), client_phone VARCHAR(30),
+    quote_date DATE, valid_until DATE NULL,
+    gst_type ENUM('intra','inter') NOT NULL DEFAULT 'intra',
+    subject VARCHAR(255), notes TEXT, terms TEXT,
+    subtotal DECIMAL(14,2) DEFAULT 0, discount_amount DECIMAL(14,2) DEFAULT 0,
+    gst_percent DECIMAL(5,2) DEFAULT 0, taxable_amount DECIMAL(14,2) DEFAULT 0,
+    gst_amount DECIMAL(14,2) DEFAULT 0, total_amount DECIMAL(14,2) DEFAULT 0,
+    sent_at DATETIME NULL, decided_at DATETIME NULL, reject_reason TEXT NULL,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_quote_rev (quote_no, revision),
+    INDEX idx_quote_mo (main_po_id),
+    FOREIGN KEY (main_po_id) REFERENCES main_pos(id) ON DELETE SET NULL
+  )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS quotation_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    quotation_id INT NOT NULL,
+    main_po_item_id INT NULL,
+    proto_code VARCHAR(100), item_name VARCHAR(255) NOT NULL, description TEXT,
+    area VARCHAR(100), size VARCHAR(255), finishes VARCHAR(500), unit VARCHAR(20) DEFAULT 'pcs',
+    qty DECIMAL(14,2) DEFAULT 1, rate DECIMAL(14,2) DEFAULT 0, amount DECIMAL(14,2) DEFAULT 0,
+    sort_order INT DEFAULT 0,
+    INDEX idx_qi_quote (quotation_id),
+    FOREIGN KEY (quotation_id) REFERENCES quotations(id) ON DELETE CASCADE
+  )`);
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('quotation_prefix','QT')").catch(() => {});
+
   // Worker marks their CFT task done ("Mark as Complete")
   await ensureColumn('cft_sheet_workers', 'completed_at', 'completed_at DATETIME NULL');
 
