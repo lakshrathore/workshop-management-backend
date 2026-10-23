@@ -19,6 +19,7 @@ const router = express.Router();
 const { getPool } = require('../database');
 const { auth, adminOnly, adminOrPermission } = require('../middleware/authHelpers');
 const auditLog = require('../middleware/auditLog');
+const { imgUpload } = require('../services/cloudinaryStorage');
 
 const CFT_CONSTANT = 0.00000003528; // fixed conversion constant (mm³ → CFT)
 const OFFCUT_PERCENT = 30;          // fixed, not configurable
@@ -78,6 +79,23 @@ async function loadSheet(db, id) {
   const [rows] = await db.query('SELECT * FROM cft_rows WHERE sheet_id=? ORDER BY row_type, sort_order, id', [id]);
   s.rows = rows;
   s.totals = computeTotals(rows);
+  s.cutting_list_photos = parsePhotos(s.cutting_list_photos);
+  return s;
+}
+
+// Cutting list photos are stored as a JSON array of image URLs
+const MAX_PHOTOS = 20;
+function parsePhotos(v) {
+  try { const a = JSON.parse(v || '[]'); return Array.isArray(a) ? a.filter(u => typeof u === 'string' && u) : []; }
+  catch (e) { return []; }
+}
+// A submitted sheet is locked; only an admin can still change its photos
+async function photoSheet(db, req, res) {
+  const [[s]] = await db.query('SELECT id, status, cutting_list_photos FROM cft_sheets WHERE id=?', [req.params.id]);
+  if (!s) { res.status(404).json({ message: 'CFT sheet not found' }); return null; }
+  if (s.status === 'submitted' && req.user.role !== 'admin') {
+    res.status(400).json({ message: 'Sheet is submitted and locked. Ask an admin to reopen it.' }); return null;
+  }
   return s;
 }
 
@@ -184,6 +202,39 @@ router.put('/cft-sheets/:id', auth, adminOrPermission('cft', 'write'),
       res.status(500).json({ message: err.message });
     } finally { conn.release(); }
   });
+
+// ══ CUTTING LIST PHOTOS ══════════════════════════════════════════════════════
+router.post('/cft-sheets/:id/photos', auth, adminOrPermission('cft', 'write'), (req, res, next) => {
+  imgUpload.array('photos', 10)(req, res, err => {
+    if (err) return res.status(400).json({ message: err.message || 'Photo upload failed' });
+    next();
+  });
+}, async (req, res) => {
+  const db = await getPool();
+  try {
+    const s = await photoSheet(db, req, res);
+    if (!s) return;
+    const added = (req.files || []).map(f => f.path || f.secure_url).filter(Boolean);
+    if (!added.length) return res.status(400).json({ message: 'Choose a photo to upload' });
+    const photos = [...parsePhotos(s.cutting_list_photos), ...added];
+    if (photos.length > MAX_PHOTOS) return res.status(400).json({ message: `A sheet can have at most ${MAX_PHOTOS} photos` });
+    await db.query('UPDATE cft_sheets SET cutting_list_photos=?, updated_by=? WHERE id=?', [JSON.stringify(photos), req.user.id, s.id]);
+    res.json({ message: 'Photo uploaded', cutting_list_photos: photos });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.delete('/cft-sheets/:id/photos', auth, adminOrPermission('cft', 'write'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const s = await photoSheet(db, req, res);
+    if (!s) return;
+    const url = String(req.query.url || '');
+    const photos = parsePhotos(s.cutting_list_photos).filter(u => u !== url);
+    await db.query('UPDATE cft_sheets SET cutting_list_photos=?, updated_by=? WHERE id=?',
+      [photos.length ? JSON.stringify(photos) : null, req.user.id, s.id]);
+    res.json({ message: 'Photo removed', cutting_list_photos: photos });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
 
 // ══ SUBMIT / REOPEN / DELETE ═════════════════════════════════════════════════
 router.post('/cft-sheets/:id/submit', auth, adminOrPermission('cft', 'write'),

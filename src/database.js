@@ -1187,6 +1187,9 @@ async function initializeDatabase() {
     FOREIGN KEY (sheet_id) REFERENCES cft_sheets(id) ON DELETE CASCADE
   )`);
 
+  // Cutting list photos on a CFT sheet: JSON array of image URLs
+  await ensureColumn('cft_sheets', 'cutting_list_photos', 'cutting_list_photos TEXT NULL');
+
   // CFT sheet series (INSERT IGNORE — never overwrites)
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_prefix','CFT')").catch(()=>{});
 
