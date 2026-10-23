@@ -6,7 +6,8 @@
 // Older orders/projects have no mode (NULL) and keep working as manual.
 //
 // Series (Settings → Proto Code Series): proto_code_prefix + number, e.g. PROTO_1001.
-// One series for the whole software, so codes never repeat across projects.
+// It starts at the Starting Number and skips any code already used anywhere, so
+// codes never repeat across projects.
 
 const MODES = ['manual', 'auto'];
 const DEFAULT_PREFIX = 'PROTO_';
@@ -17,7 +18,6 @@ const readMode = v => (MODES.includes(v) ? v : null);
 
 // Same loose rule as the rest of the app: PROTO_86005 = PROTO-86005 = 86005
 const normCode = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^PROTO/, '');
-const sqlNorm = col => `REGEXP_REPLACE(REGEXP_REPLACE(UPPER(COALESCE(${col},'')),'[^A-Z0-9]',''),'^PROTO','')`;
 
 const cleanCode = v => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, 100);
 
@@ -31,39 +31,43 @@ async function readSeries(db) {
   return { prefix, start };
 }
 
-const likeEscape = s => s.replace(/[\\%_]/g, c => `\\${c}`);
-const reEscape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-// Highest number already used in the series, in projects or Manufacturing Orders
-async function highestUsed(db, prefix) {
-  const re = new RegExp(`^${reEscape(prefix)}(\\d+)$`, 'i');
-  const like = `${likeEscape(prefix)}%`;
-  let max = 0;
+// Every Proto Code already used anywhere (loose form), so the series can skip them
+async function usedCodes(db) {
+  const set = new Set();
   for (const table of ['project_items', 'main_po_items']) {
-    const [rows] = await db.query(`SELECT proto_code FROM ${table} WHERE proto_code LIKE ?`, [like]);
-    for (const r of rows) {
-      const m = re.exec(String(r.proto_code || '').trim());
-      if (m) max = Math.max(max, parseInt(m[1], 10));
-    }
+    const [rows] = await db.query(`SELECT proto_code FROM ${table} WHERE proto_code IS NOT NULL AND proto_code <> ''`);
+    for (const r of rows) { const n = normCode(r.proto_code); if (n) set.add(n); }
   }
-  return max;
+  return set;
 }
 
-async function codeExists(db, code) {
-  const n = normCode(code);
-  if (!n) return false;
-  for (const table of ['project_items', 'main_po_items']) {
-    const [[row]] = await db.query(`SELECT 1 AS x FROM ${table} WHERE ${sqlNorm('proto_code')} = ? LIMIT 1`, [n]);
-    if (row) return true;
+// The counter remembers "prefix|start|last number given". When the prefix or the
+// Starting Number in Settings changes, counting starts again at the new Starting Number.
+const COUNTER_KEY = 'proto_code_last_number';
+function lastGiven(value, prefix, start) {
+  const [p, st, last] = String(value || '').split('|');
+  if (last !== undefined && p === prefix && Number(st) === start) return Math.max(start - 1, parseInt(last, 10) || 0);
+  return start - 1;
+}
+
+// Next free numbers from the Starting Number, skipping codes that are already used
+function pickCodes(prefix, from, count, used) {
+  const out = [];
+  let n = from;
+  for (let guard = 0; out.length < count && guard < count + 100000; guard++, n++) {
+    const code = `${prefix}${n}`;
+    if (!used.has(normCode(code))) out.push(code);
   }
-  return false;
+  if (out.length < count) throw new Error('Could not find free Proto Codes in the series');
+  return { codes: out, last: n - 1 };
 }
 
 // What the next codes would be (preview only — nothing is reserved)
 async function previewCodes(db, count = 1) {
   const { prefix, start } = await readSeries(db);
-  let next = Math.max(start, (await highestUsed(db, prefix)) + 1);
-  return { prefix, start, next: `${prefix}${next}`, codes: Array.from({ length: count }, () => `${prefix}${next++}`) };
+  const [[row]] = await db.query('SELECT setting_value FROM app_settings WHERE setting_key=?', [COUNTER_KEY]);
+  const { codes } = pickCodes(prefix, lastGiven(row?.setting_value, prefix, start) + 1, count, await usedCodes(db));
+  return { prefix, start, next: codes[0], codes };
 }
 
 // Take the next `count` codes of the series. MUST run inside a transaction on `conn`:
@@ -71,25 +75,11 @@ async function previewCodes(db, count = 1) {
 async function takeCodes(conn, count) {
   if (!count) return [];
   const { prefix, start } = await readSeries(conn);
-  await conn.query(
-    "INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('proto_code_last_number', '0')");
-  const [[row]] = await conn.query(
-    "SELECT setting_value FROM app_settings WHERE setting_key='proto_code_last_number' FOR UPDATE");
-  // The counter remembers the prefix it counted for; a new prefix starts its own count
-  let [lastPrefix, lastNum] = String(row?.setting_value || '').split('|');
-  if (lastNum === undefined) { lastNum = lastPrefix; lastPrefix = prefix; }   // old plain value
-  const counted = lastPrefix === prefix ? (parseInt(lastNum, 10) || 0) : 0;
-  let next = Math.max(start, counted + 1, (await highestUsed(conn, prefix)) + 1);
-  const out = [];
-  for (let guard = 0; out.length < count && guard < count + 5000; guard++, next++) {
-    const code = `${prefix}${next}`;
-    if (await codeExists(conn, code)) continue;      // e.g. someone typed "1005" by hand
-    out.push(code);
-  }
-  if (out.length < count) throw new Error('Could not find free Proto Codes in the series');
-  await conn.query("UPDATE app_settings SET setting_value=? WHERE setting_key='proto_code_last_number'",
-    [`${prefix}|${next - 1}`]);
-  return out;
+  await conn.query('INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES (?, ?)', [COUNTER_KEY, '']);
+  const [[row]] = await conn.query('SELECT setting_value FROM app_settings WHERE setting_key=? FOR UPDATE', [COUNTER_KEY]);
+  const { codes, last } = pickCodes(prefix, lastGiven(row?.setting_value, prefix, start) + 1, count, await usedCodes(conn));
+  await conn.query('UPDATE app_settings SET setting_value=? WHERE setting_key=?', [`${prefix}|${start}|${last}`, COUNTER_KEY]);
+  return codes;
 }
 
 // Manual codes: no code twice in one order/project (loose match).
