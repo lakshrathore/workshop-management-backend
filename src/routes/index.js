@@ -3220,6 +3220,106 @@ router.get('/reports/departments', auth, adminOrPermission('reports','read'), as
   }
 });
 
+// Every Proto Code given automatically by the Settings series:
+//  • rows of Manufacturing Orders created in Automatic mode
+//  • items added straight to an Automatic project (Project page, worker request, client PO)
+// ?from=&to= (YYYY-MM-DD, date the code was given) &project_id= &main_po_id= &source=mo|project
+// &in_project=yes|no &q= (code, item, project, order, area, person)
+router.get('/reports/auto-proto-codes', auth, adminOrPermission('reports','read'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const q = req.query;
+    const date = v => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : null);
+    const from = date(q.from), to = date(q.to);
+    const projectId = parseInt(q.project_id, 10) || null;
+    const moId = parseInt(q.main_po_id, 10) || null;
+
+    const moWhere = ["mp.proto_mode='auto'", "COALESCE(mpi.proto_code,'')<>''"], moArgs = [];
+    const piWhere = ["p.proto_mode='auto'", 'pi.source_main_po_item_id IS NULL', "COALESCE(pi.proto_code,'')<>''"], piArgs = [];
+    if (from) { moWhere.push('DATE(mpi.created_at) >= ?'); moArgs.push(from); piWhere.push('DATE(pi.created_at) >= ?'); piArgs.push(from); }
+    if (to) { moWhere.push('DATE(mpi.created_at) <= ?'); moArgs.push(to); piWhere.push('DATE(pi.created_at) <= ?'); piArgs.push(to); }
+    if (projectId) { moWhere.push('mp.project_id = ?'); moArgs.push(projectId); piWhere.push('p.id = ?'); piArgs.push(projectId); }
+    if (moId) { moWhere.push('mp.id = ?'); moArgs.push(moId); }
+
+    const [moRows] = q.source === 'project' ? [[]] : await db.query(
+      `SELECT mpi.id AS row_id, mpi.proto_code, mpi.product_name AS item_name, mpi.area, mpi.qty, mpi.created_at AS given_at,
+              mpi.added_after_approval, mpi.project_item_id,
+              mp.id AS main_po_id, mp.po_no, mp.status AS mo_status,
+              p.id AS project_id, p.name AS project_name, p.project_id AS project_code,
+              u.name AS created_by_name
+         FROM main_po_items mpi
+         JOIN main_pos mp ON mp.id = mpi.main_po_id
+         LEFT JOIN projects p ON p.id = mp.project_id
+         LEFT JOIN users u ON u.id = mp.created_by
+        WHERE ${moWhere.join(' AND ')}`, moArgs);
+    const [piRows] = (q.source === 'mo' || moId) ? [[]] : await db.query(
+      `SELECT pi.id AS row_id, pi.proto_code, pi.item_name, pi.area, pi.quantity AS qty, pi.created_at AS given_at,
+              p.id AS project_id, p.name AS project_name, p.project_id AS project_code,
+              u.name AS created_by_name
+         FROM project_items pi
+         JOIN projects p ON p.id = pi.project_id
+         LEFT JOIN users u ON u.id = pi.created_by
+        WHERE ${piWhere.join(' AND ')}`, piArgs);
+
+    let rows = [
+      ...moRows.map(r => ({
+        key: `mo-${r.row_id}`, proto_code: r.proto_code, item_name: r.item_name, area: r.area, qty: Number(r.qty) || 0,
+        given_at: r.given_at, source: 'mo', source_label: r.added_after_approval ? 'Manufacturing Order (added later)' : 'Manufacturing Order',
+        main_po_id: r.main_po_id, po_no: r.po_no, mo_status: r.mo_status,
+        project_id: r.project_id, project_name: r.project_name, project_code: r.project_code,
+        in_project: !!r.project_item_id, created_by_name: r.created_by_name,
+      })),
+      ...piRows.map(r => ({
+        key: `pi-${r.row_id}`, proto_code: r.proto_code, item_name: r.item_name, area: r.area, qty: Number(r.qty) || 0,
+        given_at: r.given_at, source: 'project', source_label: 'Added on Project',
+        main_po_id: null, po_no: null, mo_status: null,
+        project_id: r.project_id, project_name: r.project_name, project_code: r.project_code,
+        in_project: true, created_by_name: r.created_by_name,
+      })),
+    ];
+    if (q.in_project === 'yes') rows = rows.filter(r => r.in_project);
+    if (q.in_project === 'no') rows = rows.filter(r => !r.in_project);
+    const words = String(q.q || '').toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length) {
+      rows = rows.filter(r => {
+        const hay = [r.proto_code, r.item_name, r.area, r.project_name, r.project_code, r.po_no, r.created_by_name].join(' ').toLowerCase();
+        return words.every(w => hay.includes(w));
+      });
+    }
+    // Series order (prefix, then number)
+    const numOf = c => { const m = /(\d+)\s*$/.exec(c || ''); return m ? Number(m[1]) : 0; };
+    rows.sort((a, b) => String(a.proto_code).replace(/\d+\s*$/, '').localeCompare(String(b.proto_code).replace(/\d+\s*$/, ''))
+      || numOf(a.proto_code) - numOf(b.proto_code));
+
+    const byProject = new Map();
+    for (const r of rows) {
+      const k = r.project_id || `mo-${r.main_po_id}`;
+      if (!byProject.has(k)) byProject.set(k, { project_id: r.project_id, project_name: r.project_name, project_code: r.project_code, po_no: r.project_id ? null : r.po_no, codes: 0, first: r.proto_code, last: r.proto_code });
+      const g = byProject.get(k); g.codes++; g.last = r.proto_code;
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const month = today.slice(0, 7);
+    const dayOf = d => (d instanceof Date ? d.toISOString() : String(d || '')).slice(0, 10);
+    res.json({
+      rows,
+      by_project: [...byProject.values()].sort((a, b) => b.codes - a.codes),
+      summary: {
+        total: rows.length,
+        from_mo: rows.filter(r => r.source === 'mo').length,
+        from_project: rows.filter(r => r.source === 'project').length,
+        in_project: rows.filter(r => r.in_project).length,
+        not_in_project: rows.filter(r => !r.in_project).length,
+        projects: new Set(rows.filter(r => r.project_id).map(r => r.project_id)).size,
+        orders: new Set(rows.filter(r => r.main_po_id).map(r => r.main_po_id)).size,
+        today: rows.filter(r => dayOf(r.given_at) === today).length,
+        this_month: rows.filter(r => dayOf(r.given_at).slice(0, 7) === month).length,
+        first_code: rows[0]?.proto_code || null,
+        last_code: rows[rows.length - 1]?.proto_code || null,
+      },
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 router.get('/reports/transfers', auth, adminOrPermission('reports','read'), async (req, res) => {
   const db = await getPool();
   const [rows] = await db.query(`

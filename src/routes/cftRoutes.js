@@ -149,6 +149,99 @@ router.get('/cft-sheets/:id', auth, adminOrPermission('cft', 'read'), async (req
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ══ REPORT: status, approvals, Tally entries, who created / updated ═══════════
+// ?from=&to= (sheet created) &project_id= &status=draft|pending|approved|rejected|submitted
+// &tally=entered|not_entered|pending|not_assigned &worker_id= &q=
+router.get('/cft-report', auth, adminOrPermission('cft', 'read'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const q = req.query;
+    const date = v => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : null);
+    const where = [], args = [];
+    if (date(q.from)) { where.push('DATE(cs.created_at) >= ?'); args.push(date(q.from)); }
+    if (date(q.to)) { where.push('DATE(cs.created_at) <= ?'); args.push(date(q.to)); }
+    if (parseInt(q.project_id, 10)) { where.push('cs.project_id = ?'); args.push(parseInt(q.project_id, 10)); }
+    const [sheets] = await db.query(
+      `SELECT cs.id, cs.sheet_no, cs.status, cs.wood_type, cs.remarks, cs.created_at, cs.updated_at,
+              cs.submitted_at, cs.approved_at, cs.rejected_at, cs.rejected_reason,
+              cs.total_demand_cft, cs.total_issue_cft, cs.total_return_cft, cs.net_difference,
+              p.id AS project_id, p.name AS project_name, p.project_id AS project_code, pi.item_name,
+              cu.name AS created_by_name, uu.name AS updated_by_name, su.name AS submitted_by_name, au.name AS approved_by_name
+         FROM cft_sheets cs
+         LEFT JOIN projects p ON p.id = cs.project_id
+         LEFT JOIN project_items pi ON pi.id = cs.project_item_id
+         LEFT JOIN users cu ON cu.id = cs.created_by
+         LEFT JOIN users uu ON uu.id = cs.updated_by
+         LEFT JOIN users su ON su.id = cs.submitted_by
+         LEFT JOIN users au ON au.id = cs.approved_by
+        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+        ORDER BY cs.id DESC`, args);
+    const ids = sheets.map(s => s.id);
+    let workers = [], decisions = [];
+    if (ids.length) {
+      [workers] = await db.query(
+        `SELECT w.sheet_id, w.worker_id, u.name AS worker_name, w.assigned_at, ab.name AS assigned_by_name,
+                w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at
+           FROM cft_sheet_workers w JOIN users u ON u.id = w.worker_id
+           LEFT JOIN users ab ON ab.id = w.assigned_by
+          WHERE w.sheet_id IN (?) ORDER BY u.name`, [ids]);
+      [decisions] = await db.query(
+        `SELECT related_id, status, COUNT(*) AS c FROM approvals
+          WHERE type='CFT' AND related_id IN (?) GROUP BY related_id, status`, [ids]);
+    }
+    const tallyOf = list => {
+      if (!list.length) return 'not_assigned';
+      if (list.some(w => w.entered_in_tally === 'yes')) return 'entered';
+      if (list.every(w => w.entered_in_tally === 'no')) return 'not_entered';
+      return 'pending';
+    };
+    let rows = sheets.map(s => {
+      const list = workers.filter(w => w.sheet_id === s.id);
+      const count = st => Number((decisions.find(d => d.related_id === s.id && d.status === st) || {}).c || 0);
+      return {
+        ...s,
+        // A draft carrying a reject reason = rejected and waiting for corrections
+        report_status: s.status === 'draft' && s.rejected_reason ? 'rejected' : s.status,
+        times_sent: count('APPROVED') + count('REJECTED') + count('PENDING'),
+        times_rejected: count('REJECTED'),
+        workers: list,
+        tally_status: s.status === 'approved' || list.length ? tallyOf(list) : 'not_assigned',
+        stock_journal_nos: [...new Set(list.map(w => w.stock_journal_no).filter(Boolean))],
+      };
+    });
+    if (q.status) rows = rows.filter(r => r.report_status === q.status);
+    if (q.tally) rows = rows.filter(r => r.tally_status === q.tally);
+    if (parseInt(q.worker_id, 10)) rows = rows.filter(r => r.workers.some(w => w.worker_id === parseInt(q.worker_id, 10)));
+    const words = String(q.q || '').toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length) {
+      rows = rows.filter(r => {
+        const hay = [r.sheet_no, r.project_name, r.project_code, r.item_name, r.wood_type, r.created_by_name, r.updated_by_name,
+          r.approved_by_name, r.rejected_reason, ...r.workers.flatMap(w => [w.worker_name, w.stock_journal_no, w.other_details])].join(' ').toLowerCase();
+        return words.every(w => hay.includes(w));
+      });
+    }
+    const n = f => rows.filter(f).length;
+    res.json({
+      rows,
+      summary: {
+        total: rows.length,
+        draft: n(r => r.report_status === 'draft'),
+        pending: n(r => r.report_status === 'pending'),
+        approved: n(r => r.report_status === 'approved'),
+        rejected: n(r => r.report_status === 'rejected'),
+        submitted_old: n(r => r.report_status === 'submitted'),
+        rejections_total: rows.reduce((a, r) => a + r.times_rejected, 0),
+        tally_entered: n(r => r.tally_status === 'entered'),
+        tally_not_entered: n(r => r.tally_status === 'not_entered'),
+        tally_pending: n(r => r.tally_status === 'pending'),
+        approved_not_assigned: n(r => r.status === 'approved' && !r.workers.length),
+        worker_entries: rows.reduce((a, r) => a + r.workers.filter(w => w.entered_in_tally).length, 0),
+      },
+      workers: [...new Map(workers.map(w => [w.worker_id, { id: w.worker_id, name: w.worker_name }])).values()],
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ══ CREATE ═══════════════════════════════════════════════════════════════════
 router.post('/cft-sheets', auth, adminOrPermission('cft', 'write'),
   auditLog('CREATE', 'CFTSheet'), async (req, res) => {
