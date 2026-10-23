@@ -206,6 +206,7 @@ qualityRoutes.registerQualityApproval();
 // ── CFT MODULE (Phase 6) — Solid Wood Issue Sheet, demand/issue/return ──
 const cftRoutes = require('./routes/cftRoutes');
 app.use('/api', cftRoutes);
+cftRoutes.registerCftApproval();
 
 // ── CLIENT PORTAL ROUTES ──────────────────────────────────────────────────────
 const clientRoutes = require('./routes/clientRoutes');

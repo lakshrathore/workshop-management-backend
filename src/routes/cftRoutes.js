@@ -20,6 +20,7 @@ const { getPool } = require('../database');
 const { auth, adminOnly, adminOrPermission } = require('../middleware/authHelpers');
 const auditLog = require('../middleware/auditLog');
 const { imgUpload } = require('../services/cloudinaryStorage');
+const { createApprovalRequest } = require('../services/approvalService');
 
 const CFT_CONSTANT = 0.00000003528; // fixed conversion constant (mm³ → CFT)
 const OFFCUT_PERCENT = 30;          // fixed, not configurable
@@ -68,8 +69,9 @@ async function loadSheet(db, id) {
   const [[s]] = await db.query(
     `SELECT cs.*, p.project_id AS project_code, p.name AS project_name,
             pi.item_name, pi.proto_code AS item_proto_code,
-            cu.name AS created_by_name, su.name AS submitted_by_name
+            cu.name AS created_by_name, su.name AS submitted_by_name, au.name AS approved_by_name
      FROM cft_sheets cs
+     LEFT JOIN users au ON au.id = cs.approved_by
      LEFT JOIN projects p ON p.id = cs.project_id
      LEFT JOIN project_items pi ON pi.id = cs.project_item_id
      LEFT JOIN users cu ON cu.id = cs.created_by
@@ -80,8 +82,24 @@ async function loadSheet(db, id) {
   s.rows = rows;
   s.totals = computeTotals(rows);
   s.cutting_list_photos = parsePhotos(s.cutting_list_photos);
+  const [workers] = await db.query(
+    `SELECT w.worker_id, u.name AS worker_name, u.username, w.assigned_at, ab.name AS assigned_by_name,
+            w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at
+       FROM cft_sheet_workers w
+       JOIN users u ON u.id = w.worker_id
+       LEFT JOIN users ab ON ab.id = w.assigned_by
+      WHERE w.sheet_id=? ORDER BY u.name`, [id]);
+  s.assigned_workers = workers;
   return s;
 }
+
+// Only drafts can be changed; everything after "Send for Approval" is locked
+const isLocked = s => s.status !== 'draft';
+const LOCK_MSG = {
+  pending: 'This sheet is waiting for approval and is locked.',
+  approved: 'This sheet is approved and locked. An admin can reopen it.',
+  submitted: 'Sheet is submitted and locked. Ask an admin to reopen it.',
+};
 
 // Cutting list photos are stored as a JSON array of image URLs
 const MAX_PHOTOS = 20;
@@ -93,8 +111,8 @@ function parsePhotos(v) {
 async function photoSheet(db, req, res) {
   const [[s]] = await db.query('SELECT id, status, cutting_list_photos FROM cft_sheets WHERE id=?', [req.params.id]);
   if (!s) { res.status(404).json({ message: 'CFT sheet not found' }); return null; }
-  if (s.status === 'submitted' && req.user.role !== 'admin') {
-    res.status(400).json({ message: 'Sheet is submitted and locked. Ask an admin to reopen it.' }); return null;
+  if (isLocked(s) && req.user.role !== 'admin') {
+    res.status(400).json({ message: LOCK_MSG[s.status] || 'This sheet is locked.' }); return null;
   }
   return s;
 }
@@ -107,7 +125,8 @@ router.get('/cft-sheets', auth, adminOrPermission('cft', 'read'), async (req, re
     if (req.query.status && req.query.status !== 'all') { where.push('cs.status=?'); params.push(req.query.status); }
     if (req.query.project_id) { where.push('cs.project_id=?'); params.push(req.query.project_id); }
     const [rows] = await db.query(
-      `SELECT cs.id, cs.sheet_no, cs.status, cs.wood_type, cs.created_at,
+      `SELECT cs.id, cs.sheet_no, cs.status, cs.wood_type, cs.created_at, cs.rejected_reason,
+              (SELECT COUNT(*) FROM cft_sheet_workers w WHERE w.sheet_id = cs.id) AS assigned_count,
               cs.total_demand_cft, cs.total_issue_cft, cs.net_difference,
               p.project_id AS project_code, p.name AS project_name, pi.item_name, cu.name AS created_by_name
        FROM cft_sheets cs
@@ -160,9 +179,9 @@ router.put('/cft-sheets/:id', auth, adminOrPermission('cft', 'write'),
       await conn.beginTransaction();
       const [[s]] = await conn.query('SELECT * FROM cft_sheets WHERE id=? FOR UPDATE', [req.params.id]);
       if (!s) { await conn.rollback(); return res.status(404).json({ message: 'CFT sheet not found' }); }
-      if (s.status === 'submitted') {
+      if (isLocked(s)) {
         await conn.rollback();
-        return res.status(400).json({ message: 'Sheet is submitted and locked. Ask an admin to reopen it.' });
+        return res.status(400).json({ message: LOCK_MSG[s.status] || 'This sheet is locked.' });
       }
       const b = req.body;
       await conn.query(
@@ -237,28 +256,151 @@ router.delete('/cft-sheets/:id/photos', auth, adminOrPermission('cft', 'write'),
 });
 
 // ══ SUBMIT / REOPEN / DELETE ═════════════════════════════════════════════════
-router.post('/cft-sheets/:id/submit', auth, adminOrPermission('cft', 'write'),
-  auditLog('UPDATE', 'CFTSheet'), async (req, res) => {
-    const db = await getPool();
-    try {
-      const [[s]] = await db.query('SELECT * FROM cft_sheets WHERE id=?', [req.params.id]);
-      if (!s) return res.status(404).json({ message: 'CFT sheet not found' });
-      if (s.status === 'submitted') return res.status(400).json({ message: 'Already submitted' });
-      const [[{ c }]] = await db.query('SELECT COUNT(*) c FROM cft_rows WHERE sheet_id=?', [s.id]);
-      if (!c) return res.status(400).json({ message: 'Add at least one row before submitting' });
-      await db.query("UPDATE cft_sheets SET status='submitted', submitted_by=?, submitted_at=NOW() WHERE id=?", [req.user.id, s.id]);
-      res.json({ message: 'CFT sheet submitted and locked' });
-    } catch (err) { res.status(500).json({ message: err.message }); }
-  });
+// Send for approval: locks the draft and puts it in the Approvals inbox (type CFT)
+async function sendForApproval(req, res) {
+  const db = await getPool();
+  try {
+    const [[s]] = await db.query(
+      `SELECT cs.*, p.name AS project_name, p.project_id AS project_code, pi.item_name
+         FROM cft_sheets cs LEFT JOIN projects p ON p.id = cs.project_id
+         LEFT JOIN project_items pi ON pi.id = cs.project_item_id WHERE cs.id=?`, [req.params.id]);
+    if (!s) return res.status(404).json({ message: 'CFT sheet not found' });
+    if (s.status !== 'draft') return res.status(400).json({ message: LOCK_MSG[s.status] || `Sheet is ${s.status}` });
+    const [[{ c }]] = await db.query('SELECT COUNT(*) c FROM cft_rows WHERE sheet_id=?', [s.id]);
+    if (!c) return res.status(400).json({ message: 'Add at least one row before sending for approval' });
+    const [[pending]] = await db.query(
+      "SELECT id FROM approvals WHERE type='CFT' AND related_id=? AND status='PENDING' LIMIT 1", [s.id]);
+    if (pending) return res.status(400).json({ message: 'This sheet is already waiting for approval' });
+    await createApprovalRequest({
+      type: 'CFT', userId: req.user.id, relatedId: s.id,
+      requestData: {
+        sheet_no: s.sheet_no, project_name: s.project_name, project_code: s.project_code, item_name: s.item_name,
+        wood_type: s.wood_type, total_demand_cft: s.total_demand_cft, total_issue_cft: s.total_issue_cft,
+        net_difference: s.net_difference, rows: c,
+      },
+    });
+    await db.query(
+      "UPDATE cft_sheets SET status='pending', submitted_by=?, submitted_at=NOW(), rejected_reason=NULL, rejected_at=NULL WHERE id=?",
+      [req.user.id, s.id]);
+    res.json({ message: 'CFT sheet sent for approval' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+}
+router.post('/cft-sheets/:id/send-approval', auth, adminOrPermission('cft', 'write'), auditLog('UPDATE', 'CFTSheet'), sendForApproval);
+router.post('/cft-sheets/:id/submit', auth, adminOrPermission('cft', 'write'), auditLog('UPDATE', 'CFTSheet'), sendForApproval);
+
+// ══ ASSIGN an approved sheet to workers (multi-select) ══════════════════════════
+router.get('/cft-sheets/:id/assignable-workers', auth, adminOrPermission('cft', 'edit'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const [rows] = await db.query(
+      "SELECT id, name, username FROM users WHERE role='worker' AND (is_active=1 OR is_active IS NULL) ORDER BY name");
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Body { worker_ids: [..] } = the full list of workers for this sheet
+router.put('/cft-sheets/:id/workers', auth, adminOrPermission('cft', 'edit'), auditLog('UPDATE', 'CFTSheet'), async (req, res) => {
+  const pool = await getPool();
+  const conn = await pool.getConnection();
+  try {
+    const ids = [...new Set((Array.isArray(req.body.worker_ids) ? req.body.worker_ids : []).map(Number).filter(n => n > 0))];
+    await conn.beginTransaction();
+    const [[s]] = await conn.query('SELECT id, status FROM cft_sheets WHERE id=? FOR UPDATE', [req.params.id]);
+    if (!s) { await conn.rollback(); return res.status(404).json({ message: 'CFT sheet not found' }); }
+    if (s.status !== 'approved') { await conn.rollback(); return res.status(400).json({ message: 'Only an approved sheet can be assigned to workers' }); }
+    if (ids.length) {
+      const [ok] = await conn.query("SELECT id FROM users WHERE role='worker' AND id IN (?)", [ids]);
+      if (ok.length !== ids.length) { await conn.rollback(); return res.status(400).json({ message: 'Some selected users are not workers' }); }
+    }
+    const [current] = await conn.query(
+      `SELECT w.worker_id, u.name, (w.entered_in_tally IS NOT NULL OR COALESCE(w.stock_journal_no,'')<>'' OR COALESCE(w.other_details,'')<>'') AS has_details
+         FROM cft_sheet_workers w JOIN users u ON u.id = w.worker_id WHERE w.sheet_id=?`, [s.id]);
+    // A worker who already filled in details stays, so their entry is not lost
+    const keep = current.filter(c => !ids.includes(c.worker_id) && Number(c.has_details));
+    if (keep.length) {
+      await conn.rollback();
+      return res.status(400).json({ message: `${keep.map(k => k.name).join(', ')} already entered Tally details on this sheet and can't be removed` });
+    }
+    const removeIds = current.map(c => c.worker_id).filter(id => !ids.includes(id));
+    if (removeIds.length) await conn.query('DELETE FROM cft_sheet_workers WHERE sheet_id=? AND worker_id IN (?)', [s.id, removeIds]);
+    for (const wid of ids) {
+      await conn.query('INSERT IGNORE INTO cft_sheet_workers (sheet_id, worker_id, assigned_by) VALUES (?,?,?)', [s.id, wid, req.user.id]);
+    }
+    await conn.commit();
+    res.json({ message: ids.length ? `Assigned to ${ids.length} worker(s)` : 'No workers assigned', worker_ids: ids });
+  } catch (err) {
+    try { await conn.rollback(); } catch (e) { /* noop */ }
+    res.status(500).json({ message: err.message });
+  } finally { conn.release(); }
+});
+
+// ══ ASSIGNED WORKER: read-only sheet + their own Tally details ════════════════
+router.get('/cft-assigned', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [rows] = await db.query(
+      `SELECT cs.id, cs.sheet_no, cs.wood_type, cs.approved_at, cs.total_demand_cft, cs.total_issue_cft, cs.net_difference,
+              p.name AS project_name, p.project_id AS project_code, pi.item_name,
+              w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at, w.assigned_at
+         FROM cft_sheet_workers w
+         JOIN cft_sheets cs ON cs.id = w.sheet_id
+         LEFT JOIN projects p ON p.id = cs.project_id
+         LEFT JOIN project_items pi ON pi.id = cs.project_item_id
+        WHERE w.worker_id=? AND cs.status='approved'
+        ORDER BY w.assigned_at DESC`, [req.user.id]);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+async function myAssignment(db, req) {
+  const [[a]] = await db.query(
+    `SELECT w.* FROM cft_sheet_workers w JOIN cft_sheets cs ON cs.id = w.sheet_id
+      WHERE w.sheet_id=? AND w.worker_id=? AND cs.status='approved'`, [req.params.id, req.user.id]);
+  return a || null;
+}
+
+router.get('/cft-assigned/:id', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const a = await myAssignment(db, req);
+    if (!a) return res.status(404).json({ message: 'This CFT sheet is not assigned to you' });
+    const s = await loadSheet(db, req.params.id);
+    s.my_assignment = {
+      entered_in_tally: a.entered_in_tally, stock_journal_no: a.stock_journal_no,
+      other_details: a.other_details, details_updated_at: a.details_updated_at, assigned_at: a.assigned_at,
+    };
+    delete s.assigned_workers;   // a worker sees only their own entry
+    res.json(s);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.put('/cft-assigned/:id', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const a = await myAssignment(db, req);
+    if (!a) return res.status(404).json({ message: 'This CFT sheet is not assigned to you' });
+    const b = req.body || {};
+    const tally = b.entered_in_tally === 'yes' || b.entered_in_tally === 'no' ? b.entered_in_tally : null;
+    if (!tally) return res.status(400).json({ message: 'Choose Yes or No for "Entered in Tally"' });
+    const sj = String(b.stock_journal_no ?? '').trim().slice(0, 100);
+    if (tally === 'yes' && !sj) return res.status(400).json({ message: 'Enter the Stock Journal Number' });
+    const other = String(b.other_details ?? '').trim().slice(0, 2000);
+    await db.query(
+      'UPDATE cft_sheet_workers SET entered_in_tally=?, stock_journal_no=?, other_details=?, details_updated_at=NOW() WHERE id=?',
+      [tally, sj || null, other || null, a.id]);
+    res.json({ message: 'Details saved' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
 
 router.post('/cft-sheets/:id/reopen', auth, adminOnly, auditLog('UPDATE', 'CFTSheet'), async (req, res) => {
   const db = await getPool();
   try {
     const [[s]] = await db.query('SELECT * FROM cft_sheets WHERE id=?', [req.params.id]);
     if (!s) return res.status(404).json({ message: 'CFT sheet not found' });
-    if (s.status !== 'submitted') return res.status(400).json({ message: 'Sheet is not submitted' });
+    if (!['submitted', 'approved'].includes(s.status))
+      return res.status(400).json({ message: s.status === 'pending' ? 'Approve or reject it from the Approvals page' : 'Sheet is not locked' });
     await db.query("UPDATE cft_sheets SET status='draft', updated_by=? WHERE id=?", [req.user.id, s.id]);
-    res.json({ message: 'CFT sheet reopened for editing' });
+    res.json({ message: 'CFT sheet reopened for editing. Send it for approval again when done.' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -279,4 +421,32 @@ router.get('/cft-config', auth, adminOrPermission('cft', 'read'), (req, res) => 
   res.json({ cft_constant: CFT_CONSTANT, offcut_percent: OFFCUT_PERCENT });
 });
 
+// ══ APPROVAL INTEGRATION (registered from server.js) ═════════════════════════
+async function resolveCft(approval) {
+  const db = await getPool();
+  const id = approval.related_id;
+  const [[s]] = await db.query('SELECT id, status FROM cft_sheets WHERE id=?', [id]);
+  if (!s) throw new Error(`CFT sheet #${id} not found`);
+  if (s.status === 'approved') return { id };                         // idempotent
+  if (s.status !== 'pending') throw new Error(`CFT sheet is ${s.status}, cannot approve`);
+  const [[apr]] = await db.query('SELECT approved_by FROM approvals WHERE id=?', [approval.id]);
+  await db.query("UPDATE cft_sheets SET status='approved', approved_by=?, approved_at=NOW() WHERE id=?",
+    [apr?.approved_by || null, id]);
+  return { id };
+}
+
+function registerCftApproval() {
+  const { RESOLVERS } = require('../middleware/approvalResolvers');
+  const { registerRejectHook } = require('../services/approvalHooks');
+  RESOLVERS.CFT = resolveCft;
+  // Reject → back to draft for corrections, with the reason shown on the sheet
+  registerRejectHook('CFT', async (approval, adminId, reason) => {
+    await (await getPool()).query(
+      "UPDATE cft_sheets SET status='draft', rejected_reason=?, rejected_at=NOW() WHERE id=? AND status='pending'",
+      [reason || 'Rejected', approval.related_id]);
+  });
+  console.log('✅ CFT approval resolver + reject hook registered');
+}
+
 module.exports = router;
+module.exports.registerCftApproval = registerCftApproval;

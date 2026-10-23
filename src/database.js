@@ -1199,6 +1199,31 @@ async function initializeDatabase() {
   // Cutting list photos on a CFT sheet: JSON array of image URLs
   await ensureColumn('cft_sheets', 'cutting_list_photos', 'cutting_list_photos TEXT NULL');
 
+  // CFT approval flow: draft → pending (sent for approval) → approved → assigned to workers.
+  // 'submitted' stays for sheets locked before this flow existed. Appending ENUM values is safe.
+  await safeAlter(`ALTER TABLE cft_sheets MODIFY COLUMN status ENUM('draft','submitted','pending','approved') DEFAULT 'draft'`);
+  await ensureColumn('cft_sheets', 'approved_by', 'approved_by INT NULL');
+  await ensureColumn('cft_sheets', 'approved_at', 'approved_at DATETIME NULL');
+  await ensureColumn('cft_sheets', 'rejected_reason', 'rejected_reason TEXT NULL');
+  await ensureColumn('cft_sheets', 'rejected_at', 'rejected_at DATETIME NULL');
+  await safeAlter(`ALTER TABLE approvals MODIFY COLUMN type ENUM('PROJECT','ITEM','CHALLAN','PO_STATUS','SALE','MAIN_PO','CASHBOOK_ADVANCE','CASHBOOK_EXPENSE','QUALITY_REPORT','CFT') NOT NULL`);
+  // Workers an approved sheet is assigned to; each fills their own Tally details
+  await db.query(`CREATE TABLE IF NOT EXISTS cft_sheet_workers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sheet_id INT NOT NULL,
+    worker_id INT NOT NULL,
+    assigned_by INT NULL,
+    assigned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    entered_in_tally ENUM('yes','no') NULL,
+    stock_journal_no VARCHAR(100) NULL,
+    other_details TEXT NULL,
+    details_updated_at DATETIME NULL,
+    UNIQUE KEY uq_cft_worker (sheet_id, worker_id),
+    INDEX idx_cftw_worker (worker_id),
+    FOREIGN KEY (sheet_id) REFERENCES cft_sheets(id) ON DELETE CASCADE,
+    FOREIGN KEY (worker_id) REFERENCES users(id) ON DELETE CASCADE
+  )`);
+
   // CFT sheet series (INSERT IGNORE — never overwrites)
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_prefix','CFT')").catch(()=>{});
 
