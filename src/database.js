@@ -1218,11 +1218,14 @@ async function initializeDatabase() {
     stock_journal_no VARCHAR(100) NULL,
     other_details TEXT NULL,
     details_updated_at DATETIME NULL,
+    completed_at DATETIME NULL,
     UNIQUE KEY uq_cft_worker (sheet_id, worker_id),
     INDEX idx_cftw_worker (worker_id),
     FOREIGN KEY (sheet_id) REFERENCES cft_sheets(id) ON DELETE CASCADE,
     FOREIGN KEY (worker_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
+  // Worker marks their CFT task done ("Mark as Complete")
+  await ensureColumn('cft_sheet_workers', 'completed_at', 'completed_at DATETIME NULL');
 
   // CFT sheet series (INSERT IGNORE — never overwrites)
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_prefix','CFT')").catch(()=>{});

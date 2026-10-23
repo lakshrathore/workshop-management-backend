@@ -84,7 +84,7 @@ async function loadSheet(db, id) {
   s.cutting_list_photos = parsePhotos(s.cutting_list_photos);
   const [workers] = await db.query(
     `SELECT w.worker_id, u.name AS worker_name, u.username, w.assigned_at, ab.name AS assigned_by_name,
-            w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at
+            w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at, w.completed_at
        FROM cft_sheet_workers w
        JOIN users u ON u.id = w.worker_id
        LEFT JOIN users ab ON ab.id = w.assigned_by
@@ -181,7 +181,7 @@ router.get('/cft-report', auth, adminOrPermission('cft', 'read'), async (req, re
     if (ids.length) {
       [workers] = await db.query(
         `SELECT w.sheet_id, w.worker_id, u.name AS worker_name, w.assigned_at, ab.name AS assigned_by_name,
-                w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at
+                w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at, w.completed_at
            FROM cft_sheet_workers w JOIN users u ON u.id = w.worker_id
            LEFT JOIN users ab ON ab.id = w.assigned_by
           WHERE w.sheet_id IN (?) ORDER BY u.name`, [ids]);
@@ -236,6 +236,8 @@ router.get('/cft-report', auth, adminOrPermission('cft', 'read'), async (req, re
         tally_pending: n(r => r.tally_status === 'pending'),
         approved_not_assigned: n(r => r.status === 'approved' && !r.workers.length),
         worker_entries: rows.reduce((a, r) => a + r.workers.filter(w => w.entered_in_tally).length, 0),
+        worker_completed: rows.reduce((a, r) => a + r.workers.filter(w => w.completed_at).length, 0),
+        worker_pending: rows.reduce((a, r) => a + r.workers.filter(w => !w.completed_at).length, 0),
       },
       workers: [...new Map(workers.map(w => [w.worker_id, { id: w.worker_id, name: w.worker_name }])).values()],
     });
@@ -406,7 +408,7 @@ router.put('/cft-sheets/:id/workers', auth, adminOrPermission('cft', 'edit'), au
       if (ok.length !== ids.length) { await conn.rollback(); return res.status(400).json({ message: 'Some selected users are not workers' }); }
     }
     const [current] = await conn.query(
-      `SELECT w.worker_id, u.name, (w.entered_in_tally IS NOT NULL OR COALESCE(w.stock_journal_no,'')<>'' OR COALESCE(w.other_details,'')<>'') AS has_details
+      `SELECT w.worker_id, u.name, (w.entered_in_tally IS NOT NULL OR COALESCE(w.stock_journal_no,'')<>'' OR COALESCE(w.other_details,'')<>'' OR w.completed_at IS NOT NULL) AS has_details
          FROM cft_sheet_workers w JOIN users u ON u.id = w.worker_id WHERE w.sheet_id=?`, [s.id]);
     // A worker who already filled in details stays, so their entry is not lost
     const keep = current.filter(c => !ids.includes(c.worker_id) && Number(c.has_details));
@@ -434,7 +436,7 @@ router.get('/cft-assigned', auth, async (req, res) => {
     const [rows] = await db.query(
       `SELECT cs.id, cs.sheet_no, cs.wood_type, cs.approved_at, cs.total_demand_cft, cs.total_issue_cft, cs.net_difference,
               p.name AS project_name, p.project_id AS project_code, pi.item_name,
-              w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at, w.assigned_at
+              w.entered_in_tally, w.stock_journal_no, w.other_details, w.details_updated_at, w.assigned_at, w.completed_at
          FROM cft_sheet_workers w
          JOIN cft_sheets cs ON cs.id = w.sheet_id
          LEFT JOIN projects p ON p.id = cs.project_id
@@ -461,6 +463,7 @@ router.get('/cft-assigned/:id', auth, async (req, res) => {
     s.my_assignment = {
       entered_in_tally: a.entered_in_tally, stock_journal_no: a.stock_journal_no,
       other_details: a.other_details, details_updated_at: a.details_updated_at, assigned_at: a.assigned_at,
+      completed_at: a.completed_at,
     };
     delete s.assigned_workers;   // a worker sees only their own entry
     res.json(s);
@@ -472,6 +475,7 @@ router.put('/cft-assigned/:id', auth, async (req, res) => {
   try {
     const a = await myAssignment(db, req);
     if (!a) return res.status(404).json({ message: 'This CFT sheet is not assigned to you' });
+    if (a.completed_at) return res.status(400).json({ message: 'You marked this sheet complete. Undo "complete" to change the details.' });
     const b = req.body || {};
     const tally = b.entered_in_tally === 'yes' || b.entered_in_tally === 'no' ? b.entered_in_tally : null;
     if (!tally) return res.status(400).json({ message: 'Choose Yes or No for "Entered in Tally"' });
@@ -482,6 +486,20 @@ router.put('/cft-assigned/:id', auth, async (req, res) => {
       'UPDATE cft_sheet_workers SET entered_in_tally=?, stock_journal_no=?, other_details=?, details_updated_at=NOW() WHERE id=?',
       [tally, sj || null, other || null, a.id]);
     res.json({ message: 'Details saved' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Worker marks their part done (body { done: true }) or undoes it ({ done: false })
+router.post('/cft-assigned/:id/complete', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const a = await myAssignment(db, req);
+    if (!a) return res.status(404).json({ message: 'This CFT sheet is not assigned to you' });
+    const done = req.body?.done !== false;
+    if (done && !a.entered_in_tally)
+      return res.status(400).json({ message: 'Save the Tally details first, then mark it complete' });
+    await db.query(`UPDATE cft_sheet_workers SET completed_at=${done ? 'NOW()' : 'NULL'} WHERE id=?`, [a.id]);
+    res.json({ message: done ? 'Marked as complete' : 'Marked as pending again' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
