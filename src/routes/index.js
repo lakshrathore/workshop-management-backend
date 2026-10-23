@@ -30,6 +30,7 @@
 const express = require('express');
 const router = express.Router();
 const challanPacking = require('../services/challanPacking');
+const protoCodes = require('../services/protoCodes');
 const { getPool } = require('../database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -918,7 +919,8 @@ router.get('/projects/:id', auth, async (req, res) => {
     SELECT pi.*,
       u_cb.name as created_by_name,
       (SELECT pii.image_path FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_path,
-      (SELECT pii.resource_type FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_type
+      (SELECT pii.resource_type FROM project_item_images pii WHERE pii.project_item_id=pi.id ORDER BY pii.created_at ASC LIMIT 1) as thumbnail_type,
+      (SELECT mpi.added_after_approval FROM main_po_items mpi WHERE mpi.id = pi.source_main_po_item_id) as added_from_mo_later
     FROM project_items pi
     LEFT JOIN users u_cb ON u_cb.id = pi.created_by
     WHERE pi.project_id=? ORDER BY pi.id
@@ -1054,11 +1056,21 @@ router.put('/auth/change-password', auth, async (req, res) => {
 router.post('/projects/:id/items', auth, adminOrPermission('projects','write'), requireApprovalForAction('ITEM'), async (req, res) => {
   const db = await getPool();
   const { item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes, image_urls } = req.body;
-  const [r] = await db.query(
-    'INSERT INTO project_items (project_id,item_name,proto_code,description,quantity,unit,material,dimensions,unit_price,notes,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-    [req.params.id, item_name, proto_code, description, quantity || 1, unit || 'pcs', material, dimensions, unit_price || 0, notes, req.user?.id || null]
-  );
-  const itemId = r.insertId;
+  let itemId;
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [code] = await protoCodes.codesForNewProjectItems(conn, req.params.id, [proto_code]);
+    const [r] = await conn.query(
+      'INSERT INTO project_items (project_id,item_name,proto_code,description,quantity,unit,material,dimensions,unit_price,notes,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      [req.params.id, item_name, code, description, quantity || 1, unit || 'pcs', material, dimensions, unit_price || 0, notes, req.user?.id || null]
+    );
+    itemId = r.insertId;
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback().catch(() => {});
+    return res.status(err.status || 500).json({ message: err.message });
+  } finally { conn.release(); }
 
   // ✅ FIX: image_urls (temp-upload se aaye) project_item_images table mein save karo
   if (Array.isArray(image_urls) && image_urls.length > 0) {
@@ -1086,10 +1098,21 @@ router.put('/projects/:projectId/items/:id', auth, adminOrPermission('projects',
   const { item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes } = req.body;
 
   // Get old item_name to detect rename + fetch department names for title rebuild
-  const [[oldItem]] = await db.query('SELECT item_name FROM project_items WHERE id=? AND project_id=?', [req.params.id, req.params.projectId]);
+  const [[oldItem]] = await db.query('SELECT item_name, proto_code FROM project_items WHERE id=? AND project_id=?', [req.params.id, req.params.projectId]);
+
+  // Proto Code mode of the project: Automatic codes never change; Manual codes may not repeat
+  const [[proj]] = await db.query('SELECT proto_mode FROM projects WHERE id=?', [req.params.projectId]);
+  let code = proto_code;
+  if (proj?.proto_mode === 'auto' && oldItem) code = oldItem.proto_code;
+  else if (proj?.proto_mode === 'manual') {
+    code = protoCodes.cleanCode(proto_code) || null;
+    const [others] = await db.query('SELECT proto_code FROM project_items WHERE project_id=? AND id<>?', [req.params.projectId, req.params.id]);
+    try { protoCodes.checkManualCodes([code], others.map(o => o.proto_code)); }
+    catch (err) { return res.status(err.status || 400).json({ message: err.message }); }
+  }
 
   await db.query('UPDATE project_items SET item_name=?,proto_code=?,description=?,quantity=?,unit=?,material=?,dimensions=?,unit_price=?,notes=? WHERE id=? AND project_id=?',
-    [item_name, proto_code, description, quantity, unit, material, dimensions, unit_price, notes, req.params.id, req.params.projectId]);
+    [item_name, code, description, quantity, unit, material, dimensions, unit_price, notes, req.params.id, req.params.projectId]);
 
   // If item_name changed, sync task_title on every chain task for this item
   // so workers always see the current name — even on already-completed stages.
@@ -5726,13 +5749,23 @@ router.post('/admin/client-purchase-orders/:id/create-items', auth, adminOrPermi
     const [[project]] = await db.query('SELECT id FROM projects WHERE id=?', [project_id]);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
-    for (const item of items) {
-      if (!item.item_name?.trim()) continue;
-      await db.query(
-        'INSERT INTO project_items (project_id, item_name, description, quantity, unit) VALUES (?,?,?,?,?)',
-        [project_id, item.item_name.trim(), item.description||'', item.quantity||1, item.unit||'pcs']
-      );
-    }
+    const rows = items.filter(item => item.item_name?.trim());
+    const conn = await db.getConnection();
+    try {
+      await conn.beginTransaction();
+      // Automatic project → series codes; others unchanged (these rows carry no code)
+      const [[proj]] = await conn.query('SELECT proto_mode FROM projects WHERE id=?', [project_id]);
+      const codes = proj?.proto_mode === 'auto' ? await protoCodes.takeCodes(conn, rows.length) : rows.map(() => null);
+      for (let i = 0; i < rows.length; i++) {
+        const item = rows[i];
+        await conn.query(
+          'INSERT INTO project_items (project_id, item_name, proto_code, description, quantity, unit) VALUES (?,?,?,?,?,?)',
+          [project_id, item.item_name.trim(), codes[i], item.description||'', item.quantity||1, item.unit||'pcs']
+        );
+      }
+      await conn.commit();
+    } catch (err) { await conn.rollback().catch(() => {}); throw err; }
+    finally { conn.release(); }
     res.json({ message: 'Items created successfully' });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });

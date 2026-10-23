@@ -867,6 +867,15 @@ async function initializeDatabase() {
   await ensureColumn('project_items', 'area', 'area VARCHAR(100) NULL');
   await ensureColumn('project_items', 'source_main_po_item_id', 'source_main_po_item_id INT NULL');
 
+  // Proto Code mode chosen when the order is created ('manual' | 'auto'); copied to
+  // its Project. NULL = older records, which keep working as manual.
+  await ensureColumn('main_pos', 'proto_mode', 'proto_mode VARCHAR(10) NULL');
+  await ensureColumn('projects', 'proto_mode', 'proto_mode VARCHAR(10) NULL');
+  // Rows added to an order after it was approved (the customer ordered more)
+  await ensureColumn('main_po_items', 'added_after_approval', 'added_after_approval TINYINT(1) NOT NULL DEFAULT 0');
+  // Proto Code series (Settings) — INSERT IGNORE never overwrites configured values
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('proto_code_prefix','PROTO_'),('proto_code_start_number','1001')").catch(() => {});
+
   // Main PO number series (INSERT IGNORE — never overwrites configured values)
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('main_po_prefix', 'MPO')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('main_po_start_number', '1001')").catch(()=>{});

@@ -156,18 +156,27 @@ async function resolveItem(approval, db) {
     throw new Error(`Project #${projectId} not found — cannot create item (may have been deleted)`);
   }
 
-  const [r] = await db.query(
-    `INSERT INTO project_items
-      (project_id,item_name,proto_code,description,quantity,unit,material,
-       dimensions,unit_price,notes)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
-    [
-      projectId, body.item_name, body.proto_code, body.description,
-      body.quantity || 1, body.unit || 'pcs', body.material,
-      body.dimensions, body.unit_price || 0, body.notes
-    ]
-  );
-  const itemId = r.insertId;
+  // Proto Code follows the project's mode (Automatic → next series code)
+  let itemId;
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [code] = await require('../services/protoCodes').codesForNewProjectItems(conn, projectId, [body.proto_code]);
+    const [r] = await conn.query(
+      `INSERT INTO project_items
+        (project_id,item_name,proto_code,description,quantity,unit,material,
+         dimensions,unit_price,notes)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [
+        projectId, body.item_name, code, body.description,
+        body.quantity || 1, body.unit || 'pcs', body.material,
+        body.dimensions, body.unit_price || 0, body.notes
+      ]
+    );
+    itemId = r.insertId;
+    await conn.commit();
+  } catch (err) { await conn.rollback().catch(() => {}); throw err; }
+  finally { conn.release(); }
 
   // Attach pre-uploaded temp images (stored in approval body as image_urls array)
   if (Array.isArray(body.image_urls) && body.image_urls.length > 0) {

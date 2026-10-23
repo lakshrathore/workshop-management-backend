@@ -18,6 +18,22 @@ const { getPool } = require('../database');
 const { generateProjectId } = require('./projectNumbering');
 const { registerRejectHook } = require('./approvalHooks');
 
+// One project_item per Manufacturing Order row (used at approval and when rows
+// added later are transferred). Links the row to the new item.
+async function insertProjectItemFromMo(conn, projectDbId, it) {
+  const dims = [it.size_length, it.size_width, it.size_thickness].filter(Boolean).join(' x ')
+    || it.product_size || null;
+  const [pi] = await conn.query(
+    `INSERT INTO project_items (project_id, item_name, proto_code, description, quantity, dimensions, notes, area, source_main_po_item_id)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [projectDbId, it.product_name, it.proto_code || null,
+     it.finishes_note || null, Math.max(1, Math.round(Number(it.qty) || 1)),
+     dims, it.remark || null, it.area || null, it.id]
+  );
+  await conn.query('UPDATE main_po_items SET project_item_id=? WHERE id=?', [pi.insertId, it.id]);
+  return pi.insertId;
+}
+
 async function resolveMainPo(approval /*, dbIgnored */) {
   const pool = await getPool();
   const conn = await pool.getConnection();
@@ -54,28 +70,17 @@ async function resolveMainPo(approval /*, dbIgnored */) {
     // 1. Project — same numbering series as manual creation
     const projectIdStr = await generateProjectId(conn);
     const [pr] = await conn.query(
-      `INSERT INTO projects (project_id, name, client_name, description, priority, order_date, notes, created_by, source_main_po_id)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO projects (project_id, name, client_name, description, priority, order_date, notes, created_by, source_main_po_id, proto_mode)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
       [projectIdStr, po.project_name, po.client_name || null,
        `Auto-created from Main PO ${po.po_no}`, 'medium',
        po.order_date || null, po.remarks || null,
-       po.created_by || approval.user_id, mainPoId]
+       po.created_by || approval.user_id, mainPoId, po.proto_mode || null]
     );
     const projectDbId = pr.insertId;
 
     // 2. One project_item per Main PO row
-    for (const it of items) {
-      const dims = [it.size_length, it.size_width, it.size_thickness].filter(Boolean).join(' x ')
-        || it.product_size || null;
-      const [pi] = await conn.query(
-        `INSERT INTO project_items (project_id, item_name, proto_code, description, quantity, dimensions, notes, area, source_main_po_item_id)
-         VALUES (?,?,?,?,?,?,?,?,?)`,
-        [projectDbId, it.product_name, it.proto_code || null,
-         it.finishes_note || null, Math.max(1, Math.round(Number(it.qty) || 1)),
-         dims, it.remark || null, it.area || null, it.id]
-      );
-      await conn.query('UPDATE main_po_items SET project_item_id=? WHERE id=?', [pi.insertId, it.id]);
-    }
+    for (const it of items) await insertProjectItemFromMo(conn, projectDbId, it);
 
     // 3. Lock the Main PO
     await conn.query(
@@ -111,4 +116,4 @@ function registerMainPoApproval() {
   console.log('✅ MAIN_PO approval resolver + reject hook registered');
 }
 
-module.exports = { registerMainPoApproval, resolveMainPo };
+module.exports = { registerMainPoApproval, resolveMainPo, insertProjectItemFromMo };
