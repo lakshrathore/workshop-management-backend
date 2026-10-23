@@ -1224,6 +1224,56 @@ async function initializeDatabase() {
     FOREIGN KEY (sheet_id) REFERENCES cft_sheets(id) ON DELETE CASCADE,
     FOREIGN KEY (worker_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
+  // ── Wood stock: Wood Type master, standard sizes, Wood Inward (incl. opening balances) ──
+  await db.query(`CREATE TABLE IF NOT EXISTS wood_types (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(150) NOT NULL,
+    remarks VARCHAR(500) NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_wood_name (name)
+  )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS wood_type_sizes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    wood_type_id INT NOT NULL,
+    label VARCHAR(255) NULL,
+    length DECIMAL(12,3) DEFAULT 0, width DECIMAL(12,3) DEFAULT 0, thickness DECIMAL(12,3) DEFAULT 0,
+    sort_order INT DEFAULT 0,
+    INDEX idx_wts_type (wood_type_id),
+    FOREIGN KEY (wood_type_id) REFERENCES wood_types(id) ON DELETE CASCADE
+  )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS wood_inwards (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    inward_no VARCHAR(50) NOT NULL,
+    entry_type ENUM('inward','opening') NOT NULL DEFAULT 'inward',
+    inward_date DATE NOT NULL,
+    wood_type_id INT NOT NULL,
+    reference VARCHAR(255) NULL,
+    remarks TEXT NULL,
+    total_qty DECIMAL(14,2) DEFAULT 0, total_cft DECIMAL(14,4) DEFAULT 0,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_inward_no (inward_no),
+    INDEX idx_win_date (inward_date),
+    FOREIGN KEY (wood_type_id) REFERENCES wood_types(id)
+  )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS wood_inward_rows (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    inward_id INT NOT NULL,
+    label VARCHAR(255) NULL,
+    length DECIMAL(12,3) DEFAULT 0, width DECIMAL(12,3) DEFAULT 0, thickness DECIMAL(12,3) DEFAULT 0,
+    qty DECIMAL(12,2) DEFAULT 0, gross_cft DECIMAL(14,4) DEFAULT 0, net_cft DECIMAL(14,4) DEFAULT 0,
+    sort_order INT DEFAULT 0,
+    INDEX idx_winr_inward (inward_id),
+    FOREIGN KEY (inward_id) REFERENCES wood_inwards(id) ON DELETE CASCADE
+  )`);
+  // CFT sheet → wood type from the master (the old free-text wood_type stays for older sheets)
+  await ensureColumn('cft_sheets', 'wood_type_id', 'wood_type_id INT NULL');
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('wood_inward_prefix','WIN')").catch(() => {});
+
   // ── Quotations against a Manufacturing Order (revisions share quote_no) ──
   await db.query(`CREATE TABLE IF NOT EXISTS quotations (
     id INT AUTO_INCREMENT PRIMARY KEY,

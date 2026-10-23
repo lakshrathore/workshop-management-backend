@@ -22,17 +22,10 @@ const auditLog = require('../middleware/auditLog');
 const { imgUpload } = require('../services/cloudinaryStorage');
 const { createApprovalRequest } = require('../services/approvalService');
 
-const CFT_CONSTANT = 0.00000003528; // fixed conversion constant (mm³ → CFT)
+// CFT = L × W × T × 0.00000003528 per piece × qty — shared with Wood Inward and the stock reports
+const { CFT_CONSTANT, r4, rowCft } = require('../services/cftMath');
 const OFFCUT_PERCENT = 30;          // fixed, not configurable
 const ROW_TYPES = ['demand', 'issue', 'return'];
-const r4 = n => Math.round((Number(n) || 0) * 10000) / 10000; // 4-dp rounding
-
-function rowCft(row) {
-  const L = Number(row.length) || 0, W = Number(row.width) || 0, T = Number(row.thickness) || 0;
-  const qty = Number(row.qty) || 0;
-  const gross = L * W * T * CFT_CONSTANT;      // per piece
-  return { gross_cft: r4(gross), net_cft: r4(gross * qty) };
-}
 
 // Compute all totals from stored rows (never hard-coded)
 function computeTotals(rows) {
@@ -253,11 +246,26 @@ router.post('/cft-sheets', auth, adminOrPermission('cft', 'write'),
       if (!b.project_id) return res.status(400).json({ message: 'Select a project' });
       const [[proj]] = await db.query('SELECT id FROM projects WHERE id=?', [b.project_id]);
       if (!proj) return res.status(400).json({ message: 'Project not found' });
+      // Wood type from the master: its standard sizes become the Issue rows (qty to fill in)
+      let wood = null, sizes = [];
+      if (parseInt(b.wood_type_id, 10)) {
+        [[wood]] = await db.query('SELECT id, name FROM wood_types WHERE id=?', [parseInt(b.wood_type_id, 10)]);
+        if (!wood) return res.status(400).json({ message: 'Wood type not found' });
+        [sizes] = await db.query('SELECT * FROM wood_type_sizes WHERE wood_type_id=? ORDER BY sort_order, id', [wood.id]);
+      }
       const sheetNo = await generateSheetNo(db);
       const [r] = await db.query(
-        `INSERT INTO cft_sheets (sheet_no, project_id, project_item_id, wood_type, remarks, offcut_percent, status, created_by)
-         VALUES (?,?,?,?,?,?,'draft',?)`,
-        [sheetNo, b.project_id, b.project_item_id || null, b.wood_type || null, b.remarks || null, OFFCUT_PERCENT, req.user.id]);
+        `INSERT INTO cft_sheets (sheet_no, project_id, project_item_id, wood_type, wood_type_id, remarks, offcut_percent, status, created_by)
+         VALUES (?,?,?,?,?,?,?,'draft',?)`,
+        [sheetNo, b.project_id, b.project_item_id || null, wood ? wood.name : (b.wood_type || null), wood ? wood.id : null,
+         b.remarks || null, OFFCUT_PERCENT, req.user.id]);
+      for (let i = 0; i < sizes.length; i++) {
+        const z = sizes[i];
+        await db.query(
+          `INSERT INTO cft_rows (sheet_id, row_type, label, length, width, thickness, qty, gross_cft, net_cft, sort_order)
+           VALUES (?,?,?,?,?,?,0,?,0,?)`,
+          [r.insertId, 'issue', z.label, z.length, z.width, z.thickness, rowCft({ ...z, qty: 1 }).gross_cft, i]);
+      }
       res.json({ id: r.insertId, sheet_no: sheetNo, message: 'CFT sheet created' });
     } catch (err) {
       console.error('CFT create error:', err.message);
@@ -279,9 +287,19 @@ router.put('/cft-sheets/:id', auth, adminOrPermission('cft', 'write'),
         return res.status(400).json({ message: LOCK_MSG[s.status] || 'This sheet is locked.' });
       }
       const b = req.body;
+      // Wood type from the master (wood_type_id) keeps the name in wood_type too; '' clears it
+      let woodId = s.wood_type_id, woodName = b.wood_type ?? s.wood_type;
+      if (b.wood_type_id !== undefined) {
+        woodId = parseInt(b.wood_type_id, 10) || null;
+        if (woodId) {
+          const [[wt]] = await conn.query('SELECT name FROM wood_types WHERE id=?', [woodId]);
+          if (!wt) { await conn.rollback(); return res.status(400).json({ message: 'Wood type not found' }); }
+          woodName = wt.name;
+        }
+      }
       await conn.query(
-        'UPDATE cft_sheets SET wood_type=?, remarks=?, project_item_id=?, updated_by=? WHERE id=?',
-        [b.wood_type ?? s.wood_type, b.remarks ?? s.remarks, b.project_item_id ?? s.project_item_id, req.user.id, s.id]);
+        'UPDATE cft_sheets SET wood_type=?, wood_type_id=?, remarks=?, project_item_id=?, updated_by=? WHERE id=?',
+        [woodName, woodId, b.remarks ?? s.remarks, b.project_item_id ?? s.project_item_id, req.user.id, s.id]);
 
       const rows = Array.isArray(b.rows) ? b.rows : [];
       // Validate

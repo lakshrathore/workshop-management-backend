@@ -211,6 +211,9 @@ cftRoutes.registerCftApproval();
 // ── QUOTATIONS against a Manufacturing Order (revisions, rate × qty + GST) ──
 app.use('/api', require('./routes/quotationRoutes'));
 
+// ── WOOD STOCK: Wood Type master, Wood Inward, Detailed CFT report, usage dashboard ──
+app.use('/api', require('./routes/woodRoutes'));
+
 // ── CLIENT PORTAL ROUTES ──────────────────────────────────────────────────────
 const clientRoutes = require('./routes/clientRoutes');
 app.use('/api', clientRoutes);
