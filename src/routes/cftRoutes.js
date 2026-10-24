@@ -452,6 +452,20 @@ router.delete('/cft-sheets/:id/photos', auth, adminOrPermission('cft', 'write'),
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Negative-stock rule for a sheet: its Issue / Return rows as movements dated today
+// (the approval date). Returns the refusal message, or null when allowed.
+async function sheetStockBlock(db, sheetId) {
+  const [[s]] = await db.query(
+    `SELECT cs.id, COALESCE(wt.name, NULLIF(TRIM(cs.wood_type), ''), '(no wood type)') AS wood_name
+       FROM cft_sheets cs LEFT JOIN wood_types wt ON wt.id = cs.wood_type_id WHERE cs.id=?`, [sheetId]);
+  if (!s) return null;
+  const [rows] = await db.query("SELECT * FROM cft_rows WHERE sheet_id=? AND row_type IN ('issue','return') AND (qty > 0 OR net_cft > 0)", [sheetId]);
+  const date = await wood.todayYmd(db);
+  const add = rows.map(r => ({ src: 'cft', doc_id: s.id, row_id: r.id, kind: r.row_type === 'issue' ? 'outward' : 'return', date,
+    wood_name: s.wood_name, is_all_cft: r.is_all_cft, thickness: r.thickness, net_cft: r.net_cft, qty: r.qty, label: r.label }));
+  return wood.stockGuard(db, { remove: m => m.src === 'cft' && m.doc_id === s.id, add });
+}
+
 // ══ SUBMIT / REOPEN / DELETE ═════════════════════════════════════════════════
 // Send for approval: locks the draft and puts it in the Approvals inbox (type CFT)
 async function sendForApproval(req, res) {
@@ -468,6 +482,8 @@ async function sendForApproval(req, res) {
     const [[pending]] = await db.query(
       "SELECT id FROM approvals WHERE type='CFT' AND related_id=? AND status='PENDING' LIMIT 1", [s.id]);
     if (pending) return res.status(400).json({ message: 'This sheet is already waiting for approval' });
+    const blocked = await sheetStockBlock(db, s.id);
+    if (blocked) return res.status(400).json({ message: `${blocked} Reduce the Issue rows or add stock first.` });
     let stockWarning = null;
     try {
       const [sheetRows] = await db.query('SELECT * FROM cft_rows WHERE sheet_id=?', [s.id]);
@@ -620,6 +636,9 @@ router.post('/cft-sheets/:id/reopen', auth, adminOnly, auditLog('UPDATE', 'CFTSh
     if (!s) return res.status(404).json({ message: 'CFT sheet not found' });
     if (!['submitted', 'approved'].includes(s.status))
       return res.status(400).json({ message: s.status === 'pending' ? 'Approve or reject it from the Approvals page' : 'Sheet is not locked' });
+    // Reopening takes the sheet out of stock (its returns too)
+    const blocked = await wood.stockGuard(db, { remove: m => m.src === 'cft' && m.doc_id === s.id });
+    if (blocked) return res.status(400).json({ message: `This sheet can't be reopened: taking its returns out of stock leaves too little. ${blocked}` });
     await db.query("UPDATE cft_sheets SET status='draft', updated_by=? WHERE id=?", [req.user.id, s.id]);
     res.json({ message: 'CFT sheet reopened for editing. Send it for approval again when done.' });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -659,6 +678,9 @@ async function resolveCft(approval) {
   if (!s) throw new Error(`CFT sheet #${id} not found`);
   if (s.status === 'approved') return { id };                         // idempotent
   if (s.status !== 'pending') throw new Error(`CFT sheet is ${s.status}, cannot approve`);
+  // Stock may have changed since the sheet was sent — check again
+  const blocked = await sheetStockBlock(db, id);
+  if (blocked) throw new Error(`${blocked} Reject the sheet for correction, or add stock first.`);
   const [[apr]] = await db.query('SELECT approved_by FROM approvals WHERE id=?', [approval.id]);
   await db.query("UPDATE cft_sheets SET status='approved', approved_by=?, approved_at=NOW() WHERE id=?",
     [apr?.approved_by || null, id]);

@@ -1364,6 +1364,8 @@ async function initializeDatabase() {
   // CFT sheet series (INSERT IGNORE — never overwrites)
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_prefix','CFT')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_start_number','1')").catch(()=>{});
+  // Negative wood stock: 'no' = refuse any change that takes a wood + thickness below zero
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_allow_negative_stock','no')").catch(()=>{});
 
   console.log('✅ Workshop App Database initialized');
   return db;

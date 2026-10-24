@@ -17,6 +17,8 @@
 // it out of stock until it is approved again — so an edited sheet is never counted twice.
 // Movements are read from the documents themselves, so editing a document can never
 // leave a duplicate movement behind. Negative stock is allowed but shown as a warning.
+// Negative stock: Settings → "Allow negative wood stock" (cft_allow_negative_stock = yes / no).
+// With No, any change that takes a wood + thickness below zero on any date is refused.
 // Date of a CFT movement = approval date (else submit date, else created date).
 // CFT = L × W × T × 0.00000003528 per piece × qty (services/cftMath.js — same as CFT sheets).
 
@@ -308,6 +310,10 @@ async function saveInward(req, res, id) {
         [invoiceNo.toLowerCase(), (supplier || '').toLowerCase(), id || 0]);
       if (dupInv) return fail(res, 400, `Invoice ${invoiceNo}${supplier ? ` from ${supplier}` : ''} is already entered as ${dupInv.inward_no}`);
     }
+    const planned = rows.map((r, i) => ({ src: 'inw', doc_id: id || 'new', row_id: `p${i}`, kind: entryType, date, wood_name: names.get(r.wood_type_id),
+      is_all_cft: r.is_all_cft, thickness: r.thickness, net_cft: r.net_cft, qty: r.qty, label: r.label }));
+    const blocked = await stockGuard(conn, { remove: m => m.src === 'inw' && id && m.doc_id === id, add: planned });
+    if (blocked) return fail(res, 400, blocked);
     const totalQty = Math.round(rows.reduce((a, r) => a + r.qty, 0) * 100) / 100;
     const totalCft = r4(rows.reduce((a, r) => a + r.net_cft, 0));
     const head = [entryType, date, headWood, text(b.reference, 255), text(b.remarks, 2000), supplier, invoiceNo,
@@ -359,6 +365,8 @@ router.delete('/wood-inwards/:id', auth, adminOrPermission('cft', 'delete'), aud
   try {
     const [[w]] = await db.query('SELECT id, inward_no FROM wood_inwards WHERE id=?', [req.params.id]);
     if (!w) return fail(res, 404, 'Inward entry not found');
+    const blocked = await stockGuard(db, { remove: m => m.src === 'inw' && m.doc_id === w.id });
+    if (blocked) return fail(res, 400, `${w.inward_no} can't be deleted. ${blocked}`);
     await db.query('DELETE FROM wood_inwards WHERE id=?', [w.id]);   // rows cascade
     res.json({ message: `${w.inward_no} deleted` });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -408,20 +416,7 @@ async function loadMovements(db, f = {}) {
       { ...base, row_id: `${t.id}i`, kind: 'transfer_in', thickness: t.to_thickness, is_all_cft: t.to_all },
     ];
   });
-  const order = { opening: 0, inward: 1, return: 2, transfer_in: 3, transfer_out: 4, outward: 5 };
-  let list = [...inw, ...cft, ...trfMoves].map(m => {
-    const isAll = !!Number(m.is_all_cft);
-    const bkey = tKey(isAll, m.thickness);
-    const label = m.src === 'trf' ? m.label : isAll ? (m.label ? `${m.label} · ALL CFT` : 'ALL CFT') : m.label;
-    return {
-      ...m, label, length: Number(m.length), width: Number(m.width), thickness: isAll ? 0 : Number(m.thickness),
-      qty: Number(m.qty), cft: Number(m.net_cft), is_all: isAll, bucket: bkey, bucket_label: keyLabel(bkey),
-      sign: m.kind === 'outward' || m.kind === 'transfer_out' ? -1 : 1,
-      dim_key: m.src === 'trf' ? `${woodKey(m.wood_name)}|trf|${bkey}`
-        : isAll ? `${woodKey(m.wood_name)}|all|${labelKey(m.label)}`
-          : `${woodKey(m.wood_name)}|${labelKey(m.label)}|${Number(m.length)}|${Number(m.width)}|${Number(m.thickness)}`,
-    };
-  });
+  let list = [...inw, ...cft, ...trfMoves].map(toMove);
   if (f.wood) list = list.filter(m => woodKey(m.wood_name) === woodKey(f.wood));
   if (f.label) list = list.filter(m => labelKey(m.label).includes(labelKey(f.label)));
   for (const [k, col] of [['l', 'length'], ['w', 'width'], ['t', 'thickness']]) {
@@ -429,10 +424,66 @@ async function loadMovements(db, f = {}) {
   }
   if (f.bucket) list = list.filter(m => m.bucket === (String(f.bucket).toUpperCase() === 'ALL' ? 'ALL' : String(dims(f.bucket))));
   if (f.exclude_sheet) list = list.filter(m => !(m.src === 'cft' && m.doc_id === Number(f.exclude_sheet)));
-  list.sort((a, b) => a.date.localeCompare(b.date) || order[a.kind] - order[b.kind]
+  return sortMoves(list);
+}
+
+// One stock movement (from the documents above, or a planned one for the negative-stock check)
+function toMove(m) {
+  const isAll = !!Number(m.is_all_cft);
+  const bkey = tKey(isAll, m.thickness);
+  const label = m.src === 'trf' ? m.label : isAll ? (m.label ? `${m.label} · ALL CFT` : 'ALL CFT') : m.label;
+  return {
+    ...m, label, length: Number(m.length) || 0, width: Number(m.width) || 0, thickness: isAll ? 0 : Number(m.thickness) || 0,
+    qty: Number(m.qty) || 0, cft: Number(m.net_cft) || 0, is_all: isAll, bucket: bkey, bucket_label: keyLabel(bkey),
+    sign: m.kind === 'outward' || m.kind === 'transfer_out' ? -1 : 1,
+    dim_key: m.src === 'trf' ? `${woodKey(m.wood_name)}|trf|${bkey}`
+      : isAll ? `${woodKey(m.wood_name)}|all|${labelKey(m.label)}`
+        : `${woodKey(m.wood_name)}|${labelKey(m.label)}|${Number(m.length)}|${Number(m.width)}|${Number(m.thickness)}`,
+  };
+}
+// Same day: stock coming in counts before stock going out
+const KIND_ORDER = { opening: 0, inward: 1, return: 2, transfer_in: 3, transfer_out: 4, outward: 5 };
+function sortMoves(list) {
+  return list.sort((a, b) => a.date.localeCompare(b.date) || KIND_ORDER[a.kind] - KIND_ORDER[b.kind]
     || String(a.doc_id).localeCompare(String(b.doc_id), undefined, { numeric: true })
     || String(a.row_id).localeCompare(String(b.row_id), undefined, { numeric: true }));
-  return list;
+}
+
+// ── Negative-stock guard ──
+async function allowNegative(db) {
+  const [[s]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='cft_allow_negative_stock'");
+  return String(s?.setting_value || 'no').trim().toLowerCase() === 'yes';
+}
+const todayYmd = async db => { const [[r]] = await db.query("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d') AS d"); return r.d; };
+// Lowest running balance per wood + thickness: Map(key → { min, date, wood_name, label })
+function lowestBalances(moves) {
+  const run = new Map(), low = new Map();
+  for (const m of sortMoves([...moves])) {
+    const k = `${woodKey(m.wood_name)}|${m.bucket}`;
+    const bal = r4((run.get(k) || 0) + m.sign * m.cft);
+    run.set(k, bal);
+    const cur = low.get(k);
+    if (!cur || bal < cur.min) low.set(k, { min: bal, date: m.date, wood_name: m.wood_name, label: m.bucket_label });
+  }
+  return low;
+}
+// Refuses a change when negative stock is not allowed. `remove` picks movements the change takes
+// away (an edited / deleted document), `add` lists the movements it creates.
+// Stock that was already below zero before the change only blocks it if it gets worse.
+async function stockGuard(db, { remove = () => false, add = [] } = {}) {
+  if (await allowNegative(db)) return null;
+  const before = await loadMovements(db);
+  const after = [...before.filter(m => !remove(m)), ...add.map(toMove)];
+  const was = lowestBalances(before), now = lowestBalances(after);
+  const bad = [];
+  for (const [k, x] of now) {
+    if (x.min >= -0.00005) continue;
+    const prev = was.get(k);
+    if (prev && x.min >= prev.min - 0.00005) continue;
+    bad.push(x);
+  }
+  if (!bad.length) return null;
+  return `Not enough stock — ${bad.map(x => `${x.wood_name} ${x.label} would go to ${x.min.toFixed(4)} CFT on ${x.date}`).join('; ')}. Negative stock is off in Settings.`;
 }
 const readFilters = q => ({ wood: q.wood || '', label: q.label || '', l: q.l, w: q.w, t: q.t, bucket: q.bucket || '' });
 
@@ -658,6 +709,13 @@ async function saveTransfer(req, res, id) {
     if (fromK.all === toK.all && fromK.t === toK.t) return fail(res, 400, 'From and To must be different thicknesses');
     const cft = r4(num(b.cft));
     if (!(cft > 0)) return fail(res, 400, 'Enter the CFT to transfer');
+    const base = { src: 'trf', doc_id: id || 'new', date, wood_name: wt.name, net_cft: cft, label: 'Transfer' };
+    const blocked = await stockGuard(conn, {
+      remove: m => m.src === 'trf' && id && m.doc_id === id,
+      add: [{ ...base, row_id: 'po', kind: 'transfer_out', is_all_cft: fromK.all, thickness: fromK.t },
+            { ...base, row_id: 'pi', kind: 'transfer_in', is_all_cft: toK.all, thickness: toK.t }],
+    });
+    if (blocked) return fail(res, 400, blocked);
 
     await conn.beginTransaction();
     let no;
@@ -704,6 +762,8 @@ router.delete('/wood-transfers/:id', auth, adminOrPermission('cft', 'delete'), a
   try {
     const [[t]] = await db.query('SELECT id, transfer_no FROM wood_transfers WHERE id=?', [req.params.id]);
     if (!t) return fail(res, 404, 'Transfer not found');
+    const blocked = await stockGuard(db, { remove: m => m.src === 'trf' && m.doc_id === t.id });
+    if (blocked) return fail(res, 400, `${t.transfer_no} can't be deleted. ${blocked}`);
     await db.query('DELETE FROM wood_transfers WHERE id=?', [t.id]);
     res.json({ message: `${t.transfer_no} deleted` });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -799,3 +859,6 @@ module.exports.stockByBucket = stockByBucket;
 module.exports.thicknessMap = thicknessMap;
 module.exports.tKey = tKey;
 module.exports.tLabel = tLabel;
+module.exports.stockGuard = stockGuard;
+module.exports.allowNegative = allowNegative;
+module.exports.todayYmd = todayYmd;
