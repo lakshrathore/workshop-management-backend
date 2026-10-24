@@ -1363,6 +1363,7 @@ async function initializeDatabase() {
 
   // CFT sheet series (INSERT IGNORE — never overwrites)
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_prefix','CFT')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('cft_start_number','1')").catch(()=>{});
 
   console.log('✅ Workshop App Database initialized');
   return db;

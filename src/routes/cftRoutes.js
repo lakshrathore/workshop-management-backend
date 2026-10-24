@@ -75,17 +75,30 @@ function computeTotals(rows) {
   };
 }
 
-async function generateSheetNo(db) {
-  let prefix = 'CFT';
-  try {
-    const [[s]] = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='cft_prefix'");
-    if (s?.setting_value) prefix = s.setting_value;
-  } catch (e) { /* default */ }
-  const year = new Date().getFullYear();
-  const [last] = await db.query('SELECT sheet_no FROM cft_sheets ORDER BY id DESC LIMIT 1');
-  let next = 1;
-  if (last.length) { const m = last[0].sheet_no?.match(/(\d+)$/); if (m) next = parseInt(m[1]) + 1; }
-  return `${prefix}-${year}-${String(next).padStart(4, '0')}`;
+// CFT sheet number series from Settings: <prefix>-<year>-<number, 4 digits>, e.g. CFT-2026-0001.
+// cft_prefix + cft_start_number are set once; every new sheet takes the next number.
+// The number never repeats: it continues after the highest number already used with this
+// prefix (or starts at the Starting Number, whichever is higher).
+async function readCftSeries(db) {
+  const [rows] = await db.query("SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('cft_prefix','cft_start_number')");
+  const m = Object.fromEntries(rows.map(r => [r.setting_key, r.setting_value]));
+  const prefix = String(m.cft_prefix || '').trim() || 'CFT';
+  const start = Math.max(1, parseInt(m.cft_start_number, 10) || 1);
+  return { prefix, start };
+}
+async function nextSheetNo(db) {
+  const { prefix, start } = await readCftSeries(db);
+  const [rows] = await db.query('SELECT sheet_no FROM cft_sheets');
+  const head = `${prefix}-`.toLowerCase();
+  let max = 0;
+  for (const r of rows) {
+    const no = String(r.sheet_no || '');
+    if (!no.toLowerCase().startsWith(head)) continue;
+    const m = no.slice(head.length).match(/^(?:\d{4}-)?(\d+)$/);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  const next = Math.max(start, max + 1);
+  return { sheet_no: `${prefix}-${new Date().getFullYear()}-${String(next).padStart(4, '0')}`, prefix, start, next };
 }
 
 async function loadSheet(db, id) {
@@ -277,6 +290,7 @@ router.get('/cft-report', auth, adminOrPermission('cft', 'read'), async (req, re
 router.post('/cft-sheets', auth, adminOrPermission('cft', 'write'),
   auditLog('CREATE', 'CFTSheet'), async (req, res) => {
     const db = await getPool();
+    let conn = null;
     try {
       const b = req.body;
       if (!b.project_id) return res.status(400).json({ message: 'Select a project' });
@@ -289,24 +303,41 @@ router.post('/cft-sheets', auth, adminOrPermission('cft', 'write'),
         if (!wood) return res.status(400).json({ message: 'Wood type not found' });
         [sizes] = await db.query('SELECT * FROM wood_type_sizes WHERE wood_type_id=? ORDER BY sort_order, id', [wood.id]);
       }
-      const sheetNo = await generateSheetNo(db);
-      const [r] = await db.query(
-        `INSERT INTO cft_sheets (sheet_no, project_id, project_item_id, wood_type, wood_type_id, remarks, offcut_percent, status, created_by)
-         VALUES (?,?,?,?,?,?,?,'draft',?)`,
-        [sheetNo, b.project_id, b.project_item_id || null, wood ? wood.name : (b.wood_type || null), wood ? wood.id : null,
-         b.remarks || null, OFFCUT_PERCENT, req.user.id]);
+      // Take the next number under a lock (the cft_prefix settings row), so two sheets
+      // created together never get the same one; a deadlock is retried.
+      conn = await db.getConnection();
+      let sheetNo, r;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await conn.beginTransaction();
+          await conn.query("SELECT setting_value FROM app_settings WHERE setting_key='cft_prefix' FOR UPDATE");
+          sheetNo = (await nextSheetNo(conn)).sheet_no;
+          [r] = await conn.query(
+            `INSERT INTO cft_sheets (sheet_no, project_id, project_item_id, wood_type, wood_type_id, remarks, offcut_percent, status, created_by)
+             VALUES (?,?,?,?,?,?,?,'draft',?)`,
+            [sheetNo, b.project_id, b.project_item_id || null, wood ? wood.name : (b.wood_type || null), wood ? wood.id : null,
+             b.remarks || null, OFFCUT_PERCENT, req.user.id]);
+          break;
+        } catch (e) {
+          try { await conn.rollback(); } catch (x) { /* noop */ }
+          if (attempt < 4 && (e.code === 'ER_LOCK_DEADLOCK' || e.code === 'ER_DUP_ENTRY' || e.code === 'ER_LOCK_WAIT_TIMEOUT')) continue;
+          throw e;
+        }
+      }
       for (let i = 0; i < sizes.length; i++) {
         const z = sizes[i];
-        await db.query(
+        await conn.query(
           `INSERT INTO cft_rows (sheet_id, row_type, label, length, width, thickness, qty, gross_cft, net_cft, sort_order)
            VALUES (?,?,?,?,?,?,0,?,0,?)`,
           [r.insertId, 'issue', z.label, z.length, z.width, z.thickness, rowCft({ ...z, qty: 1 }).gross_cft, i]);
       }
+      await conn.commit();
       res.json({ id: r.insertId, sheet_no: sheetNo, message: 'CFT sheet created' });
     } catch (err) {
+      if (conn) { try { await conn.rollback(); } catch (e) { /* noop */ } }
       console.error('CFT create error:', err.message);
       res.status(500).json({ message: err.message });
-    }
+    } finally { if (conn) conn.release(); }
   });
 
 // ══ UPDATE (header + rows upsert; recompute + store totals) ══════════════════
@@ -607,8 +638,17 @@ router.delete('/cft-sheets/:id', auth, adminOrPermission('cft', 'delete'),
   });
 
 // Expose constants so the UI can preview identical math client-side
-router.get('/cft-config', auth, adminOrPermission('cft', 'read'), (req, res) => {
-  res.json({ cft_constant: CFT_CONSTANT, offcut_percent: OFFCUT_PERCENT });
+router.get('/cft-config', auth, adminOrPermission('cft', 'read'), async (req, res) => {
+  try {
+    const db = await getPool();
+    const n = await nextSheetNo(db);
+    res.json({ cft_constant: CFT_CONSTANT, offcut_percent: OFFCUT_PERCENT, prefix: n.prefix, start_number: n.start, next_sheet_no: n.sheet_no });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+// Next CFT sheet number for the Settings page preview (admins and settings editors)
+router.get('/cft-next-number', auth, adminOrPermission('settings', 'read'), async (req, res) => {
+  try { const n = await nextSheetNo(await getPool()); res.json({ prefix: n.prefix, start_number: n.start, next_sheet_no: n.sheet_no }); }
+  catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // ══ APPROVAL INTEGRATION (registered from server.js) ═════════════════════════
