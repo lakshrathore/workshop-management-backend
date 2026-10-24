@@ -26,6 +26,34 @@ const { createApprovalRequest } = require('../services/approvalService');
 const { CFT_CONSTANT, r4, rowCft } = require('../services/cftMath');
 const OFFCUT_PERCENT = 30;          // fixed, not configurable
 const ROW_TYPES = ['demand', 'issue', 'return'];
+// Wood stock by thickness: Issue / Return rows use the wood's thickness list or "ALL CFT"
+// (an ALL CFT row has no board sizes — its CFT is typed directly).
+const wood = require('./woodRoutes');
+const truthy = v => v === true || v === 1 || v === '1' || v === 'true';
+
+// Stock left per thickness after this sheet's Issue and Return rows (the sheet itself
+// is left out of "available"). Rows: [{ bucket, label, available, issue, return, after, short }]
+async function stockCheck(db, woodName, sheetId, rows) {
+  if (!woodName) return [];
+  const used = new Map();
+  for (const r of rows) {
+    if (r.row_type === 'demand') continue;
+    const isAll = truthy(r.is_all_cft);
+    const t = Number(r.thickness) || 0;
+    if (!isAll && !(t > 0)) continue;
+    const k = wood.tKey(isAll, t);
+    if (!used.has(k)) used.set(k, { bucket: k, label: wood.tLabel(isAll, t), issue: 0, return: 0 });
+    const net = Number(r.net_cft) || 0;
+    used.get(k)[r.row_type === 'issue' ? 'issue' : 'return'] += net;
+  }
+  if (!used.size) return [];
+  const avail = wood.stockByBucket(await wood.loadMovements(db, { wood: woodName, exclude_sheet: sheetId }));
+  return [...used.values()].map(u => {
+    const available = r4(avail[u.bucket] || 0);
+    const after = r4(available + u.return - u.issue);
+    return { ...u, issue: r4(u.issue), return: r4(u.return), available, after, short: after < 0 };
+  });
+}
 
 // Compute all totals from stored rows (never hard-coded)
 function computeTotals(rows) {
@@ -42,6 +70,8 @@ function computeTotals(rows) {
     total_issue_cft: issue, total_return_cft: ret,
     difference, net_difference: netDifference,
     net_label: netDifference > 0 ? 'excess' : netDifference < 0 ? 'shortage' : 'balanced',
+    // Shown next to the offcut figures: actual wood used, and issue against plain demand
+    net_consumption: r4(issue - ret), issue_minus_demand: r4(issue - demand),
   };
 }
 
@@ -83,6 +113,12 @@ async function loadSheet(db, id) {
        LEFT JOIN users ab ON ab.id = w.assigned_by
       WHERE w.sheet_id=? ORDER BY u.name`, [id]);
   s.assigned_workers = workers;
+  if (s.wood_type_id && ['draft', 'pending'].includes(s.status)) {
+    try {
+      const [[wt]] = await db.query('SELECT name FROM wood_types WHERE id=?', [s.wood_type_id]);
+      s.stock_check = await stockCheck(db, wt?.name, s.id, rows);
+    } catch (e) { s.stock_check = []; }
+  }
   return s;
 }
 
@@ -306,17 +342,34 @@ router.put('/cft-sheets/:id', auth, adminOrPermission('cft', 'write'),
       for (const row of rows) {
         if (!ROW_TYPES.includes(row.row_type)) { await conn.rollback(); return res.status(400).json({ message: `Invalid row type: ${row.row_type}` }); }
       }
+      // Issue / Return thickness must be one of the wood's thicknesses (or ALL CFT)
+      if (woodId) {
+        const list = (await wood.thicknessMap(conn, [woodId])).get(woodId) || new Set();
+        const n = { issue: 0, return: 0 };
+        for (const row of rows) {
+          if (row.row_type === 'demand') continue;
+          n[row.row_type]++;
+          const t = Math.round((Number(row.thickness) || 0) * 1000) / 1000;
+          if (!truthy(row.is_all_cft) && t > 0 && !list.has(t)) {
+            await conn.rollback();
+            return res.status(400).json({ message: `${row.row_type === 'issue' ? 'Issue' : 'Return'} row ${n[row.row_type]}: ${t} mm is not a thickness of ${woodName} — choose one from the list or add it in Wood Types` });
+          }
+        }
+      }
       // Replace-all strategy (rows are cheap; keeps ordering deterministic)
       await conn.query('DELETE FROM cft_rows WHERE sheet_id=?', [s.id]);
       const byType = {};
       for (const row of rows) {
-        const { gross_cft, net_cft } = rowCft(row);
+        const isAll = row.row_type !== 'demand' && truthy(row.is_all_cft);
+        const { gross_cft, net_cft } = isAll
+          ? { gross_cft: 0, net_cft: r4(Math.max(0, Number(row.net_cft ?? row.cft) || 0)) }
+          : rowCft(row);
         byType[row.row_type] = (byType[row.row_type] || 0);
         await conn.query(
-          `INSERT INTO cft_rows (sheet_id, row_type, label, length, width, thickness, qty, gross_cft, net_cft, sort_order)
-           VALUES (?,?,?,?,?,?,?,?,?,?)`,
-          [s.id, row.row_type, row.label || null, Number(row.length) || 0, Number(row.width) || 0,
-           Number(row.thickness) || 0, Number(row.qty) || 0, gross_cft, net_cft, byType[row.row_type]++]);
+          `INSERT INTO cft_rows (sheet_id, row_type, is_all_cft, label, length, width, thickness, qty, gross_cft, net_cft, sort_order)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+          [s.id, row.row_type, isAll ? 1 : 0, row.label || null, isAll ? 0 : Number(row.length) || 0, isAll ? 0 : Number(row.width) || 0,
+           isAll ? 0 : Number(row.thickness) || 0, Number(row.qty) || 0, gross_cft, net_cft, byType[row.row_type]++]);
       }
       // Recompute + persist totals for auditability
       const [allRows] = await conn.query('SELECT * FROM cft_rows WHERE sheet_id=?', [s.id]);
@@ -384,12 +437,20 @@ async function sendForApproval(req, res) {
     const [[pending]] = await db.query(
       "SELECT id FROM approvals WHERE type='CFT' AND related_id=? AND status='PENDING' LIMIT 1", [s.id]);
     if (pending) return res.status(400).json({ message: 'This sheet is already waiting for approval' });
+    let stockWarning = null;
+    try {
+      const [sheetRows] = await db.query('SELECT * FROM cft_rows WHERE sheet_id=?', [s.id]);
+      const [[wt]] = s.wood_type_id ? await db.query('SELECT name FROM wood_types WHERE id=?', [s.wood_type_id]) : [[null]];
+      const short = (await stockCheck(db, wt?.name, s.id, sheetRows)).filter(x => x.short);
+      if (short.length) stockWarning = `Stock goes below zero: ${short.map(x => `${x.label} available ${x.available.toFixed(4)}, after this sheet ${x.after.toFixed(4)} CFT`).join('; ')}`;
+    } catch (e) { /* the warning is advice only */ }
     await createApprovalRequest({
       type: 'CFT', userId: req.user.id, relatedId: s.id,
       requestData: {
         sheet_no: s.sheet_no, project_name: s.project_name, project_code: s.project_code, item_name: s.item_name,
         wood_type: s.wood_type, total_demand_cft: s.total_demand_cft, total_issue_cft: s.total_issue_cft,
         net_difference: s.net_difference, rows: c,
+        ...(stockWarning ? { stock_warning: stockWarning } : {}),
       },
     });
     await db.query(

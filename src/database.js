@@ -1274,6 +1274,55 @@ async function initializeDatabase() {
   await ensureColumn('cft_sheets', 'wood_type_id', 'wood_type_id INT NULL');
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('wood_inward_prefix','WIN')").catch(() => {});
 
+  // ── Wood stock by thickness: each wood type has thickness categories (25, 38, 50 mm …).
+  // "ALL CFT" is a separate category of every wood (rows flagged is_all_cft = 1, CFT typed directly).
+  await db.query(`CREATE TABLE IF NOT EXISTS wood_type_thicknesses (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    wood_type_id INT NOT NULL,
+    thickness DECIMAL(12,3) NOT NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    sort_order INT DEFAULT 0,
+    UNIQUE KEY uq_wood_thickness (wood_type_id, thickness),
+    FOREIGN KEY (wood_type_id) REFERENCES wood_types(id) ON DELETE CASCADE
+  )`);
+  await ensureColumn('cft_rows', 'is_all_cft', 'is_all_cft TINYINT(1) NOT NULL DEFAULT 0');
+  await ensureColumn('wood_inward_rows', 'is_all_cft', 'is_all_cft TINYINT(1) NOT NULL DEFAULT 0');
+  await ensureColumn('wood_inward_rows', 'direct_cft', 'direct_cft TINYINT(1) NOT NULL DEFAULT 0');
+  await ensureColumn('wood_inward_rows', 'wood_type_id', 'wood_type_id INT NULL');   // one invoice can carry several woods
+  await ensureColumn('wood_inwards', 'supplier_name', 'supplier_name VARCHAR(255) NULL');
+  await ensureColumn('wood_inwards', 'invoice_no', 'invoice_no VARCHAR(100) NULL');
+  await ensureColumn('wood_inwards', 'invoice_date', 'invoice_date DATE NULL');
+  await ensureColumn('wood_inwards', 'truck_no', 'truck_no VARCHAR(50) NULL');
+  await safeAlter('UPDATE wood_inward_rows r JOIN wood_inwards wi ON wi.id = r.inward_id SET r.wood_type_id = wi.wood_type_id WHERE r.wood_type_id IS NULL');
+  // Moving stock from one thickness category to another of the same wood (e.g. ALL CFT → 38 mm)
+  await db.query(`CREATE TABLE IF NOT EXISTS wood_transfers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    transfer_no VARCHAR(50) NOT NULL,
+    transfer_date DATE NOT NULL,
+    wood_type_id INT NOT NULL,
+    from_all TINYINT(1) NOT NULL DEFAULT 0, from_thickness DECIMAL(12,3) NOT NULL DEFAULT 0,
+    to_all TINYINT(1) NOT NULL DEFAULT 0, to_thickness DECIMAL(12,3) NOT NULL DEFAULT 0,
+    cft DECIMAL(14,4) NOT NULL DEFAULT 0,
+    remarks TEXT NULL,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_transfer_no (transfer_no),
+    INDEX idx_wtr_date (transfer_date),
+    FOREIGN KEY (wood_type_id) REFERENCES wood_types(id)
+  )`);
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('wood_transfer_prefix','WTR')").catch(() => {});
+  // Thicknesses already used (standard sizes, inward rows, CFT issue/return rows) join the
+  // master, so existing stock lands in its T category. Idempotent: INSERT IGNORE on (wood, T).
+  await safeAlter(`INSERT IGNORE INTO wood_type_thicknesses (wood_type_id, thickness)
+    SELECT wood_type_id, thickness FROM wood_type_sizes WHERE thickness > 0`);
+  await safeAlter(`INSERT IGNORE INTO wood_type_thicknesses (wood_type_id, thickness)
+    SELECT COALESCE(r.wood_type_id, wi.wood_type_id), r.thickness FROM wood_inward_rows r JOIN wood_inwards wi ON wi.id = r.inward_id
+     WHERE r.thickness > 0 AND r.is_all_cft = 0`);
+  await safeAlter(`INSERT IGNORE INTO wood_type_thicknesses (wood_type_id, thickness)
+    SELECT cs.wood_type_id, r.thickness FROM cft_rows r JOIN cft_sheets cs ON cs.id = r.sheet_id
+     WHERE cs.wood_type_id IS NOT NULL AND r.row_type IN ('issue','return') AND r.thickness > 0 AND r.is_all_cft = 0`);
+
   // ── Quotations against a Manufacturing Order (revisions share quote_no) ──
   await db.query(`CREATE TABLE IF NOT EXISTS quotations (
     id INT AUTO_INCREMENT PRIMARY KEY,
