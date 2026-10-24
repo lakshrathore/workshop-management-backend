@@ -55,7 +55,21 @@ async function poNoTaken(db, poNo, exceptId = null) {
   return !!row;
 }
 
+// Qty of the row that needs Paint / Fabric finish. Off → null. Empty → the whole Qty.
+// Must be more than 0 and not more than the row's Qty.
+function finishQty(it, on, value, qty, label, idx) {
+  if (!on) return null;
+  if (value === '' || value === null || value === undefined) return qty;
+  const n = Number(value);
+  const who = `Row ${idx + 1}${it.product_name ? ` (${String(it.product_name).trim()})` : ''}`;
+  const bad = msg => { const e = new Error(`${who}: ${msg}`); e.status = 400; return e; };
+  if (!Number.isFinite(n) || n <= 0) throw bad(`${label} quantity must be more than 0`);
+  if (n > qty + 1e-9) throw bad(`${label} quantity (${n}) can't be more than the item Qty (${qty})`);
+  return Math.round(n * 100) / 100;
+}
+
 function normalizeItem(it, idx) {
+  const qty = Number(it.qty) > 0 ? Number(it.qty) : 1;
   return {
     id: it.id || null,
     s_no: idx + 1,
@@ -70,7 +84,9 @@ function normalizeItem(it, idx) {
     size_length: it.size_length || null,
     size_width: it.size_width || null,
     size_thickness: it.size_thickness || null,
-    qty: Number(it.qty) > 0 ? Number(it.qty) : 1,
+    qty,
+    paint_qty: finishQty(it, flag(it.is_paint_finish), it.paint_qty, qty, 'Paint Finish', idx),
+    fabric_qty: finishQty(it, flag(it.is_fabric_finish), it.fabric_qty, qty, 'Fabric Finish', idx),
     remark: it.remark || null,
     sort_order: idx,
   };
@@ -95,10 +111,11 @@ async function applyProtoCodes(conn, mode, rows, savedCodes = new Map(), otherCo
 }
 
 const ITEM_COLS = `main_po_id, s_no, area, proto_code, product_name, product_size, finishes_note,
-  is_paint_finish, is_fabric_finish, is_metal_finish, size_length, size_width, size_thickness, qty, remark, sort_order`;
+  is_paint_finish, is_fabric_finish, is_metal_finish, size_length, size_width, size_thickness, qty, remark, sort_order,
+  paint_qty, fabric_qty`;
 const itemVals = (poId, it) => [poId, it.s_no, it.area, it.proto_code, it.product_name, it.product_size, it.finishes_note,
   it.is_paint_finish, it.is_fabric_finish, it.is_metal_finish, it.size_length, it.size_width, it.size_thickness,
-  it.qty, it.remark, it.sort_order];
+  it.qty, it.remark, it.sort_order, it.paint_qty, it.fabric_qty];
 
 async function loadPo(db, id) {
   const [[po]] = await db.query(
@@ -210,7 +227,7 @@ router.post('/main-pos', auth, adminOrPermission('main_po', 'write'), auditLog('
     const poId = r.insertId;
 
     for (const it of rows) {
-      await conn.query(`INSERT INTO main_po_items (${ITEM_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, itemVals(poId, it));
+      await conn.query(`INSERT INTO main_po_items (${ITEM_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, itemVals(poId, it));
     }
     await conn.commit();
     res.json({ id: poId, po_no: poNo, message: 'Main PO saved as draft' });
@@ -279,12 +296,12 @@ router.put('/main-pos/:id', auth, adminOrPermission('main_po', 'edit'), auditLog
         await conn.query(
           `UPDATE main_po_items SET s_no=?, area=?, proto_code=?, product_name=?, product_size=?, finishes_note=?,
              is_paint_finish=?, is_fabric_finish=?, is_metal_finish=?, size_length=?, size_width=?, size_thickness=?,
-             qty=?, remark=?, sort_order=? WHERE id=? AND main_po_id=?`,
+             qty=?, remark=?, sort_order=?, paint_qty=?, fabric_qty=? WHERE id=? AND main_po_id=?`,
           [it.s_no, it.area, it.proto_code, it.product_name, it.product_size, it.finishes_note,
            it.is_paint_finish, it.is_fabric_finish, it.is_metal_finish, it.size_length, it.size_width,
-           it.size_thickness, it.qty, it.remark, it.sort_order, it.id, po.id]);
+           it.size_thickness, it.qty, it.remark, it.sort_order, it.paint_qty, it.fabric_qty, it.id, po.id]);
       } else {
-        await conn.query(`INSERT INTO main_po_items (${ITEM_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, itemVals(po.id, it));
+        await conn.query(`INSERT INTO main_po_items (${ITEM_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, itemVals(po.id, it));
       }
     }
     await conn.commit();
@@ -337,7 +354,7 @@ router.post('/main-pos/:id/add-items', auth, adminOrPermission('main_po', 'edit'
     const added = [];
     for (const it of rows) {
       const [r] = await conn.query(
-        `INSERT INTO main_po_items (${ITEM_COLS}, added_after_approval) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`, itemVals(po.id, it));
+        `INSERT INTO main_po_items (${ITEM_COLS}, added_after_approval) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`, itemVals(po.id, it));
       it.id = r.insertId;
       added.push({ id: it.id, proto_code: it.proto_code, product_name: it.product_name });
     }

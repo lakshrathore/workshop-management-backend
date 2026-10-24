@@ -19,6 +19,8 @@ const { moReferenceUpload, deleteFile } = require('../services/cloudinaryStorage
 
 const FINISH_TYPES = ['paint', 'fabric', 'metal'];
 const FLAG_COL = { paint: 'is_paint_finish', fabric: 'is_fabric_finish', metal: 'is_metal_finish' };
+// Qty of a row that needs this finish (Paint / Fabric can be part of the row's Qty)
+const FINISH_QTY_SQL = { paint: 'COALESCE(paint_qty, qty)', fabric: 'COALESCE(fabric_qty, qty)', metal: 'qty' };
 const MATERIAL_TYPES = ['sheet', 'pipe', 'pipe_material', 'other'];
 
 function validType(req, res, next) {
@@ -44,7 +46,7 @@ async function loadSheetPayload(db, mainPoId, type) {
 
   const sheet = await getSheet(db, mainPoId, type);
   const [items] = await db.query(
-    `SELECT id, s_no, area, proto_code, product_name, product_size, qty,
+    `SELECT id, s_no, area, proto_code, product_name, product_size, qty, ${FINISH_QTY_SQL[type]} AS finish_qty,
             size_length, size_width, size_thickness, finishes_note
      FROM main_po_items WHERE main_po_id=? AND ${FLAG_COL[type]}=1 ORDER BY sort_order, id`, [mainPoId]);
 
@@ -71,9 +73,9 @@ async function loadSheetPayload(db, mainPoId, type) {
         ...entry,
         images: entryImages.filter(im => im.entry_id === entry.id && im.image_type === 'finish'),
         sample_images: entryImages.filter(im => im.entry_id === entry.id && im.image_type === 'sample'),
-        // Fabric total is authoritative server-side: live product qty × per-item qty
+        // Fabric total is authoritative server-side: fabric-finish qty × per-item qty
         total_qty: type === 'fabric'
-          ? Number(((Number(it.qty) || 0) * (Number(entry.per_item_fabric_qty) || 0)).toFixed(2))
+          ? Number(((Number(it.finish_qty) || 0) * (Number(entry.per_item_fabric_qty) || 0)).toFixed(2))
           : null,
       } : null,
     };
@@ -99,6 +101,8 @@ router.get('/finish-sheets', auth, adminOrPermission('finish', 'read'), async (r
         `SELECT mp.id AS main_po_id, mp.po_no, mp.project_name, mp.client_name, mp.status AS po_status,
                 p.project_id AS linked_project_code,
                 COUNT(i.id) AS flagged_items,
+                SUM(${FINISH_QTY_SQL[t].replace(/(paint_qty|fabric_qty|qty)/g, 'i.$1')}) AS finish_qty,
+                SUM(i.qty) AS total_qty,
                 fs.id AS sheet_id, fs.status AS sheet_status, fs.submitted_at,
                 (SELECT COUNT(*) FROM finish_entries fe WHERE fe.sheet_id = fs.id) AS filled_entries
          FROM main_pos mp
@@ -163,7 +167,7 @@ router.put('/main-pos/:id/finish/:type', auth, adminOrPermission('finish', 'writ
         if (!itemId) continue;
         // Entry must map to an item on THIS PO with the matching flag
         const [[item]] = await conn.query(
-          `SELECT id, qty FROM main_po_items WHERE id=? AND main_po_id=? AND ${FLAG_COL[type]}=1`,
+          `SELECT id, ${FINISH_QTY_SQL[type]} AS qty FROM main_po_items WHERE id=? AND main_po_id=? AND ${FLAG_COL[type]}=1`,
           [itemId, mainPoId]);
         if (!item) { await conn.rollback(); return res.status(400).json({ message: `Item ${itemId} is not a ${type}-finish item of this Main PO` }); }
 

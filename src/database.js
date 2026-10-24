@@ -1360,6 +1360,10 @@ async function initializeDatabase() {
   // QC report: check points typed per section (JSON list). NULL = never edited → the print
   // keeps the standard points for that section name.
   await ensureColumn('quality_report_sections', 'check_points', 'check_points TEXT NULL');
+  // Manufacturing Order rows: how much of the row's Qty needs Paint / Fabric finish.
+  // NULL with the flag on = the whole Qty (older rows), the rest is "without" that finish.
+  await ensureColumn('main_po_items', 'paint_qty', 'paint_qty DECIMAL(10,2) NULL');
+  await ensureColumn('main_po_items', 'fabric_qty', 'fabric_qty DECIMAL(10,2) NULL');
   // "Calculate GST" switch + additional charges (transport, loading …). Older quotations keep GST on
   // and their item GST equals the stored gst_amount.
   await ensureColumn('quotations', 'calc_gst', 'calc_gst TINYINT(1) NOT NULL DEFAULT 1');
