@@ -1357,6 +1357,25 @@ async function initializeDatabase() {
     FOREIGN KEY (quotation_id) REFERENCES quotations(id) ON DELETE CASCADE
   )`);
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('quotation_prefix','QT')").catch(() => {});
+  // "Calculate GST" switch + additional charges (transport, loading …). Older quotations keep GST on
+  // and their item GST equals the stored gst_amount.
+  await ensureColumn('quotations', 'calc_gst', 'calc_gst TINYINT(1) NOT NULL DEFAULT 1');
+  await ensureColumn('quotations', 'item_gst_amount', 'item_gst_amount DECIMAL(14,2) NULL');
+  await ensureColumn('quotations', 'charges_amount', 'charges_amount DECIMAL(14,2) NOT NULL DEFAULT 0');
+  await ensureColumn('quotations', 'charges_gst_amount', 'charges_gst_amount DECIMAL(14,2) NOT NULL DEFAULT 0');
+  await safeAlter('UPDATE quotations SET item_gst_amount = gst_amount WHERE item_gst_amount IS NULL');
+  await db.query(`CREATE TABLE IF NOT EXISTS quotation_charges (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    quotation_id INT NOT NULL,
+    description VARCHAR(255) NOT NULL,
+    amount DECIMAL(14,2) NOT NULL DEFAULT 0,
+    with_gst TINYINT(1) NOT NULL DEFAULT 1,
+    gst_percent DECIMAL(5,2) NOT NULL DEFAULT 0,
+    gst_amount DECIMAL(14,2) NOT NULL DEFAULT 0,
+    sort_order INT DEFAULT 0,
+    INDEX idx_qc_quote (quotation_id),
+    FOREIGN KEY (quotation_id) REFERENCES quotations(id) ON DELETE CASCADE
+  )`);
 
   // Worker marks their CFT task done ("Mark as Complete")
   await ensureColumn('cft_sheet_workers', 'completed_at', 'completed_at DATETIME NULL');

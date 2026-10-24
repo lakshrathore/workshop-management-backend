@@ -6,7 +6,9 @@
 // One quotation number (QT-26-1001) can have revisions: Rev 0, Rev 1, … A new
 // revision copies the previous one; the older revision is kept as 'revised'.
 // Only one revision of a number can be 'accepted'. No approval step.
-// Amount = rate × qty per row → subtotal − discount → + GST % = total.
+// Amount = rate × qty per row → subtotal − discount = taxable → + GST % (when "Calculate GST" is on)
+// + additional charges (transport, loading …), each with its own GST rate when marked With GST.
+// With "Calculate GST" off, no GST is added anywhere — items or charges.
 
 const express = require('express');
 const router = express.Router();
@@ -40,14 +42,38 @@ function cleanItems(items) {
   });
 }
 
+const calcGstOf = b => !(b.calc_gst === false || b.calc_gst === 0 || b.calc_gst === '0' || b.calc_gst === 'false');
+
+// Additional charges: { description, amount, with_gst, gst_percent }; empty rows are dropped
+function cleanCharges(list, calcGst) {
+  if (!Array.isArray(list)) return [];
+  return list.map((c, i) => {
+    const amount = r2(num(c.amount));
+    const withGst = !(c.with_gst === false || c.with_gst === 0 || c.with_gst === '0' || c.with_gst === 'false' || c.with_gst === 'without');
+    const gstPercent = Math.min(100, num(c.gst_percent));
+    return {
+      description: text(c.description, 255) || '', amount, with_gst: withGst ? 1 : 0, gst_percent: gstPercent,
+      gst_amount: calcGst && withGst ? r2(amount * gstPercent / 100) : 0, sort_order: i,
+    };
+  }).filter(c => c.description || c.amount > 0);
+}
+
 // Totals are always worked out here from the rows (never trusted from the page)
-function totalsOf(items, b) {
+function totalsOf(items, b, charges = []) {
+  const calcGst = calcGstOf(b);
   const subtotal = r2(items.reduce((a, it) => a + it.amount, 0));
   const discount = Math.min(subtotal, r2(num(b.discount_amount)));
   const gstPercent = Math.min(100, num(b.gst_percent));
   const taxable = r2(subtotal - discount);
-  const gst = r2(taxable * gstPercent / 100);
-  return { subtotal, discount_amount: discount, gst_percent: gstPercent, taxable_amount: taxable, gst_amount: gst, total_amount: r2(taxable + gst) };
+  const itemGst = calcGst ? r2(taxable * gstPercent / 100) : 0;
+  const chargesAmount = r2(charges.reduce((a, c) => a + c.amount, 0));
+  const chargesGst = r2(charges.reduce((a, c) => a + c.gst_amount, 0));
+  const gst = r2(itemGst + chargesGst);
+  return {
+    calc_gst: calcGst ? 1 : 0, subtotal, discount_amount: discount, gst_percent: gstPercent, taxable_amount: taxable,
+    item_gst_amount: itemGst, charges_amount: chargesAmount, charges_gst_amount: chargesGst,
+    gst_amount: gst, total_amount: r2(taxable + itemGst + chargesAmount + chargesGst),
+  };
 }
 
 function readHeader(b) {
@@ -65,9 +91,11 @@ function readHeader(b) {
   };
 }
 
-function validate(items) {
+function validate(items, charges = []) {
   if (!items.length) return 'Add at least one item';
   if (items.some(it => !it.item_name)) return 'Every row needs an item name';
+  const c = charges.findIndex(x => !x.description);
+  if (c >= 0) return `Additional charge ${c + 1}: enter what the charge is for`;
   return null;
 }
 
@@ -92,10 +120,21 @@ async function loadQuotation(db, id) {
       'SELECT main_po_item_id, image_path FROM main_po_item_images WHERE main_po_item_id IN (?) ORDER BY sort_order, id', [moIds]);
   }
   q.items = items.map(it => ({ ...it, images: imgs.filter(im => im.main_po_item_id === it.main_po_item_id).slice(0, 1) }));
+  const [charges] = await db.query('SELECT * FROM quotation_charges WHERE quotation_id=? ORDER BY sort_order, id', [id]);
+  q.charges = charges;
+  if (q.item_gst_amount === null || q.item_gst_amount === undefined) q.item_gst_amount = q.gst_amount;
   const [revs] = await db.query(
     'SELECT id, revision, status, total_amount, quote_date, updated_at FROM quotations WHERE quote_no=? ORDER BY revision', [q.quote_no]);
   q.revisions = revs;
   return q;
+}
+
+async function insertCharges(conn, quotationId, charges) {
+  for (const c of charges) {
+    await conn.query(
+      'INSERT INTO quotation_charges (quotation_id, description, amount, with_gst, gst_percent, gst_amount, sort_order) VALUES (?,?,?,?,?,?,?)',
+      [quotationId, c.description, c.amount, c.with_gst, c.gst_percent, c.gst_amount, c.sort_order]);
+  }
 }
 
 async function insertItems(conn, quotationId, items) {
@@ -206,10 +245,11 @@ router.post('/quotations', auth, adminOrPermission('quotations', 'write'), audit
     const [[mo]] = await conn.query('SELECT id FROM main_pos WHERE id=?', [moId]);
     if (!mo) return res.status(400).json({ message: 'Manufacturing Order not found' });
     const items = cleanItems(b.items);
-    const err = validate(items);
+    const charges = cleanCharges(b.charges, calcGstOf(b));
+    const err = validate(items, charges);
     if (err) return res.status(400).json({ message: err });
     const h = readHeader(b);
-    const t = totalsOf(items, b);
+    const t = totalsOf(items, b, charges);
 
     await conn.beginTransaction();
     // Serialise numbering so two saves never get the same number
@@ -226,12 +266,13 @@ router.post('/quotations', auth, adminOrPermission('quotations', 'write'), audit
     const [r] = await conn.query(
       `INSERT INTO quotations (quote_no, revision, main_po_id, status, client_name, client_address, client_gstin, client_phone,
          quote_date, valid_until, gst_type, subject, notes, terms, subtotal, discount_amount, gst_percent, taxable_amount,
-         gst_amount, total_amount, created_by, updated_by)
-       VALUES (?,0,?,'draft',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         gst_amount, total_amount, calc_gst, item_gst_amount, charges_amount, charges_gst_amount, created_by, updated_by)
+       VALUES (?,0,?,'draft',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [quoteNo, moId, h.client_name, h.client_address, h.client_gstin, h.client_phone, h.quote_date, h.valid_until,
        h.gst_type, h.subject, h.notes, h.terms, t.subtotal, t.discount_amount, t.gst_percent, t.taxable_amount,
-       t.gst_amount, t.total_amount, req.user.id, req.user.id]);
+       t.gst_amount, t.total_amount, t.calc_gst, t.item_gst_amount, t.charges_amount, t.charges_gst_amount, req.user.id, req.user.id]);
     await insertItems(conn, r.insertId, items);
+    await insertCharges(conn, r.insertId, charges);
     await conn.commit();
     res.json({ id: r.insertId, quote_no: quoteNo, message: `Quotation ${quoteNo} saved as draft` });
   } catch (err) {
@@ -254,19 +295,28 @@ router.put('/quotations/:id', auth, adminOrPermission('quotations', 'edit'), aud
     }
     const b = req.body || {};
     const items = cleanItems(b.items);
-    const err = validate(items);
+    // A page that doesn't send charges (older screen) keeps the saved ones
+    const keepCharges = !Array.isArray(b.charges);
+    let charges;
+    if (keepCharges) {
+      const [old] = await conn.query('SELECT * FROM quotation_charges WHERE quotation_id=? ORDER BY sort_order, id', [q.id]);
+      charges = cleanCharges(old, calcGstOf(b));
+    } else charges = cleanCharges(b.charges, calcGstOf(b));
+    const err = validate(items, charges);
     if (err) { await conn.rollback(); return res.status(400).json({ message: err }); }
     const h = readHeader(b);
-    const t = totalsOf(items, b);
+    const t = totalsOf(items, b, charges);
     await conn.query(
       `UPDATE quotations SET client_name=?, client_address=?, client_gstin=?, client_phone=?, quote_date=?, valid_until=?,
          gst_type=?, subject=?, notes=?, terms=?, subtotal=?, discount_amount=?, gst_percent=?, taxable_amount=?,
-         gst_amount=?, total_amount=?, updated_by=? WHERE id=?`,
+         gst_amount=?, total_amount=?, calc_gst=?, item_gst_amount=?, charges_amount=?, charges_gst_amount=?, updated_by=? WHERE id=?`,
       [h.client_name, h.client_address, h.client_gstin, h.client_phone, h.quote_date, h.valid_until, h.gst_type,
        h.subject, h.notes, h.terms, t.subtotal, t.discount_amount, t.gst_percent, t.taxable_amount, t.gst_amount,
-       t.total_amount, req.user.id, q.id]);
+       t.total_amount, t.calc_gst, t.item_gst_amount, t.charges_amount, t.charges_gst_amount, req.user.id, q.id]);
     await conn.query('DELETE FROM quotation_items WHERE quotation_id=?', [q.id]);
     await insertItems(conn, q.id, items);
+    await conn.query('DELETE FROM quotation_charges WHERE quotation_id=?', [q.id]);
+    await insertCharges(conn, q.id, charges);
     await conn.commit();
     res.json({ message: 'Quotation saved' });
   } catch (err) {
@@ -328,16 +378,20 @@ router.post('/quotations/:id/revise', auth, adminOrPermission('quotations', 'wri
     const [r] = await conn.query(
       `INSERT INTO quotations (quote_no, revision, main_po_id, status, client_name, client_address, client_gstin, client_phone,
          quote_date, valid_until, gst_type, subject, notes, terms, subtotal, discount_amount, gst_percent, taxable_amount,
-         gst_amount, total_amount, created_by, updated_by)
+         gst_amount, total_amount, calc_gst, item_gst_amount, charges_amount, charges_gst_amount, created_by, updated_by)
        SELECT quote_no, ?, main_po_id, 'draft', client_name, client_address, client_gstin, client_phone,
          CURDATE(), valid_until, gst_type, subject, notes, terms, subtotal, discount_amount, gst_percent, taxable_amount,
-         gst_amount, total_amount, ?, ? FROM quotations WHERE id=?`,
+         gst_amount, total_amount, calc_gst, COALESCE(item_gst_amount, gst_amount), charges_amount, charges_gst_amount, ?, ?
+         FROM quotations WHERE id=?`,
       [rev, req.user.id, req.user.id, q.id]);
     await conn.query(
       `INSERT INTO quotation_items (quotation_id, main_po_item_id, proto_code, item_name, description, area, size, finishes,
          unit, qty, rate, amount, sort_order)
        SELECT ?, main_po_item_id, proto_code, item_name, description, area, size, finishes, unit, qty, rate, amount, sort_order
          FROM quotation_items WHERE quotation_id=?`, [r.insertId, q.id]);
+    await conn.query(
+      `INSERT INTO quotation_charges (quotation_id, description, amount, with_gst, gst_percent, gst_amount, sort_order)
+       SELECT ?, description, amount, with_gst, gst_percent, gst_amount, sort_order FROM quotation_charges WHERE quotation_id=?`, [r.insertId, q.id]);
     await conn.query("UPDATE quotations SET status='revised', updated_by=? WHERE id=?", [req.user.id, q.id]);
     await conn.commit();
     res.json({ id: r.insertId, revision: rev, message: `${q.quote_no} Rev ${rev} created as draft` });
@@ -369,3 +423,5 @@ router.delete('/quotations/:id', auth, adminOrPermission('quotations', 'delete')
 });
 
 module.exports = router;
+module.exports.totalsOf = totalsOf;
+module.exports.cleanCharges = cleanCharges;
