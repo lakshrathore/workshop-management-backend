@@ -1364,6 +1364,23 @@ async function initializeDatabase() {
   await ensureColumn('quotations', 'charges_amount', 'charges_amount DECIMAL(14,2) NOT NULL DEFAULT 0');
   await ensureColumn('quotations', 'charges_gst_amount', 'charges_gst_amount DECIMAL(14,2) NOT NULL DEFAULT 0');
   await safeAlter('UPDATE quotations SET item_gst_amount = gst_amount WHERE item_gst_amount IS NULL');
+  // Saved Terms & Conditions for quotations (one is the default for new quotations)
+  await db.query(`CREATE TABLE IF NOT EXISTS quotation_terms_templates (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(150) NOT NULL,
+    content TEXT NOT NULL,
+    is_default TINYINT(1) NOT NULL DEFAULT 0,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    sort_order INT DEFAULT 0,
+    created_by INT NULL, updated_by INT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )`);
+  // Terms typed earlier in Settings (quotation_terms) become the first, default set — once
+  await safeAlter(`INSERT INTO quotation_terms_templates (name, content, is_default)
+    SELECT 'Standard Terms', setting_value, 1 FROM app_settings
+     WHERE setting_key = 'quotation_terms' AND COALESCE(TRIM(setting_value), '') <> ''
+       AND NOT EXISTS (SELECT 1 FROM quotation_terms_templates)`);
   await db.query(`CREATE TABLE IF NOT EXISTS quotation_charges (
     id INT AUTO_INCREMENT PRIMARY KEY,
     quotation_id INT NOT NULL,

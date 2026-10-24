@@ -147,6 +147,69 @@ async function insertItems(conn, quotationId, items) {
   }
 }
 
+// ── TERMS & CONDITIONS templates (page: Terms & Conditions, permission 'terms') ──
+// Any logged-in user can read them (they fill quotations); changing them needs 'terms'.
+router.get('/quotation-terms', auth, async (req, res) => {
+  const db = await getPool();
+  try {
+    const [rows] = await db.query(
+      `SELECT t.*, cu.name AS created_by_name, uu.name AS updated_by_name FROM quotation_terms_templates t
+         LEFT JOIN users cu ON cu.id = t.created_by LEFT JOIN users uu ON uu.id = t.updated_by
+        ${req.query.active === '1' ? 'WHERE t.is_active = 1' : ''}
+        ORDER BY t.is_default DESC, t.sort_order, t.name`);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+async function saveTerms(req, res, id) {
+  const pool = await getPool();
+  const conn = await pool.getConnection();
+  try {
+    const b = req.body || {};
+    const name = text(b.name, 150);
+    if (!name) return res.status(400).json({ message: 'Enter a name for these terms' });
+    const content = String(b.content ?? '').replace(/\r\n/g, '\n').trim().slice(0, 20000);
+    if (!content) return res.status(400).json({ message: 'Write the terms and conditions' });
+    const isDefault = b.is_default === true || b.is_default === 1 || b.is_default === '1';
+    const isActive = !(b.is_active === false || b.is_active === 0 || b.is_active === '0');
+    if (isDefault && !isActive) return res.status(400).json({ message: 'The default terms must be active' });
+    const [[dup]] = await conn.query('SELECT id FROM quotation_terms_templates WHERE LOWER(TRIM(name)) = ? AND id <> ?', [name.toLowerCase(), id || 0]);
+    if (dup) return res.status(400).json({ message: `Terms named "${name}" already exist` });
+    await conn.beginTransaction();
+    if (isDefault) await conn.query('UPDATE quotation_terms_templates SET is_default = 0');
+    if (id) {
+      const [[cur]] = await conn.query('SELECT id FROM quotation_terms_templates WHERE id=? FOR UPDATE', [id]);
+      if (!cur) { await conn.rollback(); return res.status(404).json({ message: 'Terms not found' }); }
+      await conn.query('UPDATE quotation_terms_templates SET name=?, content=?, is_default=?, is_active=?, updated_by=? WHERE id=?',
+        [name, content, isDefault ? 1 : 0, isActive ? 1 : 0, req.user.id, id]);
+    } else {
+      // The first set saved becomes the default
+      const [[{ c }]] = await conn.query('SELECT COUNT(*) c FROM quotation_terms_templates');
+      const [r] = await conn.query(
+        'INSERT INTO quotation_terms_templates (name, content, is_default, is_active, created_by, updated_by) VALUES (?,?,?,?,?,?)',
+        [name, content, isDefault || !c ? 1 : 0, isActive ? 1 : 0, req.user.id, req.user.id]);
+      id = r.insertId;
+    }
+    await conn.commit();
+    res.json({ id, message: `Terms "${name}" saved` });
+  } catch (err) {
+    try { await conn.rollback(); } catch (e) { /* noop */ }
+    res.status(500).json({ message: err.message });
+  } finally { conn.release(); }
+}
+router.post('/quotation-terms', auth, adminOrPermission('terms', 'write'), auditLog('CREATE', 'QuotationTerms'), (req, res) => saveTerms(req, res, null));
+router.put('/quotation-terms/:id', auth, adminOrPermission('terms', 'edit'), auditLog('UPDATE', 'QuotationTerms'), (req, res) => saveTerms(req, res, Number(req.params.id)));
+router.delete('/quotation-terms/:id', auth, adminOrPermission('terms', 'delete'), auditLog('DELETE', 'QuotationTerms'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const [[t]] = await db.query('SELECT id, name, is_default FROM quotation_terms_templates WHERE id=?', [req.params.id]);
+    if (!t) return res.status(404).json({ message: 'Terms not found' });
+    if (t.is_default) return res.status(400).json({ message: 'This is the default — make another set the default first' });
+    await db.query('DELETE FROM quotation_terms_templates WHERE id=?', [t.id]);
+    res.json({ message: `Terms "${t.name}" deleted` });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ── LIST (latest revision of each number by default) ───────────────────────
 router.get('/quotations', auth, adminOrPermission('quotations', 'read'), async (req, res) => {
   const db = await getPool();
