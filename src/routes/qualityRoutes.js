@@ -108,7 +108,7 @@ async function loadReport(db, id) {
     [images] = await db.query(
       'SELECT * FROM quality_report_images WHERE section_id IN (?) ORDER BY sort_order, id', [secIds]);
   }
-  r.sections = sections.map(s => ({ ...s, images: images.filter(im => im.section_id === s.id) }));
+  r.sections = sections.map(s => ({ ...s, check_points: parseCheckPoints(s.check_points), images: images.filter(im => im.section_id === s.id) }));
   r.checklist = mergeChecklist(r.checklist_json);
   delete r.checklist_json;
 
@@ -375,6 +375,16 @@ router.post('/quality/reports/:id/sections', auth, adminOrPermission('quality_re
     } catch (err) { res.status(500).json({ message: err.message }); }
   });
 
+// Check points of a section: JSON list of short lines; null = never edited (print uses the standard list)
+function parseCheckPoints(v) {
+  if (v === null || v === undefined || v === '') return null;
+  try { const a = JSON.parse(v); return Array.isArray(a) ? a.map(x => String(x)) : null; } catch (e) { return null; }
+}
+function cleanCheckPoints(list) {
+  if (!Array.isArray(list)) return null;
+  return list.map(x => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)).filter(Boolean).slice(0, 40);
+}
+
 router.put('/quality/sections/:sectionId', auth, adminOrPermission('quality_report', 'write'), async (req, res) => {
   const db = await getPool();
   try {
@@ -387,6 +397,11 @@ router.put('/quality/sections/:sectionId', auth, adminOrPermission('quality_repo
     if (req.body.section_name !== undefined) { sets.push('section_name=?'); vals.push(String(req.body.section_name).trim()); }
     if (req.body.description !== undefined) { sets.push('description=?'); vals.push(req.body.description); }
     if (req.body.sort_order !== undefined) { sets.push('sort_order=?'); vals.push(Number(req.body.sort_order)); }
+    if (req.body.check_points !== undefined) {
+      const pts = req.body.check_points === null ? null : cleanCheckPoints(req.body.check_points);
+      if (req.body.check_points !== null && pts === null) return res.status(400).json({ message: 'Check points must be a list' });
+      sets.push('check_points=?'); vals.push(pts === null ? null : JSON.stringify(pts));
+    }
     if (!sets.length) return res.status(400).json({ message: 'Nothing to update' });
     vals.push(sec.id);
     await db.query(`UPDATE quality_report_sections SET ${sets.join(',')} WHERE id=?`, vals);

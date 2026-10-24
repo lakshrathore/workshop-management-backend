@@ -1357,6 +1357,9 @@ async function initializeDatabase() {
     FOREIGN KEY (quotation_id) REFERENCES quotations(id) ON DELETE CASCADE
   )`);
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('quotation_prefix','QT')").catch(() => {});
+  // QC report: check points typed per section (JSON list). NULL = never edited → the print
+  // keeps the standard points for that section name.
+  await ensureColumn('quality_report_sections', 'check_points', 'check_points TEXT NULL');
   // "Calculate GST" switch + additional charges (transport, loading …). Older quotations keep GST on
   // and their item GST equals the stored gst_amount.
   await ensureColumn('quotations', 'calc_gst', 'calc_gst TINYINT(1) NOT NULL DEFAULT 1');
