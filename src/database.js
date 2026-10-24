@@ -1364,6 +1364,20 @@ async function initializeDatabase() {
   // NULL with the flag on = the whole Qty (older rows), the rest is "without" that finish.
   await ensureColumn('main_po_items', 'paint_qty', 'paint_qty DECIMAL(10,2) NULL');
   await ensureColumn('main_po_items', 'fabric_qty', 'fabric_qty DECIMAL(10,2) NULL');
+  // Finish sheet entries: one for the qty WITH the finish and one for the rest WITHOUT it
+  await ensureColumn('finish_entries', 'part', "part VARCHAR(10) NOT NULL DEFAULT 'with'");
+  {
+    const [idx] = await db.query(
+      `SELECT DISTINCT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'finish_entries' AND INDEX_NAME IN ('uniq_finish_entry','uniq_finish_entry_part')`);
+    const names = idx.map(r => r.INDEX_NAME);
+    if (!names.includes('uniq_finish_entry_part'))
+      await db.query('ALTER TABLE finish_entries ADD UNIQUE KEY uniq_finish_entry_part (sheet_id, main_po_item_id, part)')
+        .catch(err => { if (err.code !== 'ER_DUP_KEYNAME') throw err; });
+    if (names.includes('uniq_finish_entry'))
+      await db.query('ALTER TABLE finish_entries DROP INDEX uniq_finish_entry')
+        .catch(err => { if (err.code !== 'ER_CANT_DROP_FIELD_OR_KEY') throw err; });
+  }
   // "Calculate GST" switch + additional charges (transport, loading …). Older quotations keep GST on
   // and their item GST equals the stored gst_amount.
   await ensureColumn('quotations', 'calc_gst', 'calc_gst TINYINT(1) NOT NULL DEFAULT 1');

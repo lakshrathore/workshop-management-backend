@@ -65,19 +65,24 @@ async function loadSheetPayload(db, mainPoId, type) {
       'SELECT * FROM main_po_item_images WHERE main_po_item_id IN (?) ORDER BY sort_order, id', [itemIds]);
   }
 
+  // Each item: `entry` = the qty WITH this finish; `rest_entry` = the rest WITHOUT it
+  // (only when Paint / Fabric covers part of the item's Qty).
+  const shape = (entry, qty) => entry ? {
+    ...entry,
+    images: entryImages.filter(im => im.entry_id === entry.id && im.image_type === 'finish'),
+    sample_images: entryImages.filter(im => im.entry_id === entry.id && im.image_type === 'sample'),
+    // Fabric total is authoritative server-side: that part's qty × per-item qty
+    total_qty: type === 'fabric'
+      ? Number(((Number(qty) || 0) * (Number(entry.per_item_fabric_qty) || 0)).toFixed(2))
+      : null,
+  } : null;
   const rows = items.map(it => {
-    const entry = entries.find(e => e.main_po_item_id === it.id) || null;
+    const restQty = type === 'metal' ? 0 : Math.round(((Number(it.qty) || 0) - (Number(it.finish_qty) || 0)) * 100) / 100;
+    const find = part => entries.find(e => e.main_po_item_id === it.id && (e.part || 'with') === part) || null;
     return {
-      item: { ...it, ref_images: refImages.filter(r => r.main_po_item_id === it.id) },
-      entry: entry ? {
-        ...entry,
-        images: entryImages.filter(im => im.entry_id === entry.id && im.image_type === 'finish'),
-        sample_images: entryImages.filter(im => im.entry_id === entry.id && im.image_type === 'sample'),
-        // Fabric total is authoritative server-side: fabric-finish qty × per-item qty
-        total_qty: type === 'fabric'
-          ? Number(((Number(it.finish_qty) || 0) * (Number(entry.per_item_fabric_qty) || 0)).toFixed(2))
-          : null,
-      } : null,
+      item: { ...it, rest_qty: restQty > 0 ? restQty : 0, ref_images: refImages.filter(r => r.main_po_item_id === it.id) },
+      entry: shape(find('with'), it.finish_qty),
+      rest_entry: restQty > 0 ? shape(find('without'), restQty) : null,
     };
   });
 
@@ -104,7 +109,7 @@ router.get('/finish-sheets', auth, adminOrPermission('finish', 'read'), async (r
                 SUM(${FINISH_QTY_SQL[t].replace(/(paint_qty|fabric_qty|qty)/g, 'i.$1')}) AS finish_qty,
                 SUM(i.qty) AS total_qty,
                 fs.id AS sheet_id, fs.status AS sheet_status, fs.submitted_at,
-                (SELECT COUNT(*) FROM finish_entries fe WHERE fe.sheet_id = fs.id) AS filled_entries
+                (SELECT COUNT(DISTINCT fe.main_po_item_id) FROM finish_entries fe WHERE fe.sheet_id = fs.id) AS filled_entries
          FROM main_pos mp
          JOIN main_po_items i ON i.main_po_id = mp.id AND i.${FLAG_COL[t]} = 1
          LEFT JOIN projects p ON p.id = mp.project_id
@@ -167,9 +172,16 @@ router.put('/main-pos/:id/finish/:type', auth, adminOrPermission('finish', 'writ
         if (!itemId) continue;
         // Entry must map to an item on THIS PO with the matching flag
         const [[item]] = await conn.query(
-          `SELECT id, ${FINISH_QTY_SQL[type]} AS qty FROM main_po_items WHERE id=? AND main_po_id=? AND ${FLAG_COL[type]}=1`,
+          `SELECT id, qty AS item_qty, ${FINISH_QTY_SQL[type]} AS qty FROM main_po_items WHERE id=? AND main_po_id=? AND ${FLAG_COL[type]}=1`,
           [itemId, mainPoId]);
         if (!item) { await conn.rollback(); return res.status(400).json({ message: `Item ${itemId} is not a ${type}-finish item of this Main PO` }); }
+        // 'with' = qty with this finish, 'without' = the rest of the item's Qty
+        const part = e.part === 'without' ? 'without' : 'with';
+        if (part === 'without') {
+          if (type === 'metal') continue;
+          item.qty = Math.round(((Number(item.item_qty) || 0) - (Number(item.qty) || 0)) * 100) / 100;
+          if (!(item.qty > 0)) continue;          // finish now covers the whole Qty — nothing without it
+        }
 
         const common = { remark: e.remark || null };
         let fields = {}, err = null;
@@ -202,11 +214,17 @@ router.put('/main-pos/:id/finish/:type', auth, adminOrPermission('finish', 'writ
         const data = { ...fields, ...common };
         const cols = Object.keys(data);
         const vals = Object.values(data);
-        await conn.query(
-          `INSERT INTO finish_entries (sheet_id, main_po_item_id, ${cols.join(',')})
-           VALUES (?,?,${cols.map(() => '?').join(',')})
-           ON DUPLICATE KEY UPDATE ${cols.map(c => `${c}=VALUES(${c})`).join(',')}`,
-          [sheet.id, itemId, ...vals]);
+        const [[found]] = await conn.query(
+          "SELECT id FROM finish_entries WHERE sheet_id=? AND main_po_item_id=? AND COALESCE(part,'with')=? LIMIT 1",
+          [sheet.id, itemId, part]);
+        if (found) {
+          await conn.query(`UPDATE finish_entries SET ${cols.map(c => `${c}=?`).join(',')} WHERE id=?`, [...vals, found.id]);
+        } else {
+          await conn.query(
+            `INSERT INTO finish_entries (sheet_id, main_po_item_id, part, ${cols.join(',')})
+             VALUES (?,?,?,${cols.map(() => '?').join(',')})`,
+            [sheet.id, itemId, part, ...vals]);
+        }
       }
 
       await conn.commit();
