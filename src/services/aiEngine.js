@@ -74,6 +74,7 @@ async function callCompat(name, { system, tools, messages, maxTokens, model }) {
   body[name === 'openai' ? 'max_completion_tokens' : 'max_tokens'] = maxTokens || 1500;
   const url = `${p.base()}/chat/completions`;
   const headers = { Authorization: `Bearer ${p.key()}`, 'content-type': 'application/json' };
+  if (swapped[`${name}|${model}`]) body.model = swapped[`${name}|${model}`];
   try {
     return (await axios.post(url, body, { headers, timeout: 60000 })).data;
   } catch (err) {
@@ -81,7 +82,43 @@ async function callCompat(name, { system, tools, messages, maxTokens, model }) {
     if (err.response?.status === 400 && /tool_use_failed|failed_generation/i.test(JSON.stringify(err.response?.data || ''))) {
       return (await axios.post(url, body, { headers, timeout: 60000 })).data;
     }
+    // The model was retired / renamed by the provider → pick a current one from its model list, retry once
+    if (isModelGone(err)) {
+      const next = await pickLiveModel(name, headers, body.model);
+      if (next) {
+        swapped[`${name}|${model}`] = next;
+        console.warn(`[ai] model "${body.model}" is not available on ${name} — using "${next}". Set AI_MODEL to choose one.`);
+        return (await axios.post(url, { ...body, model: next }, { headers, timeout: 60000 })).data;
+      }
+    }
     throw err;
+  }
+}
+
+// Retired-model handling (Groq retires models often)
+const swapped = {};                       // "<provider>|<configured model>" → model actually used
+const isModelGone = (err) => {
+  const s = err.response?.status;
+  const t = JSON.stringify(err.response?.data || '');
+  return (s === 404 || s === 400) && /model_not_found|model_decommissioned|does not exist|decommissioned|not found/i.test(t) && /model/i.test(t);
+};
+// Chat models known to handle tool calls well, best first; else any chat model on the list
+const PREFERRED = {
+  groq: ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'meta-llama/llama-4-maverick-17b-128e-instruct',
+    'moonshotai/kimi-k2-instruct', 'qwen/qwen3-32b', 'meta-llama/llama-4-scout-17b-16e-instruct', 'openai/gpt-oss-20b'],
+  openai: ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4o'],
+};
+async function pickLiveModel(name, headers, current) {
+  try {
+    const { data } = await axios.get(`${PROVIDERS[name].base()}/models`, { headers, timeout: 15000 });
+    const ids = (data?.data || []).filter(m => m && m.id && m.active !== false).map(m => m.id);
+    const chat = ids.filter(id => id !== current && !/whisper|tts|guard|embed|playai|distil|orpheus|compound|vision|audio|moderation|image|dall-e|realtime|transcribe/i.test(id));
+    return (PREFERRED[name] || []).find(id => chat.includes(id))
+      || chat.find(id => /70b|120b|maverick|large|instruct|versatile/i.test(id))
+      || chat[0] || null;
+  } catch (e) {
+    console.error(`[ai] could not list ${name} models:`, e.response?.status || e.message);
+    return null;
   }
 }
 
