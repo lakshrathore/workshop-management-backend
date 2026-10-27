@@ -13,16 +13,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
 const axios = require('axios');
 
+// Env values as typed in a hosting panel may carry quotes or spaces ("groq", ' gsk_…') — strip them
+const clean = (v) => String(v ?? '').trim().replace(/^(['"])(.*)\1$/, '$2').trim();
+const env = (k) => clean(process.env[k]) || undefined;
+
 // ── providers ───────────────────────────────────────────────────────────────
 const PROVIDERS = {
-  anthropic: { key: () => process.env.ANTHROPIC_API_KEY, model: () => process.env.AI_MODEL || 'claude-sonnet-5-5' },
-  openai:    { key: () => process.env.OPENAI_API_KEY,    model: () => process.env.AI_MODEL || 'gpt-4o-mini',
-               base: () => process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1' },
-  groq:      { key: () => process.env.GROQ_API_KEY || process.env.GROQ_API, model: () => process.env.AI_MODEL || 'llama-3.3-70b-versatile',
-               base: () => process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1' },
+  anthropic: { key: () => env('ANTHROPIC_API_KEY'), model: () => env('AI_MODEL') || 'claude-sonnet-5-5' },
+  openai:    { key: () => env('OPENAI_API_KEY'),    model: () => env('AI_MODEL') || 'gpt-4o-mini',
+               base: () => env('OPENAI_BASE_URL') || 'https://api.openai.com/v1' },
+  groq:      { key: () => env('GROQ_API_KEY') || env('GROQ_API'), model: () => env('AI_MODEL') || 'llama-3.3-70b-versatile',
+               base: () => env('GROQ_BASE_URL') || 'https://api.groq.com/openai/v1' },
 };
 const providerName = (override) => {
-  const n = String(override || process.env.AI_PROVIDER || 'anthropic').toLowerCase();
+  const n = (clean(override) || env('AI_PROVIDER') || 'anthropic').toLowerCase();
   return PROVIDERS[n] ? n : 'anthropic';
 };
 const MODEL = (override) => PROVIDERS[providerName(override)].model();
@@ -30,7 +34,7 @@ const MODEL = (override) => PROVIDERS[providerName(override)].model();
 // ── Anthropic Messages API ──────────────────────────────────────────────────
 async function callAnthropic({ system, tools, messages, maxTokens, model }) {
   const { data } = await axios.post(
-    (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com') + '/v1/messages',
+    (env('ANTHROPIC_BASE_URL') || 'https://api.anthropic.com') + '/v1/messages',
     { model, max_tokens: maxTokens || 1500, system, tools, messages },
     { headers: { 'x-api-key': PROVIDERS.anthropic.key(), 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 60000 }
   );
@@ -127,7 +131,7 @@ function sanitizeHistory(incoming, { maxHistory = 16, maxChars = 2000 } = {}) {
  */
 async function runChat({ system, tools, runTool, history, maxTokens, model, provider, maxRounds = 6, maxToolChars = 14000 }) {
   const name = providerName(provider);
-  const args = { system, tools, runTool, history, maxTokens, model: model || MODEL(provider), maxRounds, maxToolChars };
+  const args = { system, tools, runTool, history, maxTokens, model: clean(model) || MODEL(provider), maxRounds, maxToolChars };
   return name === 'anthropic' ? runAnthropic(args) : runCompat(name, args);
 }
 
