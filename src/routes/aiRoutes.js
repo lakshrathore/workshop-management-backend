@@ -75,7 +75,7 @@ router.post('/ai/chat', auth, adminOnly, adminLimit, async (req, res) => {
       runTool: (name, input) => adminTools.runTool(db, name, input, ctx),
     });
     res.json({ reply, tools_used: toolsUsed, actions: ctx.actions });
-  } catch (err) { sendAiError(res, err, 'ai-admin'); }
+  } catch (err) { sendAiError(res, err, 'ai-admin', { showDetail: true }); }
 });
 
 // ── Client-portal assistant ─────────────────────────────────────────────────

@@ -148,12 +148,18 @@ function makeRateLimiter({ max, windowMs, keyFn, message }) {
 }
 
 // Maps an Anthropic/axios error to a safe client response (never leaks upstream details).
-function sendAiError(res, err, tag = 'ai') {
+// showDetail (admin only): adds the provider's own error text so a setup problem
+// (wrong model name, wrong key, provider mismatch) can be fixed without the server logs.
+function sendAiError(res, err, tag = 'ai', { showDetail = false } = {}) {
   const status = err.response?.status;
-  console.error(`[${tag}] chat error:`, status, err.response?.data?.error?.message || err.message);
-  if (status === 429 || status === 529) return res.status(503).json({ message: 'AI abhi busy hai, thodi der baad try karo.' });
-  if (status === 401) return res.status(503).json({ message: 'AI abhi available nahi hai. Thodi der baad try karo.' });
-  return res.status(500).json({ message: 'AI se jawab nahi aa paya. Thodi der baad try karo.' });
+  const upstream = err.response?.data?.error?.message || err.response?.data?.message || err.message || '';
+  console.error(`[${tag}] chat error:`, providerName(), status, upstream);
+  const detail = showDetail
+    ? ` [${providerName()}${status ? ' ' + status : ''}: ${String(upstream).replace(/(sk|gsk|key)[-_A-Za-z0-9]{8,}/g, '***').slice(0, 250)}]`
+    : '';
+  if (status === 429 || status === 529) return res.status(503).json({ message: 'AI abhi busy hai, thodi der baad try karo.' + detail });
+  if (status === 401 || status === 403) return res.status(503).json({ message: 'AI abhi available nahi hai. Thodi der baad try karo.' + (showDetail ? ' (API key check karo)' + detail : '') });
+  return res.status(500).json({ message: 'AI se jawab nahi aa paya. Thodi der baad try karo.' + detail });
 }
 
 const isConfigured = (provider) => !!PROVIDERS[providerName(provider)].key();
