@@ -220,6 +220,12 @@ app.use('/api', clientRoutes);
 // app.use('/api', backupRoutes);  // BACKUP SYSTEM DISABLED
 
 // ── PUBLIC WEBSITE + CMS ROUTES ───────────────────────────────────────────────
+// Ask Moji — AI assistant (admin + client portal; read-only, actions need Confirm)
+app.use('/api', require('./routes/aiRoutes'));
+
+// Ask Moji — public website assistant (no login; rate limited, public data only)
+app.use('/api/website', require('./routes/publicAiRoutes'));
+
 const websiteRoutes = require('./routes/websiteRoutes');
 app.use('/api/website', websiteRoutes.router);
 
