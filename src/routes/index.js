@@ -2554,6 +2554,28 @@ router.get('/reports/dashboard', auth, async (req, res) => {
     } catch(e) {
       console.warn('extraStats partial error:', e.message);
     }
+    // Dispatch flow: Worker Done → Packing (boxes) → Sale Challan (boxes ticked) → Delivered
+    try {
+      const [[fl]] = await db.query(`
+        SELECT
+          (SELECT COALESCE(SUM(GREATEST(LEAST(COALESCE(copies, 1), 26), 1)), 0)
+             FROM packing_boxes WHERE DATE(created_at) = CURDATE()) AS packed_boxes_today,
+          (SELECT COUNT(*) FROM sale_challans
+            WHERE challan_date = CURDATE() AND status <> 'cancelled') AS challans_today,
+          (SELECT COUNT(*) FROM sale_challans
+            WHERE delivered_at IS NOT NULL AND DATE(delivered_at) = CURDATE() AND status = 'delivered') AS delivered_today,
+          (SELECT COUNT(*) FROM sale_challans WHERE status IN ('draft','sent')) AS challans_not_delivered`);
+      Object.assign(extraStats, fl);
+      // Boxes packed but not ticked on any challan yet (all dates) — same rule as the Packing report
+      const rep = await challanPacking.packingDispatchReport(db, {});
+      extraStats.boxes_not_on_challan = rep.summary.pending_labels;
+      extraStats.boxes_total = rep.summary.labels;
+      const [todayCh] = await db.query("SELECT id FROM sale_challans WHERE challan_date = CURDATE() AND status <> 'cancelled'");
+      const todayIds = new Set(todayCh.map(c => c.id));
+      extraStats.boxes_on_challan_today = rep.boxes.filter(b => b.challans.some(c => todayIds.has(c.id))).length;
+    } catch (e) {
+      console.warn('dispatch flow stats error:', e.message);
+    }
 
     // ── DATE-FILTERED QUERIES — all use from/to properly ─────────────────────
 
@@ -5101,6 +5123,7 @@ router.post('/sale-challans', auth, adminOrPermission('sale_challans','write'), 
     );
     const challanId = r.insertId;
     await challanPacking.insertChallanItems(db, challanId, items);
+    await stampDelivered(db, challanId);
     res.json({ id: challanId, challan_number, message: 'Sale Challan created successfully' });
   } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
 });
@@ -5143,6 +5166,7 @@ router.put('/sale-challans/:id', auth, adminOrPermission('sale_challans','edit')
       await conn.commit();
     } catch (e) { await conn.rollback().catch(() => {}); throw e; }
     finally { conn.release(); }
+    await stampDelivered(db, req.params.id);
     res.json({ message: 'Sale Challan updated successfully' });
   } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
 });
@@ -5182,6 +5206,13 @@ router.get('/sale-challans/:id/packing-status', auth, async (req, res) => {
 });
 
 // PATCH status only
+// Delivered time follows the status: set once when it becomes Delivered, cleared otherwise
+async function stampDelivered(db, challanId) {
+  await db.query(
+    "UPDATE sale_challans SET delivered_at = CASE WHEN status = 'delivered' THEN COALESCE(delivered_at, NOW()) ELSE NULL END WHERE id = ?",
+    [challanId]).catch(e => console.warn('delivered_at:', e.message));
+}
+
 router.patch('/sale-challans/:id/status', auth, adminOrPermission('sale_challans','edit'), auditLog('UPDATE','SaleChallan'), async (req, res) => {
   const db = await getPool();
   try {
@@ -5193,6 +5224,7 @@ router.patch('/sale-challans/:id/status', auth, adminOrPermission('sale_challans
       await challanPacking.validateTicks(db, lines, Number(req.params.id));
     }
     await db.query('UPDATE sale_challans SET status=? WHERE id=?', [status, req.params.id]);
+    await stampDelivered(db, req.params.id);
     res.json({ message: 'Status updated successfully' });
   } catch (err) { res.status(err.status || 500).json({ message: err.message }); }
 });
@@ -5319,6 +5351,7 @@ router.patch('/dispatch/challans/:id/status', auth, async (req, res) => {
     }
     const { status } = req.body;
     await db.query('UPDATE sale_challans SET status=? WHERE id=?', [status, req.params.id]);
+    await stampDelivered(db, req.params.id);
     res.json({ message: 'Status updated successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });

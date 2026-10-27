@@ -595,6 +595,16 @@ async function initializeDatabase() {
 
   // Vehicle length (e.g. "17 ft") next to the vehicle number on a challan
   await ensureColumn('sale_challans', 'vehicle_length', 'vehicle_length VARCHAR(50) NULL');
+  // When a challan became Delivered (dashboard "Delivered today"). Older delivered
+  // challans get their last-updated time as a best guess.
+  {
+    const [[has]] = await db.query(
+      "SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sale_challans' AND COLUMN_NAME = 'delivered_at'");
+    if (!Number(has.c)) {
+      await ensureColumn('sale_challans', 'delivered_at', 'delivered_at DATETIME NULL');
+      await db.query("UPDATE sale_challans SET delivered_at = updated_at WHERE status = 'delivered' AND delivered_at IS NULL").catch(() => {});
+    }
+  }
 
   // ── Sale Challan ↔ Packing link ────────────────────────────────────────────
   // Proto Code + source project item on each challan line
