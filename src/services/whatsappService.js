@@ -59,14 +59,62 @@ const msgRetryCounterCache = {
 };
 
 // Minimal silent logger (Baileys requires one; keep only warnings/errors).
+// ── Diagnostics (shown in Settings → WhatsApp Alerts) ─────────────────────────
+// Last Baileys warnings/errors, and the delivery status of recent sends.
+const recentLogs = [];   // { at, level, text }
+const recentSends = [];  // { id, to, kind, name, at, status, error }
+const STATUS_NAMES = { 0: 'error', 1: 'pending', 2: 'server', 3: 'delivered', 4: 'read', 5: 'played' };
+
+function describeLog(args) {
+  return args.map((a) => {
+    if (typeof a === 'string') return a;
+    if (a instanceof Error) return a.message;
+    try {
+      const o = a && typeof a === 'object' ? { ...a } : a;
+      if (o && o.err) o.err = o.err.message || String(o.err);
+      if (o && o.error) o.error = o.error.message || String(o.error);
+      return JSON.stringify(o);
+    } catch { return String(a); }
+  }).join(' ').slice(0, 400);
+}
+
+function pushLog(level, args) {
+  recentLogs.push({ at: new Date().toISOString(), level, text: describeLog(args) });
+  if (recentLogs.length > 30) recentLogs.shift();
+}
+
+function trackSend(msg, to, kind, name) {
+  if (!msg?.key?.id) return;
+  recentSends.unshift({ id: msg.key.id, to, kind, name: name || null, at: new Date().toISOString(), status: 'sent' });
+  if (recentSends.length > 20) recentSends.pop();
+}
+
+function updateSendStatus(id, status) {
+  const item = recentSends.find((s) => s.id === id);
+  if (!item) return;
+  const order = ['error', 'pending', 'sent', 'server', 'delivered', 'read', 'played'];
+  if (order.indexOf(status) > order.indexOf(item.status) || status === 'error') item.status = status;
+}
+
+// Baileys logger: keep warnings/errors for the diagnostics panel (and Railway logs).
 const logger = {
   level: 'warn',
   child() { return logger; },
   trace() {}, debug() {}, info() {},
-  warn(...a) { if (process.env.WHATSAPP_DEBUG) console.warn('[whatsapp]', ...a); },
-  error(...a) { if (process.env.WHATSAPP_DEBUG) console.error('[whatsapp]', ...a); },
-  fatal(...a) { console.error('[whatsapp] fatal', ...a); },
+  warn(...a) { pushLog('warn', a); if (process.env.WHATSAPP_DEBUG) console.warn('[whatsapp]', ...a); },
+  error(...a) { pushLog('error', a); console.error('[whatsapp]', describeLog(a)); },
+  fatal(...a) { pushLog('fatal', a); console.error('[whatsapp] fatal', describeLog(a)); },
 };
+
+let libraryVersion = null;
+function baileysVersion() {
+  if (libraryVersion) return libraryVersion;
+  try {
+    const pkg = require('path').join(__dirname, '../../node_modules/@whiskeysockets/baileys/package.json');
+    libraryVersion = JSON.parse(require('fs').readFileSync(pkg, 'utf8')).version;
+  } catch { libraryVersion = 'unknown'; }
+  return libraryVersion;
+}
 
 function isEnabledForThisServer() {
   const flag = (process.env.WHATSAPP_ENABLED || '').toLowerCase();
@@ -177,6 +225,20 @@ async function connect() {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // Delivery ticks for the diagnostics list.
+  sock.ev.on('messages.update', (updates) => {
+    for (const { key, update } of updates || []) {
+      if (key?.fromMe && update?.status !== undefined) updateSendStatus(key.id, STATUS_NAMES[update.status] || String(update.status));
+    }
+  });
+  sock.ev.on('message-receipt.update', (receipts) => {
+    for (const { key, receipt } of receipts || []) {
+      if (!key?.fromMe) continue;
+      if (receipt?.readTimestamp) updateSendStatus(key.id, 'read');
+      else if (receipt?.receiptTimestamp) updateSendStatus(key.id, 'delivered');
+    }
+  });
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -269,13 +331,18 @@ function getWhatsAppStatus() {
     qr: status === 'qr' ? lastQr : null,
     queued: queue.length,
     error: lastError,
+    library_version: baileysVersion(),
+    recent_sends: recentSends,
+    recent_logs: recentLogs.slice(-15).reverse(),
   };
 }
 
 // ── Sending ───────────────────────────────────────────────────────────────────
 async function deliver(phone, message) {
   const jid = `${phone}@s.whatsapp.net`;
-  rememberSent(await sock.sendMessage(jid, { text: message }));
+  const sent = await sock.sendMessage(jid, { text: message });
+  rememberSent(sent);
+  trackSend(sent, phone, 'text');
 }
 
 function flushQueue() {
@@ -351,6 +418,7 @@ async function sendWhatsAppDocument(receiverPhone, fileSource, fileName, caption
       caption: caption || undefined,
     });
     rememberSent(sent);
+    trackSend(sent, phone, 'document', fileName);
     return { sent: true, phone };
   } catch (err) {
     console.warn('[whatsapp] document send failed:', err.message);

@@ -60,7 +60,10 @@ router.get('/settings/whatsapp/status', ...canRead, (req, res) => {
 
 router.post('/settings/whatsapp/test', ...canEdit, async (req, res) => {
   try {
-    const { number } = await getAlertSettings();
+    // Optional body.phone sends the test to another number (for checking delivery)
+    const custom = req.body?.phone ? formatPhoneNumber(req.body.phone) : null;
+    if (req.body?.phone && !custom) return res.status(400).json({ message: 'Enter a valid WhatsApp number' });
+    const number = custom || (await getAlertSettings()).number;
     if (!number) return res.status(400).json({ message: 'Save an admin WhatsApp number first' });
     const message = buildApprovalMessage({
       moduleName: 'Test Alert', referenceId: 'TEST', workerName: req.user.name || 'Admin',
