@@ -29,6 +29,35 @@ let reconnectTimer = null;
 let reconnectDelay = 5000;
 const queue = [];
 
+// Copies of recently sent messages. When a phone can't decrypt a message it
+// shows "Waiting for this message" and asks us to resend; Baileys can only do
+// that through getMessage(), so we keep the last messages for a while.
+const SENT_CACHE_MAX = 300;
+const SENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const sentMessages = new Map(); // id -> { message, at }
+
+function rememberSent(msg) {
+  if (!msg?.key?.id || !msg.message) return;
+  sentMessages.set(msg.key.id, { message: msg.message, at: Date.now() });
+  if (sentMessages.size > SENT_CACHE_MAX) sentMessages.delete(sentMessages.keys().next().value);
+}
+
+async function getMessage(key) {
+  const hit = key?.id && sentMessages.get(key.id);
+  if (!hit) return undefined;
+  if (Date.now() - hit.at > SENT_CACHE_TTL_MS) { sentMessages.delete(key.id); return undefined; }
+  return hit.message;
+}
+
+// Retry counters per message (Baileys expects a get/set/del cache object).
+const retryCounts = new Map();
+const msgRetryCounterCache = {
+  get: (k) => retryCounts.get(k),
+  set: (k, v) => { retryCounts.set(k, v); if (retryCounts.size > 1000) retryCounts.delete(retryCounts.keys().next().value); return true; },
+  del: (k) => retryCounts.delete(k),
+  flushAll: () => retryCounts.clear(),
+};
+
 // Minimal silent logger (Baileys requires one; keep only warnings/errors).
 const logger = {
   level: 'warn',
@@ -143,6 +172,8 @@ async function connect() {
     printQRInTerminal: false,
     markOnlineOnConnect: false,   // don't hide the admin's phone notifications
     syncFullHistory: false,
+    getMessage,              // lets Baileys resend when a phone couldn't decrypt
+    msgRetryCounterCache,
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -245,7 +276,7 @@ function getWhatsAppStatus() {
 // ── Sending ───────────────────────────────────────────────────────────────────
 async function deliver(phone, message) {
   const jid = `${phone}@s.whatsapp.net`;
-  await sock.sendMessage(jid, { text: message });
+  rememberSent(await sock.sendMessage(jid, { text: message }));
 }
 
 function flushQueue() {
@@ -314,12 +345,13 @@ async function sendWhatsAppDocument(receiverPhone, fileSource, fileName, caption
     const [check] = await sock.onWhatsApp(phone).catch(() => [null]);
     if (check && check.exists === false) return { sent: false, reason: 'not_on_whatsapp' };
     const jid = check?.jid || `${phone}@s.whatsapp.net`;
-    await sock.sendMessage(jid, {
+    const sent = await sock.sendMessage(jid, {
       document,
       mimetype: mimeType || mimeTypeFor(fileName),
       fileName: fileName || 'document.pdf',
       caption: caption || undefined,
     });
+    rememberSent(sent);
     return { sent: true, phone };
   } catch (err) {
     console.warn('[whatsapp] document send failed:', err.message);
