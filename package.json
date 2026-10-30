@@ -7,7 +7,7 @@
     "dev": "nodemon src/server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.24",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "archiver": "^6.0.0",
     "axios": "^1.6.7",
     "bcryptjs": "^2.4.3",

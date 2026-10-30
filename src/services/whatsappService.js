@@ -169,7 +169,6 @@ async function connect() {
     logger,
     ...(version ? { version } : {}),
     browser: Browsers.ubuntu('MOJI Factory Alerts'),
-    printQRInTerminal: false,
     markOnlineOnConnect: false,   // don't hide the admin's phone notifications
     syncFullHistory: false,
     getMessage,              // lets Baileys resend when a phone couldn't decrypt
