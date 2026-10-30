@@ -4,6 +4,7 @@
 //   GET    /api/settings/whatsapp/status   connection status (+ QR to scan)
 //   POST   /api/settings/whatsapp/test     send a test alert to the saved number
 //   POST   /api/settings/whatsapp/reset    unlink and show a new QR
+//   POST   /api/whatsapp/send-document     send a PDF/Word/Excel document to a number
 
 const express = require('express');
 const router = express.Router();
@@ -82,5 +83,17 @@ router.post('/settings/whatsapp/reset', ...canEdit, auditLog('UPDATE', 'Settings
     res.json({ message: 'WhatsApp unlinked. Scan the new QR code to link again.' });
   } catch (err) { res.status(400).json({ message: err.message }); }
 });
+
+// ── Send a document (Sale Challan, Invoice, Quotation, ...) ────────────────────
+const multer = require('multer');
+const { sendDocument, requireDocumentPermission } = require('../controllers/whatsappDocumentController');
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+}).fields([{ name: 'html', maxCount: 1 }, { name: 'file', maxCount: 1 }]);
+
+router.post('/whatsapp/send-document', auth, documentUpload, requireDocumentPermission,
+  auditLog('CREATE', 'WhatsApp Document', (req) => (/^\d+$/.test(String(req.body.referenceId || '')) ? Number(req.body.referenceId) : null)),
+  sendDocument);
 
 module.exports = router;

@@ -1,0 +1,7 @@
+# Railway (Nixpacks) build additions.
+# "..." keeps Nixpacks' default Node packages; the rest is for "Send via WhatsApp":
+# headless Chromium renders the app's printable documents to PDF
+# (services/pdfRenderer.js finds the `chromium` binary on PATH).
+# Fonts: Liberation = Arial/Times-compatible metrics, DejaVu covers ₹ and other symbols.
+[phases.setup]
+nixPkgs = ["...", "chromium", "fontconfig", "liberation_ttf", "dejavu_fonts"]

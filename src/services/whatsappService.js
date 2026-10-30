@@ -279,9 +279,60 @@ async function sendWhatsAppNotification(phoneNumber, message) {
   }
 }
 
+// ── Documents (PDF / Word / Excel) ────────────────────────────────────────────
+const MIME_TYPES = {
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  doc: 'application/msword',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  xls: 'application/vnd.ms-excel',
+};
+const MAX_DOCUMENT_BYTES = 30 * 1024 * 1024;
+
+function mimeTypeFor(fileName, fallback) {
+  const ext = String(fileName || '').split('.').pop().toLowerCase();
+  return MIME_TYPES[ext] || fallback || 'application/octet-stream';
+}
+
+// Send a file to one number. Unlike alerts, documents are NOT queued: the user
+// is waiting, so we report clearly instead. Never throws.
+// fileSource: Buffer, or a URL/path string (https URL or local file path).
+async function sendWhatsAppDocument(receiverPhone, fileSource, fileName, caption = '', mimeType) {
+  const phone = formatPhoneNumber(receiverPhone);
+  if (!phone) return { sent: false, reason: 'invalid_number' };
+  if (status === 'disabled') return { sent: false, reason: 'service_disabled' };
+  if (status !== 'connected' || !sock) return { sent: false, reason: 'not_connected' };
+
+  let document;
+  if (Buffer.isBuffer(fileSource)) document = fileSource;
+  else if (typeof fileSource === 'string' && /^https:\/\//i.test(fileSource)) document = { url: fileSource };
+  else if (typeof fileSource === 'string') document = require('fs').readFileSync(fileSource);
+  else return { sent: false, reason: 'no_file' };
+  if (Buffer.isBuffer(document) && document.length > MAX_DOCUMENT_BYTES) return { sent: false, reason: 'file_too_large' };
+
+  try {
+    const [check] = await sock.onWhatsApp(phone).catch(() => [null]);
+    if (check && check.exists === false) return { sent: false, reason: 'not_on_whatsapp' };
+    const jid = check?.jid || `${phone}@s.whatsapp.net`;
+    await sock.sendMessage(jid, {
+      document,
+      mimetype: mimeType || mimeTypeFor(fileName),
+      fileName: fileName || 'document.pdf',
+      caption: caption || undefined,
+    });
+    return { sent: true, phone };
+  } catch (err) {
+    console.warn('[whatsapp] document send failed:', err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
 module.exports = {
   initWhatsApp,
   sendWhatsAppNotification,
+  sendWhatsAppDocument,
+  mimeTypeFor,
+  MIME_TYPES,
   formatPhoneNumber,
   getWhatsAppStatus,
   resetWhatsAppSession,
