@@ -180,6 +180,9 @@ app.use('/api', apiRoutes);
 const approvalRoutes = require('./routes/approvalRoutes');
 app.use('/api', approvalRoutes);
 
+// ── WHATSAPP APPROVAL ALERTS — settings + connection status ─────────────────
+app.use('/api', require('./routes/whatsappRoutes'));
+
 // ── MAIN PO MODULE (Phase 1) — new routes + approval resolver registration ──
 const mainPoRoutes = require('./routes/mainPoRoutes');
 app.use('/api', mainPoRoutes);
@@ -311,6 +314,8 @@ initializeDatabase().then(async () => {
     console.log(`   Local:  http://localhost:${PORT}`);
     console.log(`   Mobile: http://${localIP}:${PORT}`);
     console.log(`📋 Admin: admin / admin123\n`);
+    // WhatsApp connects in the background; failures never affect the API.
+    require('./services/whatsappService').initWhatsApp();
   });
 }).catch(err => {
   console.error('❌ DB Error:', err.message);

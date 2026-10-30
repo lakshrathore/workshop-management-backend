@@ -658,6 +658,17 @@ async function initializeDatabase() {
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('system_email', 'Mojiinnovators@gmail.com')").catch(()=>{});
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('resend_api_key', '')").catch(()=>{});
 
+  // ── WhatsApp approval alerts (Settings → WhatsApp tab) ────────────────────
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('admin_whatsapp_number', '')").catch(()=>{});
+  await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('is_whatsapp_approval_alerts_enabled', '1')").catch(()=>{});
+  // WhatsApp login session (Baileys auth keys). Kept in the DB, not on disk,
+  // because Railway wipes the filesystem on every deploy.
+  await db.query(`CREATE TABLE IF NOT EXISTS whatsapp_auth (
+    id VARCHAR(191) PRIMARY KEY,
+    data LONGTEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )`).catch(e => console.error('whatsapp_auth table error:', e.message));
+
 
   // ── CLIENT PURCHASE ORDERS (client-submitted with PDF) ────────────────────
   await db.query(`CREATE TABLE IF NOT EXISTS client_purchase_orders (

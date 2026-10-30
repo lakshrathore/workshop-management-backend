@@ -3854,7 +3854,10 @@ router.get('/settings', async (req, res) => {
   try {
     const [rows] = await db.query('SELECT setting_key, setting_value FROM app_settings');
     const settings = {};
-    rows.forEach(r => settings[r.setting_key] = r.setting_value);
+    // This endpoint is public: keep the admin's WhatsApp number out of it
+    // (it's served by the authenticated GET /settings/whatsapp instead).
+    const PRIVATE_KEYS = new Set(['admin_whatsapp_number']);
+    rows.forEach(r => { if (!PRIVATE_KEYS.has(r.setting_key)) settings[r.setting_key] = r.setting_value; });
     res.json(settings);
   } catch(err) { res.status(500).json({ message: err.message }); }
 });

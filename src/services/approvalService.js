@@ -10,6 +10,7 @@
  */
 
 const { getPool } = require('../database');
+const { alertForApprovalRequest } = require('./approvalAlerts');
 
 /**
  * Check if approval system is enabled
@@ -67,6 +68,9 @@ async function createApprovalRequest(params) {
     );
 
     console.log(`✅ Approval created: ID=${approvalId}, Type=${type}, User=${userId}`);
+
+    // 3. WhatsApp alert to admin (background; can never fail this request)
+    alertForApprovalRequest({ type, userId, requestData, relatedId, approvalId });
 
     return {
       approval_id: approvalId,
