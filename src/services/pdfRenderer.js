@@ -22,36 +22,72 @@ let browserPromise = null;
 let idleTimer = null;
 let chain = Promise.resolve(); // serialises renders
 
-function findChrome() {
-  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
-  const candidates = [
-    '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  const found = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
-  if (found) return found;
+// Ubuntu ships /usr/bin/chromium-browser as a tiny script that only says
+// "install the chromium snap" — it is not a browser. Skip such stubs.
+function isRealBrowser(file) {
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile()) return false;
+    if (st.size > 64 * 1024) return true; // real binaries are large
+    const head = fs.readFileSync(file, 'utf8').slice(0, 4096);
+    return !/snap/i.test(head) || /exec\s+["']?\/nix\/store/.test(head); // keep Nix wrapper scripts
+  } catch { return false; }
+}
+
+// Candidate browsers, best first: CHROME_PATH, then whatever is on PATH
+// (Railway/Nixpacks puts chromium there), then common install locations.
+function chromeCandidates() {
+  const list = [];
+  if (process.env.CHROME_PATH) list.push(process.env.CHROME_PATH);
   if (process.platform !== 'win32') {
-    for (const bin of ['chromium', 'chromium-browser', 'google-chrome']) {
-      try { const p = execSync(`command -v ${bin}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); if (p) return p; } catch { /* next */ }
+    for (const bin of ['chromium', 'chromium-browser', 'google-chrome-stable', 'google-chrome']) {
+      try {
+        const out = execSync(`command -v ${bin}`, { stdio: ['ignore', 'pipe', 'ignore'], shell: '/bin/sh' }).toString().trim();
+        if (out) list.push(out);
+      } catch { /* not on PATH */ }
     }
   }
-  return null;
+  list.push(
+    '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome',
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+    'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  );
+  return [...new Set(list)].filter((p) => p === process.env.CHROME_PATH || isRealBrowser(p));
+}
+
+function findChrome() {
+  return chromeCandidates()[0] || null;
+}
+
+const LAUNCH_ARGS = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--font-render-hinting=none'];
+
+// Try each candidate until one actually starts.
+async function launchAny() {
+  const puppeteer = require('puppeteer-core');
+  const candidates = chromeCandidates();
+  if (!candidates.length) {
+    throw new Error('PDF engine not available: no Chrome/Chromium found on the server (install chromium or set CHROME_PATH)');
+  }
+  const failures = [];
+  for (const executablePath of candidates) {
+    try {
+      const browser = await puppeteer.launch({ executablePath, headless: true, args: LAUNCH_ARGS });
+      if (failures.length) console.warn('[pdf] skipped browsers:', failures.join(' | '));
+      console.log(`🖨️  [pdf] using ${executablePath}`);
+      return browser;
+    } catch (err) {
+      failures.push(`${executablePath}: ${String(err.message).split('\n')[0]}`);
+    }
+  }
+  throw new Error(`PDF engine could not start Chrome. Tried: ${failures.join(' | ')}`);
 }
 
 async function getBrowser() {
   if (!browserPromise) {
-    const executablePath = findChrome();
-    if (!executablePath) throw new Error('PDF engine not available: Chrome/Chromium not found on the server (set CHROME_PATH)');
-    const puppeteer = require('puppeteer-core');
-    browserPromise = puppeteer.launch({
-      executablePath,
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--font-render-hinting=none'],
-    }).catch((err) => { browserPromise = null; throw err; });
+    browserPromise = launchAny().catch((err) => { browserPromise = null; throw err; });
     browserPromise.then((b) => b.on('disconnected', () => { browserPromise = null; })).catch(() => {});
   }
   return browserPromise;
@@ -124,4 +160,4 @@ function renderHtmlToPdf(html, options = {}) {
   return job.finally(touchIdle);
 }
 
-module.exports = { renderHtmlToPdf, findChrome };
+module.exports = { renderHtmlToPdf, findChrome, chromeCandidates };
