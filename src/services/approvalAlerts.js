@@ -7,7 +7,8 @@
 // types get alerts automatically.
 //
 // Settings come from app_settings (Settings → WhatsApp), never from code:
-//   admin_whatsapp_number                  e.g. "9876543210"
+//   admin_whatsapp_number                  one or more numbers, comma-separated
+//                                          e.g. "919876543210,919812345678"
 //   is_whatsapp_approval_alerts_enabled    '1' | '0'
 //
 // Fire-and-forget: nothing here can fail or slow down the request that
@@ -29,6 +30,13 @@ const MODULE_LABELS = {
   CASHBOOK_EXPENSE: 'Cash Book – Expense',
 };
 
+const MAX_ADMIN_NUMBERS = 10;
+
+// "919876543210,919812345678" → ['919876543210', '919812345678']
+function parseNumbers(value) {
+  return [...new Set(String(value || '').split(/[,;\s]+/).map((n) => n.trim()).filter(Boolean))];
+}
+
 async function getAlertSettings() {
   const db = await getPool();
   const [rows] = await db.query(
@@ -36,7 +44,8 @@ async function getAlertSettings() {
   );
   const s = Object.fromEntries(rows.map((r) => [r.setting_key, r.setting_value]));
   return {
-    number: s.admin_whatsapp_number || '',
+    numbers: parseNumbers(s.admin_whatsapp_number),
+    number: parseNumbers(s.admin_whatsapp_number)[0] || '', // first one (older callers)
     enabled: (s.is_whatsapp_approval_alerts_enabled ?? '1') !== '0',
   };
 }
@@ -74,11 +83,14 @@ function buildApprovalMessage({ moduleName, actionTitle, workerName, referenceId
 function triggerApprovalAlert({ moduleName, actionTitle, workerName, referenceId, remarks } = {}) {
   setImmediate(async () => {
     try {
-      const { number, enabled } = await getAlertSettings();
-      if (!enabled || !number) return;
+      const { numbers, enabled } = await getAlertSettings();
+      if (!enabled || !numbers.length) return;
       const message = buildApprovalMessage({ moduleName, actionTitle, workerName, referenceId, remarks });
-      const result = await sendWhatsAppNotification(number, message);
-      if (!result.sent) console.warn(`[approval-alert] not sent (${result.reason}) for ${moduleName} #${referenceId}`);
+      // Every admin number gets the alert (one after another, to stay gentle with WhatsApp)
+      for (const number of numbers) {
+        const result = await sendWhatsAppNotification(number, message);
+        if (!result.sent) console.warn(`[approval-alert] not sent to +${number} (${result.reason}) for ${moduleName} #${referenceId}`);
+      }
     } catch (err) {
       console.warn('[approval-alert] failed:', err.message);
     }
@@ -121,4 +133,4 @@ function alertForApprovalRequest({ type, userId, requestData, relatedId, approva
   });
 }
 
-module.exports = { triggerApprovalAlert, alertForApprovalRequest, buildApprovalMessage, getAlertSettings, MODULE_LABELS };
+module.exports = { triggerApprovalAlert, alertForApprovalRequest, buildApprovalMessage, getAlertSettings, parseNumbers, MAX_ADMIN_NUMBERS, MODULE_LABELS };

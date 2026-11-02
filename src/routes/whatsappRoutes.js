@@ -12,30 +12,36 @@ const { getPool } = require('../database');
 const { auth, adminOrPermission } = require('../middleware/authHelpers');
 const auditLog = require('../middleware/auditLog');
 const { formatPhoneNumber, getWhatsAppStatus, resetWhatsAppSession, sendWhatsAppNotification } = require('../services/whatsappService');
-const { getAlertSettings, buildApprovalMessage } = require('../services/approvalAlerts');
+const { getAlertSettings, buildApprovalMessage, parseNumbers, MAX_ADMIN_NUMBERS } = require('../services/approvalAlerts');
 
 const canRead = [auth, adminOrPermission('settings', 'read')];
 const canEdit = [auth, adminOrPermission('settings', 'edit')];
 
 router.get('/settings/whatsapp', ...canRead, async (req, res) => {
   try {
-    const { number, enabled } = await getAlertSettings();
-    res.json({ admin_whatsapp_number: number, is_whatsapp_approval_alerts_enabled: enabled });
+    const { numbers, enabled } = await getAlertSettings();
+    res.json({ admin_whatsapp_numbers: numbers, admin_whatsapp_number: numbers[0] || '', is_whatsapp_approval_alerts_enabled: enabled });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 router.put('/settings/whatsapp', ...canEdit, auditLog('UPDATE', 'Settings'), async (req, res) => {
   try {
-    const { admin_whatsapp_number, is_whatsapp_approval_alerts_enabled } = req.body || {};
+    const { admin_whatsapp_numbers, admin_whatsapp_number, is_whatsapp_approval_alerts_enabled } = req.body || {};
     const updates = [];
 
-    if (admin_whatsapp_number !== undefined) {
-      const raw = String(admin_whatsapp_number || '').trim();
-      const formatted = raw ? formatPhoneNumber(raw) : '';
-      if (raw && !formatted) {
-        return res.status(400).json({ message: 'Enter a valid WhatsApp number, e.g. 9876543210 or +91 98765 43210' });
+    // Accepts an array (admin_whatsapp_numbers) or a single/comma-separated string (admin_whatsapp_number)
+    const input = admin_whatsapp_numbers !== undefined ? admin_whatsapp_numbers : admin_whatsapp_number;
+    if (input !== undefined) {
+      const raws = (Array.isArray(input) ? input : String(input || '').split(/[,;\n]+/))
+        .map((n) => String(n || '').trim()).filter(Boolean);
+      const formatted = [];
+      for (const raw of raws) {
+        const f = formatPhoneNumber(raw);
+        if (!f) return res.status(400).json({ message: `"${raw}" is not a valid WhatsApp number (e.g. 9876543210 or +91 98765 43210)` });
+        if (!formatted.includes(f)) formatted.push(f);
       }
-      updates.push(['admin_whatsapp_number', formatted]);
+      if (formatted.length > MAX_ADMIN_NUMBERS) return res.status(400).json({ message: `Up to ${MAX_ADMIN_NUMBERS} admin numbers allowed` });
+      updates.push(['admin_whatsapp_number', formatted.join(',')]);
     }
     if (is_whatsapp_approval_alerts_enabled !== undefined) {
       const on = [true, 'true', 1, '1'].includes(is_whatsapp_approval_alerts_enabled);
@@ -50,7 +56,7 @@ router.put('/settings/whatsapp', ...canEdit, auditLog('UPDATE', 'Settings'), asy
       );
     }
     const saved = await getAlertSettings();
-    res.json({ message: 'WhatsApp settings saved', admin_whatsapp_number: saved.number, is_whatsapp_approval_alerts_enabled: saved.enabled });
+    res.json({ message: 'WhatsApp settings saved', admin_whatsapp_numbers: saved.numbers, admin_whatsapp_number: saved.number, is_whatsapp_approval_alerts_enabled: saved.enabled });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -63,14 +69,20 @@ router.post('/settings/whatsapp/test', ...canEdit, async (req, res) => {
     // Optional body.phone sends the test to another number (for checking delivery)
     const custom = req.body?.phone ? formatPhoneNumber(req.body.phone) : null;
     if (req.body?.phone && !custom) return res.status(400).json({ message: 'Enter a valid WhatsApp number' });
-    const number = custom || (await getAlertSettings()).number;
-    if (!number) return res.status(400).json({ message: 'Save an admin WhatsApp number first' });
+    const numbers = custom ? [custom] : (await getAlertSettings()).numbers;
+    if (!numbers.length) return res.status(400).json({ message: 'Save an admin WhatsApp number first' });
     const message = buildApprovalMessage({
       moduleName: 'Test Alert', referenceId: 'TEST', workerName: req.user.name || 'Admin',
       remarks: 'This is a test message. WhatsApp approval alerts are working.',
     });
-    const result = await sendWhatsAppNotification(number, message);
-    if (result.sent) return res.json({ message: `Test message sent to +${number}` });
+    // Test goes to every admin number (or just the one given)
+    let result = { sent: false, reason: 'invalid_number' };
+    const sentTo = [];
+    for (const number of numbers) {
+      result = await sendWhatsAppNotification(number, message);
+      if (result.sent) sentTo.push(`+${number}`);
+    }
+    if (sentTo.length) return res.json({ message: `Test message sent to ${sentTo.join(', ')}` });
     const reasons = {
       service_disabled: 'WhatsApp service is not running on this server',
       queued_until_connected: 'WhatsApp is not connected yet — scan the QR code first. The test will be sent once connected.',
