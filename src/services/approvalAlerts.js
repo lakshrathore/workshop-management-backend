@@ -15,7 +15,7 @@
 // created the approval.
 
 const { getPool } = require('../database');
-const { sendWhatsAppNotification } = require('./whatsappService');
+const { sendWhatsAppNotification, formatPhoneNumber } = require('./whatsappService');
 
 const MODULE_LABELS = {
   PROJECT: 'New Project',
@@ -133,4 +133,73 @@ function alertForApprovalRequest({ type, userId, requestData, relatedId, approva
   });
 }
 
-module.exports = { triggerApprovalAlert, alertForApprovalRequest, buildApprovalMessage, getAlertSettings, parseNumbers, MAX_ADMIN_NUMBERS, MODULE_LABELS };
+
+// ══ Worker channel ════════════════════════════════════════════════════════════
+// Two separate channels, never mixed:
+//   admin  → approval-needed alerts, ONLY to the admin numbers in Settings
+//   worker → "your request was approved", ONLY to that worker's own number
+// Guards: a worker update is refused if the number is an admin number, and the
+// Settings page refuses to save a worker's number as an admin number.
+
+// Normalised phone → worker name, for every worker that has a phone saved.
+async function getWorkerPhoneMap() {
+  const db = await getPool();
+  const [rows] = await db.query("SELECT name, phone FROM users WHERE role='worker' AND phone IS NOT NULL AND phone <> ''");
+  const map = new Map();
+  for (const r of rows) {
+    const p = formatPhoneNumber(r.phone);
+    if (p && !map.has(p)) map.set(p, r.name);
+  }
+  return map;
+}
+
+function buildWorkerApprovalMessage({ moduleName, referenceId, adminName, notes, time }) {
+  const line = '------------------------------------------';
+  return [
+    line,
+    '✅ *Request Approved*',
+    line,
+    `📋 *Module:* ${clean(moduleName) || 'General'}`,
+    `🆔 *Ref:* #${clean(referenceId) || '-'}`,
+    `👤 *Approved By:* ${clean(adminName) || 'Admin'}`,
+    ...(clean(notes) ? [`📝 *Note:* ${clean(notes, 300)}`] : []),
+    `🕒 *Time:* ${formatTime(time)}`,
+    '',
+    '👉 Your request has been approved. You can continue in the app.',
+    line,
+  ].join('\n');
+}
+
+// Send the worker their approval update. Returns { sent, reason, phone }.
+// Never throws; never sends to an admin number or to an admin requester.
+async function notifyWorkerOfApproval({ approvalId, phone, adminName, notes }) {
+  try {
+    const db = await getPool();
+    const [[a]] = await db.query(
+      `SELECT a.id, a.type, a.related_id, u.role AS user_role, u.phone AS user_phone
+         FROM approvals a LEFT JOIN users u ON u.id = a.user_id WHERE a.id=?`, [approvalId]);
+    if (!a) return { sent: false, reason: 'approval_not_found' };
+    if (['admin', 'superadmin'].includes(a.user_role)) return { sent: false, reason: 'requester_is_admin' };
+
+    const target = formatPhoneNumber(phone || a.user_phone);
+    if (!target) return { sent: false, reason: phone ? 'invalid_number' : 'no_worker_number' };
+
+    const { numbers: adminNumbers } = await getAlertSettings();
+    if (adminNumbers.includes(target)) return { sent: false, reason: 'admin_number', phone: target };
+
+    const message = buildWorkerApprovalMessage({
+      moduleName: MODULE_LABELS[a.type] || String(a.type || '').replace(/_/g, ' '),
+      referenceId: a.related_id ? `${a.related_id} (Approval #${a.id})` : a.id,
+      adminName,
+      notes,
+    });
+    const result = await sendWhatsAppNotification(target, message);
+    return { ...result, phone: target };
+  } catch (err) {
+    console.warn('[worker-notify] failed:', err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+module.exports = { triggerApprovalAlert, alertForApprovalRequest, buildApprovalMessage, getAlertSettings, parseNumbers, MAX_ADMIN_NUMBERS, MODULE_LABELS,
+  getWorkerPhoneMap, buildWorkerApprovalMessage, notifyWorkerOfApproval };

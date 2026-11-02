@@ -12,7 +12,7 @@ const { getPool } = require('../database');
 const { auth, adminOrPermission } = require('../middleware/authHelpers');
 const auditLog = require('../middleware/auditLog');
 const { formatPhoneNumber, getWhatsAppStatus, resetWhatsAppSession, sendWhatsAppNotification } = require('../services/whatsappService');
-const { getAlertSettings, buildApprovalMessage, parseNumbers, MAX_ADMIN_NUMBERS } = require('../services/approvalAlerts');
+const { getAlertSettings, buildApprovalMessage, parseNumbers, MAX_ADMIN_NUMBERS, getWorkerPhoneMap } = require('../services/approvalAlerts');
 
 const canRead = [auth, adminOrPermission('settings', 'read')];
 const canEdit = [auth, adminOrPermission('settings', 'edit')];
@@ -41,6 +41,10 @@ router.put('/settings/whatsapp', ...canEdit, auditLog('UPDATE', 'Settings'), asy
         if (!formatted.includes(f)) formatted.push(f);
       }
       if (formatted.length > MAX_ADMIN_NUMBERS) return res.status(400).json({ message: `Up to ${MAX_ADMIN_NUMBERS} admin numbers allowed` });
+      // Channel isolation: admin alerts must never reach a worker's phone
+      const workerPhones = await getWorkerPhoneMap();
+      const clash = formatted.find((n) => workerPhones.has(n));
+      if (clash) return res.status(400).json({ message: `+${clash} is saved for worker "${workerPhones.get(clash)}". Admin alerts can't go to a worker's number.` });
       updates.push(['admin_whatsapp_number', formatted.join(',')]);
     }
     if (is_whatsapp_approval_alerts_enabled !== undefined) {

@@ -16,6 +16,7 @@ const {
   rejectRequest,
   sendApprovalNotification
 } = require('../services/approvalService');
+const { notifyWorkerOfApproval } = require('../services/approvalAlerts');
 
 // ── Auth Middleware ────────────────────────────────────────────────────────────
 function auth(req, res, next) {
@@ -105,6 +106,8 @@ router.get('/approvals', auth, adminOnly, async (req, res) => {
         a.rejected_at, a.rejected_reason,
         u.name        AS user_name,
         u.username    AS user_username,
+        u.phone       AS user_phone,
+        u.role        AS user_role,
         u.name        AS created_by_name,
         adm.name      AS approved_by_name
       FROM approvals a
@@ -189,10 +192,29 @@ router.get('/approvals/user-pending', auth, async (req, res) => {
  */
 router.post('/approvals/:id/approve', auth, adminOnly, async (req, res) => {
   try {
-    const { adminNotes } = req.body;
+    const { adminNotes, notifyWorker, workerPhone, saveWorkerPhone } = req.body;
     const approvalId = req.params.id;
 
     const result = await approveRequest(approvalId, req.user.id, adminNotes || '');
+
+    // Worker WhatsApp update (worker channel only — see approvalAlerts.js).
+    // Approval is already done; a failed message never undoes it.
+    let worker_notification = null;
+    if (notifyWorker) {
+      worker_notification = await notifyWorkerOfApproval({
+        approvalId, phone: workerPhone, adminName: req.user.name, notes: adminNotes,
+      });
+      // Optionally remember the number on the worker's profile
+      if (saveWorkerPhone && worker_notification.phone && worker_notification.reason !== 'admin_number') {
+        try {
+          const db = await getPool();
+          await db.query(
+            `UPDATE users u JOIN approvals a ON a.user_id = u.id
+                SET u.phone = ? WHERE a.id = ? AND u.role = 'worker'`,
+            [worker_notification.phone, approvalId]);
+        } catch (e) { console.warn('[worker-notify] save phone failed:', e.message); }
+      }
+    }
 
     // Send notification to requester
     try {
@@ -212,8 +234,10 @@ router.post('/approvals/:id/approve', auth, adminOnly, async (req, res) => {
     }
 
     res.json({
-      message: result.message,
-      approval_id: result.approval_id
+      message: 'You have approved successfully',
+      detail: result.message,
+      approval_id: result.approval_id,
+      worker_notification,
     });
   } catch (err) {
     res.status(400).json({ message: err.message });
@@ -267,7 +291,7 @@ router.post('/approvals/:id/reject', auth, adminOnly, async (req, res) => {
  */
 router.post('/approvals/bulk-approve', auth, adminOnly, async (req, res) => {
   try {
-    const { approval_ids, adminNotes } = req.body;
+    const { approval_ids, adminNotes, notifyWorkers } = req.body;
 
     if (!Array.isArray(approval_ids) || approval_ids.length === 0) {
       return res.status(400).json({ message: 'approval_ids must be non-empty array' });
@@ -278,8 +302,11 @@ router.post('/approvals/bulk-approve', auth, adminOnly, async (req, res) => {
 
     for (const id of approval_ids) {
       try {
-        const result = await approveRequest(id, req.user.id, adminNotes || '');
-        results.push({ id, status: 'approved' });
+        await approveRequest(id, req.user.id, adminNotes || '');
+        const item = { id, status: 'approved' };
+        // Bulk: notify each worker on their saved number (if any)
+        if (notifyWorkers) item.worker_notification = await notifyWorkerOfApproval({ approvalId: id, adminName: req.user.name, notes: adminNotes });
+        results.push(item);
       } catch (err) {
         errors.push({ id, error: err.message });
       }
