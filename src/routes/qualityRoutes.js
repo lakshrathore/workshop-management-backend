@@ -297,7 +297,8 @@ router.put('/quality/reports/:id', auth, adminOrPermission('quality_report', 'ed
     try {
       const [[r]] = await db.query('SELECT * FROM quality_reports WHERE id=?', [req.params.id]);
       if (!r) return res.status(404).json({ message: 'Report not found' });
-      if (!['draft', 'rejected'].includes(r.status))
+      // Details stay editable until the report is submitted for approval
+      if (!['draft', 'assigned', 'rejected'].includes(r.status))
         return res.status(400).json({ message: `Cannot edit a ${r.status} report` });
       const b = req.body;
       if (b.inspection_level && !INSPECTION_LEVELS.includes(b.inspection_level))
