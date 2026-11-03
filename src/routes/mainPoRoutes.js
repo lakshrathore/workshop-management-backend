@@ -3,6 +3,7 @@
 // Permission model (menu_key 'main_po'):
 //   read  = View / Print          write = Add / Submit own
 //   edit  = Edit draft/rejected   delete = Delete draft
+//   Admins can edit an order at any stage (also after approval).
 //   Approve/Reject = admin only, via the EXISTING /api/approvals endpoints.
 
 const express = require('express');
@@ -14,7 +15,15 @@ const { moReferenceUpload, deleteFile } = require('../services/cloudinaryStorage
 const { createApprovalRequest } = require('../services/approvalService');
 const { generateSeriesNumber } = require('../services/projectNumbering');
 const proto = require('../services/protoCodes');
-const { insertProjectItemFromMo } = require('../services/mainPoApproval');
+const { insertProjectItemFromMo, copyMoImagesToProjectItem, syncProjectItemFromMo, isImageFileInUse } = require('../services/mainPoApproval');
+
+// Delete a stored file only if no order row / project item still uses it.
+async function deleteImageIfUnused(db, imagePath, publicId) {
+  try {
+    if (await isImageFileInUse(db, imagePath)) return;
+    if (publicId) await deleteFile(publicId);
+  } catch { /* best-effort */ }
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 const flag = v => (v === 1 || v === '1' || v === true || String(v).toUpperCase() === 'YES') ? 1 : 0;
@@ -181,6 +190,24 @@ router.get('/main-pos/proto-preview', auth, adminOrPermission('main_po', 'read')
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Items of several orders at once (Excel export of the list)
+router.get('/main-pos/export-items', auth, adminOrPermission('main_po', 'read'), async (req, res) => {
+  const db = await getPool();
+  try {
+    const ids = String(req.query.ids || '').split(',').map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 2000);
+    if (!ids.length) return res.json([]);
+    const [items] = await db.query(
+      `SELECT i.*, mp.po_no,
+              (SELECT COUNT(*) FROM main_po_item_images im WHERE im.main_po_item_id = i.id) AS image_count,
+              (SELECT im.image_path FROM main_po_item_images im WHERE im.main_po_item_id = i.id ORDER BY im.sort_order, im.id LIMIT 1) AS first_image
+         FROM main_po_items i JOIN main_pos mp ON mp.id = i.main_po_id
+        WHERE i.main_po_id IN (?) ORDER BY mp.id DESC, i.sort_order, i.id`, [ids]);
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.get('/main-pos/:id', auth, adminOrPermission('main_po', 'read'), async (req, res) => {
   const db = await getPool();
   try {
@@ -243,7 +270,7 @@ router.post('/main-pos', auth, adminOrPermission('main_po', 'write'), auditLog('
   }
 });
 
-// ── UPDATE (draft / rejected only; upsert rows so images survive) ────────────
+// ── UPDATE (draft / rejected; admins at any stage. Upsert rows so images survive) ──
 router.put('/main-pos/:id', auth, adminOrPermission('main_po', 'edit'), auditLog('UPDATE', 'MainPO'), async (req, res) => {
   const pool = await getPool();
   const conn = await pool.getConnection();
@@ -254,10 +281,12 @@ router.put('/main-pos/:id', auth, adminOrPermission('main_po', 'edit'), auditLog
     await conn.beginTransaction();
     const [[po]] = await conn.query('SELECT * FROM main_pos WHERE id=? FOR UPDATE', [req.params.id]);
     if (!po) { await conn.rollback(); return res.status(404).json({ message: 'Main PO not found' }); }
-    if (!['draft', 'rejected'].includes(po.status)) {
+    const isAdmin = req.user.role === 'admin';
+    if (!['draft', 'rejected'].includes(po.status) && !isAdmin) {
       await conn.rollback();
-      return res.status(400).json({ message: `Cannot edit a ${po.status} Main PO. Approved/submitted POs are locked.` });
+      return res.status(400).json({ message: `Cannot edit a ${po.status} Manufacturing Order. Only an admin can edit it now.` });
     }
+    const afterApproval = po.status === 'approved';
 
     const b = req.body;
     const manual = readPoNo(b);
@@ -274,7 +303,7 @@ router.put('/main-pos/:id', auth, adminOrPermission('main_po', 'edit'), auditLog
        b.timelines || null, b.remarks || null, req.user.id, po.id]);
 
     const items = Array.isArray(b.items) ? b.items : [];
-    const [existing] = await conn.query('SELECT id, proto_code FROM main_po_items WHERE main_po_id=?', [po.id]);
+    const [existing] = await conn.query('SELECT id, proto_code, product_name, project_item_id FROM main_po_items WHERE main_po_id=?', [po.id]);
     const keepIds = items.filter(i => i.id).map(i => Number(i.id));
     // The mode chosen at creation stays; it is never switched by an edit
     const rows = items.map((it, i) => normalizeItem(it, i));
@@ -285,12 +314,22 @@ router.put('/main-pos/:id', auth, adminOrPermission('main_po', 'edit'), auditLog
     }
     await applyProtoCodes(conn, po.proto_mode, rows, new Map(existing.map(e => [e.id, e.proto_code])));
     const removeIds = existing.map(e => e.id).filter(id => !keepIds.includes(id));
-    if (removeIds.length) {
-      // image records cascade; delete Cloudinary assets best-effort
-      const [imgs] = await conn.query('SELECT public_id FROM main_po_item_images WHERE main_po_item_id IN (?)', [removeIds]);
-      await conn.query('DELETE FROM main_po_items WHERE id IN (?) AND main_po_id=?', [removeIds, po.id]);
-      for (const im of imgs) { if (im.public_id) deleteFile(im.public_id).catch(() => {}); }
+    // Rows that are already Project items can't be removed from the order (their
+    // tasks/progress live in the Project) — remove them from the Project instead.
+    const lockedRemovals = existing.filter(e => removeIds.includes(e.id) && e.project_item_id);
+    if (lockedRemovals.length) {
+      await conn.rollback();
+      return res.status(400).json({
+        message: `${lockedRemovals.map(e => e.product_name).join(', ')} ${lockedRemovals.length > 1 ? 'are' : 'is'} already in the Project and can't be removed from the order.`,
+      });
     }
+    let removedImgs = [];
+    if (removeIds.length) {
+      // image records cascade; stored files are deleted after commit if unused
+      [removedImgs] = await conn.query('SELECT image_path, public_id FROM main_po_item_images WHERE main_po_item_id IN (?)', [removeIds]);
+      await conn.query('DELETE FROM main_po_items WHERE id IN (?) AND main_po_id=?', [removeIds, po.id]);
+    }
+    const linkedOf = new Map(existing.filter(e => e.project_item_id).map(e => [e.id, e.project_item_id]));
     for (const it of rows) {
       if (it.id) {
         await conn.query(
@@ -300,12 +339,18 @@ router.put('/main-pos/:id', auth, adminOrPermission('main_po', 'edit'), auditLog
           [it.s_no, it.area, it.proto_code, it.product_name, it.product_size, it.finishes_note,
            it.is_paint_finish, it.is_fabric_finish, it.is_metal_finish, it.size_length, it.size_width,
            it.size_thickness, it.qty, it.remark, it.sort_order, it.paint_qty, it.fabric_qty, it.id, po.id]);
+        // Approved order edited by an admin: keep the Project item in step
+        if (linkedOf.has(Number(it.id))) await syncProjectItemFromMo(conn, linkedOf.get(Number(it.id)), it);
+      } else if (afterApproval) {
+        // New row on an approved order: like "Add Items" — transfer it to the Project from the order page
+        await conn.query(`INSERT INTO main_po_items (${ITEM_COLS}, added_after_approval) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`, itemVals(po.id, it));
       } else {
         await conn.query(`INSERT INTO main_po_items (${ITEM_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, itemVals(po.id, it));
       }
     }
     await conn.commit();
-    res.json({ message: 'Main PO updated' });
+    for (const im of removedImgs) deleteImageIfUnused(pool, im.image_path, im.public_id);
+    res.json({ message: afterApproval && linkedOf.size ? 'Manufacturing Order updated — Project items updated too' : 'Main PO updated' });
   } catch (err) {
     try { await conn.rollback(); } catch (e) { /* noop */ }
     if (err.status) return res.status(err.status).json({ message: err.message });
@@ -422,10 +467,10 @@ router.delete('/main-pos/:id', auth, adminOrPermission('main_po', 'delete'), aud
     if (!po) return res.status(404).json({ message: 'Main PO not found' });
     if (po.status !== 'draft') return res.status(400).json({ message: 'Only draft Main POs can be deleted' });
     const [imgs] = await db.query(
-      `SELECT im.public_id FROM main_po_item_images im
+      `SELECT im.image_path, im.public_id FROM main_po_item_images im
        JOIN main_po_items i ON i.id = im.main_po_item_id WHERE i.main_po_id=?`, [po.id]);
     await db.query('DELETE FROM main_pos WHERE id=?', [po.id]); // items + images cascade
-    for (const im of imgs) { if (im.public_id) deleteFile(im.public_id).catch(() => {}); }
+    for (const im of imgs) deleteImageIfUnused(db, im.image_path, im.public_id);
     res.json({ message: 'Main PO deleted' });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -473,11 +518,14 @@ router.post('/main-pos/:id/items/:itemId/images', auth, adminOrPermission('main_
     try {
       const [[po]] = await db.query('SELECT status FROM main_pos WHERE id=?', [req.params.id]);
       if (!po) return res.status(404).json({ message: 'Main PO not found' });
-      const [[item]] = await db.query('SELECT id, added_after_approval FROM main_po_items WHERE id=? AND main_po_id=?',
+      const [[item]] = await db.query(
+        `SELECT i.id, i.added_after_approval, i.project_item_id, pi.project_id
+           FROM main_po_items i LEFT JOIN project_items pi ON pi.id = i.project_item_id
+          WHERE i.id=? AND i.main_po_id=?`,
         [req.params.itemId, req.params.id]);
       if (!item) return res.status(404).json({ message: 'Item row not found on this Main PO' });
-      // Approved orders are locked, except rows added after approval
-      if (!['draft', 'rejected'].includes(po.status) && !(po.status === 'approved' && item.added_after_approval))
+      // Approved orders are locked (except rows added after approval) — admins can always add
+      if (req.user.role !== 'admin' && !['draft', 'rejected'].includes(po.status) && !(po.status === 'approved' && item.added_after_approval))
         return res.status(400).json({ message: `Cannot add images to a ${po.status} Main PO` });
       if (!req.files || !req.files.length) return res.status(400).json({ message: 'No images received' });
 
@@ -490,6 +538,8 @@ router.post('/main-pos/:id/items/:itemId/images', auth, adminOrPermission('main_
           [item.id, f.path, f.filename || f.public_id || null, req.body.caption || null, i, req.user.id]);
         saved.push({ id: r.insertId, image_path: f.path });
       }
+      // Row already in the Project → the Project item gets the new images too
+      if (item.project_item_id && item.project_id) await copyMoImagesToProjectItem(db, item.id, item.project_item_id, item.project_id);
       res.json({ message: `${saved.length} image(s) uploaded`, images: saved });
     } catch (err) {
       console.error('Main PO image upload error:', err.message);
@@ -506,10 +556,11 @@ router.delete('/main-pos/item-images/:imageId', auth, adminOrPermission('main_po
        JOIN main_pos mp ON mp.id = i.main_po_id
        WHERE im.id=?`, [req.params.imageId]);
     if (!img) return res.status(404).json({ message: 'Image not found' });
-    if (!['draft', 'rejected'].includes(img.status) && !(img.status === 'approved' && img.added_after_approval))
+    if (req.user.role !== 'admin' && !['draft', 'rejected'].includes(img.status) && !(img.status === 'approved' && img.added_after_approval))
       return res.status(400).json({ message: `Cannot delete images from a ${img.status} Main PO` });
     await db.query('DELETE FROM main_po_item_images WHERE id=?', [img.id]);
-    if (img.public_id) deleteFile(img.public_id).catch(() => {});
+    // The Project item keeps its copy; the file is removed only when unused
+    deleteImageIfUnused(db, img.image_path, img.public_id);
     res.json({ message: 'Image deleted' });
   } catch (err) {
     res.status(500).json({ message: err.message });

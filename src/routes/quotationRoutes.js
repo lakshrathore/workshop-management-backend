@@ -303,10 +303,12 @@ router.post('/quotations', auth, adminOrPermission('quotations', 'write'), audit
   const conn = await pool.getConnection();
   try {
     const b = req.body || {};
-    const moId = parseInt(b.main_po_id, 10);
-    if (!moId) return res.status(400).json({ message: 'Choose the Manufacturing Order this quotation is for' });
-    const [[mo]] = await conn.query('SELECT id FROM main_pos WHERE id=?', [moId]);
-    if (!mo) return res.status(400).json({ message: 'Manufacturing Order not found' });
+    // A quotation can be made on its own, or for a Manufacturing Order
+    const moId = parseInt(b.main_po_id, 10) || null;
+    if (moId) {
+      const [[mo]] = await conn.query('SELECT id FROM main_pos WHERE id=?', [moId]);
+      if (!mo) return res.status(400).json({ message: 'Manufacturing Order not found' });
+    }
     const items = cleanItems(b.items);
     const charges = cleanCharges(b.charges, calcGstOf(b));
     const err = validate(items, charges);

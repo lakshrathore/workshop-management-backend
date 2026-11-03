@@ -1409,8 +1409,10 @@ router.delete('/projects/:projectId/items/:itemId/images/:imageId', auth, adminO
   try {
     const [[img]] = await db.query('SELECT * FROM project_item_images WHERE id=? AND project_item_id=?', [req.params.imageId, req.params.itemId]);
     if (!img) return res.status(404).json({ message: 'Image nahi mili' });
-    await deleteFile(img.image_path);
     await db.query('DELETE FROM project_item_images WHERE id=?', [req.params.imageId]);
+    // The file may be shared with its Manufacturing Order row — delete only if unused
+    const { isImageFileInUse } = require('../services/mainPoApproval');
+    if (!(await isImageFileInUse(db, img.image_path))) await deleteFile(img.image_path);
     res.json({ message: 'Deleted' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });

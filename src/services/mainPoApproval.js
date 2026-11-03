@@ -18,11 +18,46 @@ const { getPool } = require('../database');
 const { generateProjectId } = require('./projectNumbering');
 const { registerRejectHook } = require('./approvalHooks');
 
+const moDims = it => [it.size_length, it.size_width, it.size_thickness].filter(Boolean).join(' x ')
+  || it.product_size || null;
+
+// Give a project item the reference images of its Manufacturing Order row.
+// The project gets its own image records pointing at the same uploaded files
+// (no re-upload). Skips files the item already has, so it is safe to repeat.
+async function copyMoImagesToProjectItem(conn, moItemId, projectItemId, projectDbId) {
+  await conn.query(
+    `INSERT INTO project_item_images (project_item_id, project_id, image_path, resource_type, caption, uploaded_by)
+     SELECT ?, ?, im.image_path, 'image', LEFT(COALESCE(im.caption, ''), 255), im.uploaded_by
+       FROM main_po_item_images im
+      WHERE im.main_po_item_id = ?
+        AND NOT EXISTS (SELECT 1 FROM project_item_images x WHERE x.project_item_id = ? AND x.image_path = im.image_path)
+      ORDER BY im.sort_order, im.id`,
+    [projectItemId, projectDbId, moItemId, projectItemId]);
+}
+
+// Admin edited an approved order: keep the linked project item in step.
+async function syncProjectItemFromMo(conn, projectItemId, it) {
+  await conn.query(
+    `UPDATE project_items SET item_name=?, proto_code=?, description=?, quantity=?, dimensions=?, notes=?, area=?
+      WHERE id=?`,
+    [it.product_name, it.proto_code || null, it.finishes_note || null,
+     Math.max(1, Math.round(Number(it.qty) || 1)), moDims(it), it.remark || null, it.area || null, projectItemId]);
+}
+
+// A file can be shared by an order row and a project item. Only delete it from
+// storage when nothing points at it any more.
+async function isImageFileInUse(db, imagePath) {
+  if (!imagePath) return false;
+  const [[a]] = await db.query('SELECT 1 AS x FROM main_po_item_images WHERE image_path=? LIMIT 1', [imagePath]);
+  if (a) return true;
+  const [[b]] = await db.query('SELECT 1 AS x FROM project_item_images WHERE image_path=? LIMIT 1', [imagePath]);
+  return !!b;
+}
+
 // One project_item per Manufacturing Order row (used at approval and when rows
-// added later are transferred). Links the row to the new item.
+// added later are transferred). Links the row to the new item and copies its images.
 async function insertProjectItemFromMo(conn, projectDbId, it) {
-  const dims = [it.size_length, it.size_width, it.size_thickness].filter(Boolean).join(' x ')
-    || it.product_size || null;
+  const dims = moDims(it);
   const [pi] = await conn.query(
     `INSERT INTO project_items (project_id, item_name, proto_code, description, quantity, dimensions, notes, area, source_main_po_item_id)
      VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -31,6 +66,7 @@ async function insertProjectItemFromMo(conn, projectDbId, it) {
      dims, it.remark || null, it.area || null, it.id]
   );
   await conn.query('UPDATE main_po_items SET project_item_id=? WHERE id=?', [pi.insertId, it.id]);
+  await copyMoImagesToProjectItem(conn, it.id, pi.insertId, projectDbId);
   return pi.insertId;
 }
 
@@ -116,4 +152,7 @@ function registerMainPoApproval() {
   console.log('✅ MAIN_PO approval resolver + reject hook registered');
 }
 
-module.exports = { registerMainPoApproval, resolveMainPo, insertProjectItemFromMo };
+module.exports = {
+  registerMainPoApproval, resolveMainPo, insertProjectItemFromMo,
+  copyMoImagesToProjectItem, syncProjectItemFromMo, isImageFileInUse,
+};
