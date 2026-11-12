@@ -28,6 +28,12 @@ function cleanItems(items) {
   return items.map((it, i) => {
     const qty = num(it.qty, 1e9);
     const rate = num(it.rate);
+    const images = Array.isArray(it.images)
+      ? it.images.slice(0, 10).map(image => ({
+        image_path: text(image?.image_path || image?.url || image?.secure_url || image?.path, 2000),
+        public_id: text(image?.public_id, 255),
+      })).filter(image => image.image_path)
+      : null;
     return {
       main_po_item_id: parseInt(it.main_po_item_id, 10) || null,
       proto_code: text(it.proto_code, 100),
@@ -38,6 +44,7 @@ function cleanItems(items) {
       finishes: text(it.finishes, 500),
       unit: text(it.unit, 20) || 'pcs',
       qty, rate, amount: r2(qty * rate), sort_order: i,
+      images,
     };
   });
 }
@@ -119,7 +126,12 @@ async function loadQuotation(db, id) {
     [imgs] = await db.query(
       'SELECT main_po_item_id, image_path FROM main_po_item_images WHERE main_po_item_id IN (?) ORDER BY sort_order, id', [moIds]);
   }
-  q.items = items.map(it => ({ ...it, images: imgs.filter(im => im.main_po_item_id === it.main_po_item_id).slice(0, 1) }));
+  q.items = items.map(it => ({
+    ...it,
+    images: it.images == null
+      ? imgs.filter(im => im.main_po_item_id === it.main_po_item_id).slice(0, 1)
+      : JSON.parse(it.images),
+  }));
   const [charges] = await db.query('SELECT * FROM quotation_charges WHERE quotation_id=? ORDER BY sort_order, id', [id]);
   q.charges = charges;
   if (q.item_gst_amount === null || q.item_gst_amount === undefined) q.item_gst_amount = q.gst_amount;
@@ -141,9 +153,9 @@ async function insertItems(conn, quotationId, items) {
   for (const it of items) {
     await conn.query(
       `INSERT INTO quotation_items (quotation_id, main_po_item_id, proto_code, item_name, description, area, size, finishes,
-         unit, qty, rate, amount, sort_order) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         unit, qty, rate, amount, sort_order, images) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [quotationId, it.main_po_item_id, it.proto_code, it.item_name, it.description, it.area, it.size, it.finishes,
-       it.unit, it.qty, it.rate, it.amount, it.sort_order]);
+       it.unit, it.qty, it.rate, it.amount, it.sort_order, it.images == null ? null : JSON.stringify(it.images)]);
   }
 }
 
@@ -451,8 +463,8 @@ router.post('/quotations/:id/revise', auth, adminOrPermission('quotations', 'wri
       [rev, req.user.id, req.user.id, q.id]);
     await conn.query(
       `INSERT INTO quotation_items (quotation_id, main_po_item_id, proto_code, item_name, description, area, size, finishes,
-         unit, qty, rate, amount, sort_order)
-       SELECT ?, main_po_item_id, proto_code, item_name, description, area, size, finishes, unit, qty, rate, amount, sort_order
+         unit, qty, rate, amount, sort_order, images)
+       SELECT ?, main_po_item_id, proto_code, item_name, description, area, size, finishes, unit, qty, rate, amount, sort_order, images
          FROM quotation_items WHERE quotation_id=?`, [r.insertId, q.id]);
     await conn.query(
       `INSERT INTO quotation_charges (quotation_id, description, amount, with_gst, gst_percent, gst_amount, sort_order)

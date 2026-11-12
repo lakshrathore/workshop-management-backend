@@ -1373,10 +1373,11 @@ async function initializeDatabase() {
     proto_code VARCHAR(100), item_name VARCHAR(255) NOT NULL, description TEXT,
     area VARCHAR(100), size VARCHAR(255), finishes VARCHAR(500), unit VARCHAR(20) DEFAULT 'pcs',
     qty DECIMAL(14,2) DEFAULT 1, rate DECIMAL(14,2) DEFAULT 0, amount DECIMAL(14,2) DEFAULT 0,
-    sort_order INT DEFAULT 0,
+    sort_order INT DEFAULT 0, images TEXT NULL,
     INDEX idx_qi_quote (quotation_id),
     FOREIGN KEY (quotation_id) REFERENCES quotations(id) ON DELETE CASCADE
   )`);
+  await ensureColumn('quotation_items', 'images', 'images TEXT NULL');
   await db.query("INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES ('quotation_prefix','QT')").catch(() => {});
   // QC report: check points typed per section (JSON list). NULL = never edited → the print
   // keeps the standard points for that section name.
