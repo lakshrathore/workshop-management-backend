@@ -538,6 +538,29 @@ router.put('/superadmin/organizations/:id/users/:userId/username', async (req, r
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// "Login as" — Super Admin us user ke account mein bina password badle login karta hai.
+// Token mein impersonated_by flag rehta hai; login_logs mein entry jaati hai.
+router.post('/superadmin/organizations/:id/users/:userId/impersonate', async (req, res) => {
+  try {
+    if (!(await requirePrimary(req, res))) return;
+    const db = await getPool();
+    const [[user]] = await db.query('SELECT id, name, username, role, is_active FROM users WHERE id=?', [req.params.userId]);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!user.is_active) return res.status(400).json({ message: 'User is inactive. Activate the user first.' });
+    try {
+      await db.query(
+        'INSERT INTO login_logs (user_id, user_role, user_name, action, ip_address, user_agent) VALUES (?,?,?,?,?,?)',
+        [user.id, user.role, user.name, 'LOGIN', clientIp(req), `[Super Admin login-as] ${req.headers['user-agent'] || 'unknown'}`.slice(0, 500)]
+      );
+    } catch (e) { console.error('Impersonate log error:', e.message); }
+    const token = jwt.sign(
+      { id: user.id, username: user.username, role: user.role, name: user.name, impersonated_by: 'superadmin' },
+      JWT_SECRET, { expiresIn: '2h' }
+    );
+    res.json({ token, user: { id: user.id, name: user.name, username: user.username, role: user.role, impersonated: true } });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 router.patch('/superadmin/organizations/:id/users/:userId/status', async (req, res) => {
   const is_active = req.body.is_active ? 1 : 0;
   try {
