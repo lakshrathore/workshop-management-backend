@@ -141,8 +141,16 @@ async function loadReport(db, id) {
   return r;
 }
 
+// Admin, the assigned worker, or the user who created the report
+function reportCreator(report) {
+  return report.report_created_by !== undefined ? report.report_created_by : report.created_by;
+}
 function canWorkerTouch(report, user) {
-  return user.role === 'admin' || report.assigned_to === user.id;
+  return user.role === 'admin' || report.assigned_to === user.id || reportCreator(report) === user.id;
+}
+// Sections: creator can always add/delete; an assigned worker only if can_add_sections
+function canManageSections(report, user) {
+  return user.role === 'admin' || reportCreator(report) === user.id || (report.assigned_to === user.id && !!report.can_add_sections);
 }
 
 // ══ QC PERSONS (small master) ════════════════════════════════════════════════
@@ -267,14 +275,17 @@ router.post('/quality/reports', auth, adminOrPermission('quality_report', 'write
       const sMap = {}; settingsRows.forEach(s => sMap[s.setting_key] = s.setting_value);
 
       const reportNo = await generateReportNo(db);
+      // A user (non-admin) who creates a report works on it directly → auto-assign to themselves
+      const selfAssign = req.user.role !== 'admin';
       const [r] = await db.query(
         `INSERT INTO quality_reports (report_no, project_id, project_item_id, client_name, vendor_name, location,
-           qc_person_id, inspection_level, inspection_date, sku_number, status, can_add_sections, created_by)
-         VALUES (?,?,?,?,?,?,?,?,?,?,'draft',?,?)`,
+           qc_person_id, inspection_level, inspection_date, sku_number, status, assigned_to, can_add_sections, created_by)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [reportNo, b.project_id, b.project_item_id || null, b.client_name || null,
          b.vendor_name || sMap.company_name || 'MOZI Innovators LLP', b.location || sMap.company_address || null,
          b.qc_person_id || null, b.inspection_level || 'final', b.inspection_date || null,
-         b.sku_number || null, b.can_add_sections ? 1 : 0, req.user.id]);
+         b.sku_number || null, selfAssign ? 'assigned' : 'draft', selfAssign ? req.user.id : null,
+         (b.can_add_sections || selfAssign) ? 1 : 0, req.user.id]);
 
       // Optional starter sections
       const starters = Array.isArray(b.sections) ? b.sections : [];
@@ -364,7 +375,7 @@ router.post('/quality/reports/:id/sections', auth, adminOrPermission('quality_re
       // Add-section gate (Q10): admin always; worker only if can_add_sections
       if (req.user.role !== 'admin') {
         if (!canWorkerTouch(r, req.user)) return res.status(403).json({ message: 'This report is not assigned to you' });
-        if (!r.can_add_sections) return res.status(403).json({ message: 'You do not have permission to add sections to this report' });
+        if (!canManageSections(r, req.user)) return res.status(403).json({ message: 'You do not have permission to add sections to this report' });
       }
       const name = (req.body.section_name || '').trim();
       if (!name) return res.status(400).json({ message: 'Section name is required' });
@@ -390,7 +401,7 @@ router.put('/quality/sections/:sectionId', auth, adminOrPermission('quality_repo
   const db = await getPool();
   try {
     const [[sec]] = await db.query(
-      `SELECT s.*, r.status, r.assigned_to, r.can_add_sections FROM quality_report_sections s
+      `SELECT s.*, r.status, r.assigned_to, r.created_by AS report_created_by, r.can_add_sections FROM quality_report_sections s
        JOIN quality_reports r ON r.id=s.report_id WHERE s.id=?`, [req.params.sectionId]);
     if (!sec) return res.status(404).json({ message: 'Section not found' });
     if (['submitted', 'approved'].includes(sec.status)) return res.status(400).json({ message: 'Report is locked' });
@@ -414,11 +425,11 @@ router.delete('/quality/sections/:sectionId', auth, adminOrPermission('quality_r
   const db = await getPool();
   try {
     const [[sec]] = await db.query(
-      `SELECT s.*, r.status, r.assigned_to, r.can_add_sections FROM quality_report_sections s
+      `SELECT s.*, r.status, r.assigned_to, r.created_by AS report_created_by, r.can_add_sections FROM quality_report_sections s
        JOIN quality_reports r ON r.id=s.report_id WHERE s.id=?`, [req.params.sectionId]);
     if (!sec) return res.status(404).json({ message: 'Section not found' });
     if (['submitted', 'approved'].includes(sec.status)) return res.status(400).json({ message: 'Report is locked' });
-    if (req.user.role !== 'admin' && (!canWorkerTouch(sec, req.user) || !sec.can_add_sections))
+    if (!canManageSections(sec, req.user))
       return res.status(403).json({ message: 'Not permitted' });
     const [imgs] = await db.query('SELECT public_id FROM quality_report_images WHERE section_id=?', [sec.id]);
     await db.query('DELETE FROM quality_report_sections WHERE id=?', [sec.id]); // images cascade
@@ -433,11 +444,11 @@ router.put('/quality/reports/:id/inspection', auth, adminOrPermission('quality_r
   auditLog('UPDATE', 'QualityReportInspection'), async (req, res) => {
     const db = await getPool();
     try {
-      const [[r]] = await db.query('SELECT id, status, assigned_to FROM quality_reports WHERE id=?', [req.params.id]);
+      const [[r]] = await db.query('SELECT id, status, assigned_to, created_by AS report_created_by FROM quality_reports WHERE id=?', [req.params.id]);
       if (!r) return res.status(404).json({ message: 'Report not found' });
       if (['submitted', 'approved'].includes(r.status))
         return res.status(400).json({ message: `Report is ${r.status} and locked` });
-      if (req.user.role !== 'admin' && r.assigned_to !== req.user.id)
+      if (!canWorkerTouch(r, req.user))
         return res.status(403).json({ message: 'This report is not assigned to you' });
 
       const b = req.body || {};
@@ -484,12 +495,12 @@ router.post('/quality/sections/:sectionId/images', auth, adminOrPermission('qual
     const db = await getPool();
     try {
       const [[sec]] = await db.query(
-        `SELECT s.id, r.status, r.assigned_to FROM quality_report_sections s
+        `SELECT s.id, r.status, r.assigned_to, r.created_by AS report_created_by FROM quality_report_sections s
          JOIN quality_reports r ON r.id=s.report_id WHERE s.id=?`, [req.params.sectionId]);
       if (!sec) return res.status(404).json({ message: 'Section not found' });
       if (['submitted', 'approved'].includes(sec.status))
         return res.status(400).json({ message: `Report is ${sec.status} and locked` });
-      if (req.user.role !== 'admin' && sec.assigned_to !== req.user.id)
+      if (!canWorkerTouch(sec, req.user))
         return res.status(403).json({ message: 'This report is not assigned to you' });
       if (!req.files || !req.files.length) return res.status(400).json({ message: 'No images received' });
       const [[mx]] = await db.query('SELECT COALESCE(MAX(sort_order),-1) mo FROM quality_report_images WHERE section_id=?', [sec.id]);
@@ -509,12 +520,12 @@ router.put('/quality/images/:imageId', auth, adminOrPermission('quality_report',
   const db = await getPool();
   try {
     const [[img]] = await db.query(
-      `SELECT im.*, r.status, r.assigned_to FROM quality_report_images im
+      `SELECT im.*, r.status, r.assigned_to, r.created_by AS report_created_by FROM quality_report_images im
        JOIN quality_report_sections s ON s.id=im.section_id
        JOIN quality_reports r ON r.id=s.report_id WHERE im.id=?`, [req.params.imageId]);
     if (!img) return res.status(404).json({ message: 'Image not found' });
     if (['submitted', 'approved'].includes(img.status)) return res.status(400).json({ message: 'Report is locked' });
-    if (req.user.role !== 'admin' && img.assigned_to !== req.user.id) return res.status(403).json({ message: 'Not permitted' });
+    if (!canWorkerTouch(img, req.user)) return res.status(403).json({ message: 'Not permitted' });
     const sets = [], vals = [];
     if (req.body.caption !== undefined) { sets.push('caption=?'); vals.push(req.body.caption); }
     if (req.body.corner_note !== undefined) { sets.push('corner_note=?'); vals.push(req.body.corner_note); }
@@ -529,12 +540,12 @@ router.delete('/quality/images/:imageId', auth, adminOrPermission('quality_repor
   const db = await getPool();
   try {
     const [[img]] = await db.query(
-      `SELECT im.*, r.status, r.assigned_to FROM quality_report_images im
+      `SELECT im.*, r.status, r.assigned_to, r.created_by AS report_created_by FROM quality_report_images im
        JOIN quality_report_sections s ON s.id=im.section_id
        JOIN quality_reports r ON r.id=s.report_id WHERE im.id=?`, [req.params.imageId]);
     if (!img) return res.status(404).json({ message: 'Image not found' });
     if (['submitted', 'approved'].includes(img.status)) return res.status(400).json({ message: 'Report is locked' });
-    if (req.user.role !== 'admin' && img.assigned_to !== req.user.id) return res.status(403).json({ message: 'Not permitted' });
+    if (!canWorkerTouch(img, req.user)) return res.status(403).json({ message: 'Not permitted' });
     await db.query('DELETE FROM quality_report_images WHERE id=?', [img.id]);
     if (img.public_id) deleteFile(img.public_id).catch(() => {});
     res.json({ message: 'Image deleted' });
@@ -548,9 +559,11 @@ router.post('/quality/reports/:id/submit', auth, adminOrPermission('quality_repo
     try {
       const [[r]] = await db.query('SELECT * FROM quality_reports WHERE id=?', [req.params.id]);
       if (!r) return res.status(404).json({ message: 'Report not found' });
-      if (req.user.role !== 'admin' && r.assigned_to !== req.user.id)
+      if (!canWorkerTouch(r, req.user))
         return res.status(403).json({ message: 'Only the assigned worker or an admin can submit' });
-      if (!['assigned', 'rejected'].includes(r.status))
+      const submittable = ['assigned', 'rejected'];
+      if (req.user.role !== 'admin' && r.created_by === req.user.id) submittable.push('draft'); // own draft
+      if (!submittable.includes(r.status))
         return res.status(400).json({ message: `Report is ${r.status}` });
       const [[{ c: secCount }]] = await db.query('SELECT COUNT(*) c FROM quality_report_sections WHERE report_id=?', [r.id]);
       if (!secCount) return res.status(400).json({ message: 'Add at least one section before submitting' });
