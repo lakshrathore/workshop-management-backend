@@ -4,7 +4,7 @@
 // Workflow (client-confirmed Q6):
 //   Draft → Assigned → (worker uploads images/data) → Submitted
 //        → Admin Approves/Rejects → Final(Approved)/Locked  |  Rejected→rework
-// Uses the EXISTING Approvals inbox (type QUALITY_REPORT). Worker cannot approve.
+// QC approval removed: reports stay editable; old QUALITY_REPORT approvals still resolve.
 //
 // Sections are dynamic. Admin can always add sections. An assigned worker can
 // add sections ONLY if the report's can_add_sections flag is set (per Q10);
@@ -23,7 +23,7 @@ const { getPool } = require('../database');
 const { auth, adminOnly, adminOrPermission } = require('../middleware/authHelpers');
 const auditLog = require('../middleware/auditLog');
 const { moReferenceUpload, deleteFile } = require('../services/cloudinaryStorage');
-const { createApprovalRequest } = require('../services/approvalService');
+// createApprovalRequest no longer used — QC approval removed
 
 const INSPECTION_LEVELS = ['final', 'white_body'];
 
@@ -308,9 +308,7 @@ router.put('/quality/reports/:id', auth, adminOrPermission('quality_report', 'ed
     try {
       const [[r]] = await db.query('SELECT * FROM quality_reports WHERE id=?', [req.params.id]);
       if (!r) return res.status(404).json({ message: 'Report not found' });
-      // Details stay editable until the report is submitted for approval
-      if (!['draft', 'assigned', 'rejected'].includes(r.status))
-        return res.status(400).json({ message: `Cannot edit a ${r.status} report` });
+      // QC approval removed: details are always editable (old approved reports too)
       const b = req.body;
       if (b.inspection_level && !INSPECTION_LEVELS.includes(b.inspection_level))
         return res.status(400).json({ message: 'Invalid inspection level' });
@@ -333,8 +331,6 @@ router.post('/quality/reports/:id/assign', auth, adminOrPermission('quality_repo
     try {
       const [[r]] = await db.query('SELECT * FROM quality_reports WHERE id=?', [req.params.id]);
       if (!r) return res.status(404).json({ message: 'Report not found' });
-      if (['submitted', 'approved'].includes(r.status))
-        return res.status(400).json({ message: `Cannot reassign a ${r.status} report` });
       const workerId = req.body.assigned_to ? Number(req.body.assigned_to) : null;
       if (workerId) {
         const [[w]] = await db.query("SELECT id FROM users WHERE id=? AND role IN ('worker','admin')", [workerId]);
@@ -370,8 +366,6 @@ router.post('/quality/reports/:id/sections', auth, adminOrPermission('quality_re
     try {
       const [[r]] = await db.query('SELECT * FROM quality_reports WHERE id=?', [req.params.id]);
       if (!r) return res.status(404).json({ message: 'Report not found' });
-      if (['submitted', 'approved'].includes(r.status))
-        return res.status(400).json({ message: `Cannot modify a ${r.status} report` });
       // Add-section gate (Q10): admin always; worker only if can_add_sections
       if (req.user.role !== 'admin') {
         if (!canWorkerTouch(r, req.user)) return res.status(403).json({ message: 'This report is not assigned to you' });
@@ -404,7 +398,6 @@ router.put('/quality/sections/:sectionId', auth, adminOrPermission('quality_repo
       `SELECT s.*, r.status, r.assigned_to, r.created_by AS report_created_by, r.can_add_sections FROM quality_report_sections s
        JOIN quality_reports r ON r.id=s.report_id WHERE s.id=?`, [req.params.sectionId]);
     if (!sec) return res.status(404).json({ message: 'Section not found' });
-    if (['submitted', 'approved'].includes(sec.status)) return res.status(400).json({ message: 'Report is locked' });
     const sets = [], vals = [];
     if (req.body.section_name !== undefined) { sets.push('section_name=?'); vals.push(String(req.body.section_name).trim()); }
     if (req.body.description !== undefined) { sets.push('description=?'); vals.push(req.body.description); }
@@ -428,7 +421,6 @@ router.delete('/quality/sections/:sectionId', auth, adminOrPermission('quality_r
       `SELECT s.*, r.status, r.assigned_to, r.created_by AS report_created_by, r.can_add_sections FROM quality_report_sections s
        JOIN quality_reports r ON r.id=s.report_id WHERE s.id=?`, [req.params.sectionId]);
     if (!sec) return res.status(404).json({ message: 'Section not found' });
-    if (['submitted', 'approved'].includes(sec.status)) return res.status(400).json({ message: 'Report is locked' });
     if (!canManageSections(sec, req.user))
       return res.status(403).json({ message: 'Not permitted' });
     const [imgs] = await db.query('SELECT public_id FROM quality_report_images WHERE section_id=?', [sec.id]);
@@ -446,8 +438,6 @@ router.put('/quality/reports/:id/inspection', auth, adminOrPermission('quality_r
     try {
       const [[r]] = await db.query('SELECT id, status, assigned_to, created_by AS report_created_by FROM quality_reports WHERE id=?', [req.params.id]);
       if (!r) return res.status(404).json({ message: 'Report not found' });
-      if (['submitted', 'approved'].includes(r.status))
-        return res.status(400).json({ message: `Report is ${r.status} and locked` });
       if (!canWorkerTouch(r, req.user))
         return res.status(403).json({ message: 'This report is not assigned to you' });
 
@@ -498,8 +488,6 @@ router.post('/quality/sections/:sectionId/images', auth, adminOrPermission('qual
         `SELECT s.id, r.status, r.assigned_to, r.created_by AS report_created_by FROM quality_report_sections s
          JOIN quality_reports r ON r.id=s.report_id WHERE s.id=?`, [req.params.sectionId]);
       if (!sec) return res.status(404).json({ message: 'Section not found' });
-      if (['submitted', 'approved'].includes(sec.status))
-        return res.status(400).json({ message: `Report is ${sec.status} and locked` });
       if (!canWorkerTouch(sec, req.user))
         return res.status(403).json({ message: 'This report is not assigned to you' });
       if (!req.files || !req.files.length) return res.status(400).json({ message: 'No images received' });
@@ -524,7 +512,6 @@ router.put('/quality/images/:imageId', auth, adminOrPermission('quality_report',
        JOIN quality_report_sections s ON s.id=im.section_id
        JOIN quality_reports r ON r.id=s.report_id WHERE im.id=?`, [req.params.imageId]);
     if (!img) return res.status(404).json({ message: 'Image not found' });
-    if (['submitted', 'approved'].includes(img.status)) return res.status(400).json({ message: 'Report is locked' });
     if (!canWorkerTouch(img, req.user)) return res.status(403).json({ message: 'Not permitted' });
     const sets = [], vals = [];
     if (req.body.caption !== undefined) { sets.push('caption=?'); vals.push(req.body.caption); }
@@ -544,7 +531,6 @@ router.delete('/quality/images/:imageId', auth, adminOrPermission('quality_repor
        JOIN quality_report_sections s ON s.id=im.section_id
        JOIN quality_reports r ON r.id=s.report_id WHERE im.id=?`, [req.params.imageId]);
     if (!img) return res.status(404).json({ message: 'Image not found' });
-    if (['submitted', 'approved'].includes(img.status)) return res.status(400).json({ message: 'Report is locked' });
     if (!canWorkerTouch(img, req.user)) return res.status(403).json({ message: 'Not permitted' });
     await db.query('DELETE FROM quality_report_images WHERE id=?', [img.id]);
     if (img.public_id) deleteFile(img.public_id).catch(() => {});
@@ -552,35 +538,9 @@ router.delete('/quality/images/:imageId', auth, adminOrPermission('quality_repor
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ══ SUBMIT → existing Approvals inbox ════════════════════════════════════════
-router.post('/quality/reports/:id/submit', auth, adminOrPermission('quality_report', 'write'),
-  auditLog('UPDATE', 'QualityReport'), async (req, res) => {
-    const db = await getPool();
-    try {
-      const [[r]] = await db.query('SELECT * FROM quality_reports WHERE id=?', [req.params.id]);
-      if (!r) return res.status(404).json({ message: 'Report not found' });
-      if (!canWorkerTouch(r, req.user))
-        return res.status(403).json({ message: 'Only the assigned worker or an admin can submit' });
-      const submittable = ['assigned', 'rejected'];
-      if (req.user.role !== 'admin' && r.created_by === req.user.id) submittable.push('draft'); // own draft
-      if (!submittable.includes(r.status))
-        return res.status(400).json({ message: `Report is ${r.status}` });
-      const [[{ c: secCount }]] = await db.query('SELECT COUNT(*) c FROM quality_report_sections WHERE report_id=?', [r.id]);
-      if (!secCount) return res.status(400).json({ message: 'Add at least one section before submitting' });
-      const [[pending]] = await db.query(
-        "SELECT id FROM approvals WHERE type='QUALITY_REPORT' AND related_id=? AND status='PENDING' LIMIT 1", [r.id]);
-      if (pending) return res.status(400).json({ message: 'Report is already pending approval' });
-
-      await createApprovalRequest({
-        type: 'QUALITY_REPORT', userId: req.user.id, relatedId: r.id,
-        requestData: { report_no: r.report_no, client: r.client_name, sku: r.sku_number, sections: secCount },
-      });
-      await db.query(
-        "UPDATE quality_reports SET status='submitted', submitted_by=?, submitted_at=NOW(), rejected_by=NULL, rejected_at=NULL, rejected_reason=NULL WHERE id=?",
-        [req.user.id, r.id]);
-      res.json({ message: 'Quality report submitted for approval' });
-    } catch (err) { res.status(500).json({ message: err.message }); }
-  });
+// ══ SUBMIT — QC approval removed (client request). New reports never go to the Approvals inbox.
+router.post("/quality/reports/:id/submit", auth, (req, res) =>
+  res.status(410).json({ message: "Approval is no longer required for quality reports" }));
 
 // ══ APPROVAL INTEGRATION (registered from server.js) ═════════════════════════
 async function resolveQualityReport(approval) {
